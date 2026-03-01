@@ -11,6 +11,7 @@
  *   get_refactor_report — Return refactoring priorities (from cached analysis)
  *   get_call_graph      — Return call graph: hubs, entry points, violations
  *   get_signatures      — Return compact function/class signatures per file
+ *   get_subgraph        — Extract upstream/downstream call subgraph from a function
  *
  * Configuration for Cline / Claude Code:
  *   {
@@ -120,6 +121,40 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ['directory'],
+    },
+  },
+  {
+    name: 'get_subgraph',
+    description:
+      'Extract a subgraph of the call graph centred on a specific function. ' +
+      'Useful for impact analysis ("what does X call?"), dependency tracing ' +
+      '("who calls X?"), or understanding a change\'s blast radius. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory',
+        },
+        functionName: {
+          type: 'string',
+          description: 'Name of the function to centre the subgraph on (exact or partial match)',
+        },
+        direction: {
+          type: 'string',
+          enum: ['downstream', 'upstream', 'both'],
+          description:
+            'downstream = what this function calls (default), ' +
+            'upstream = who calls this function, ' +
+            'both = full neighbourhood',
+        },
+        maxDepth: {
+          type: 'number',
+          description: 'Maximum traversal depth (default: 3)',
+        },
+      },
+      required: ['directory', 'functionName'],
     },
   },
 ];
@@ -281,6 +316,103 @@ async function handleGetSignatures(directory: string, filePattern?: string): Pro
   return chunks.join('\n\n---\n\n');
 }
 
+async function handleGetSubgraph(
+  directory: string,
+  functionName: string,
+  direction: 'downstream' | 'upstream' | 'both' = 'downstream',
+  maxDepth = 3
+): Promise<unknown> {
+  const absDir = resolve(directory);
+  const ctx = await readCachedContext(absDir);
+
+  if (!ctx) {
+    return { error: 'No analysis found. Run analyze_codebase first.' };
+  }
+  if (!ctx.callGraph) {
+    return { error: 'Call graph not available in cached analysis. Re-run analyze_codebase.' };
+  }
+
+  const cg = ctx.callGraph as SerializedCallGraph;
+
+  // Find seed nodes — all functions whose name contains functionName (case-insensitive)
+  const lower = functionName.toLowerCase();
+  const seeds = cg.nodes.filter(n => n.name.toLowerCase().includes(lower));
+
+  if (seeds.length === 0) {
+    return { error: `No function matching "${functionName}" found in call graph.` };
+  }
+
+  // Build adjacency lists
+  const forward = new Map<string, string[]>();  // callerId → calleeIds
+  const backward = new Map<string, string[]>(); // calleeId → callerIds
+  for (const node of cg.nodes) {
+    forward.set(node.id, []);
+    backward.set(node.id, []);
+  }
+  for (const edge of cg.edges) {
+    if (!edge.calleeId) continue;
+    forward.get(edge.callerId)?.push(edge.calleeId);
+    backward.get(edge.calleeId)?.push(edge.callerId);
+  }
+
+  // BFS in the requested direction(s)
+  const visitedIds = new Set<string>();
+  const queue: Array<{ id: string; depth: number }> = seeds.map(n => ({ id: n.id, depth: 0 }));
+  for (const seed of seeds) visitedIds.add(seed.id);
+
+  while (queue.length > 0) {
+    const { id, depth } = queue.shift()!;
+    if (depth >= maxDepth) continue;
+
+    const neighbours: string[] = [];
+    if (direction === 'downstream' || direction === 'both') {
+      neighbours.push(...(forward.get(id) ?? []));
+    }
+    if (direction === 'upstream' || direction === 'both') {
+      neighbours.push(...(backward.get(id) ?? []));
+    }
+
+    for (const nId of neighbours) {
+      if (!visitedIds.has(nId)) {
+        visitedIds.add(nId);
+        queue.push({ id: nId, depth: depth + 1 });
+      }
+    }
+  }
+
+  // Collect subgraph nodes and edges
+  const nodeMap = new Map(cg.nodes.map(n => [n.id, n]));
+  const subNodes = Array.from(visitedIds)
+    .map(id => nodeMap.get(id)!)
+    .filter(Boolean)
+    .map(n => ({
+      name: n.name,
+      file: n.filePath,
+      className: n.className,
+      fanIn: n.fanIn,
+      fanOut: n.fanOut,
+      language: n.language,
+      isSeed: seeds.some(s => s.id === n.id),
+    }));
+
+  const subEdges = cg.edges
+    .filter(e => e.calleeId && visitedIds.has(e.callerId) && visitedIds.has(e.calleeId))
+    .map(e => ({
+      caller: nodeMap.get(e.callerId)?.name ?? e.callerId,
+      callee: nodeMap.get(e.calleeId)?.name ?? e.calleeId,
+      callerFile: nodeMap.get(e.callerId)?.filePath,
+      calleeFile: nodeMap.get(e.calleeId)?.filePath,
+    }));
+
+  return {
+    query: { functionName, direction, maxDepth },
+    seeds: seeds.map(n => ({ name: n.name, file: n.filePath })),
+    stats: { nodes: subNodes.length, edges: subEdges.length },
+    nodes: subNodes,
+    edges: subEdges,
+  };
+}
+
 // ============================================================================
 // MCP SERVER
 // ============================================================================
@@ -313,6 +445,10 @@ async function startMcpServer(): Promise<void> {
       } else if (name === 'get_signatures') {
         const { directory, filePattern } = args as { directory: string; filePattern?: string };
         result = await handleGetSignatures(directory, filePattern);
+      } else if (name === 'get_subgraph') {
+        const { directory, functionName, direction = 'downstream', maxDepth = 3 } =
+          args as { directory: string; functionName: string; direction?: 'downstream' | 'upstream' | 'both'; maxDepth?: number };
+        result = await handleGetSubgraph(directory, functionName, direction, maxDepth);
       } else {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
