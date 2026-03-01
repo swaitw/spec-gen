@@ -258,6 +258,7 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen drift` | Detect spec drift (static) | No |
 | `spec-gen drift --use-llm` | Detect spec drift (LLM-enhanced) | Yes |
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
+| `spec-gen mcp` | Start MCP server (stdio, for Cline / Claude Code) | No |
 
 ### Global Options
 
@@ -322,6 +323,72 @@ spec-gen verify [options]
   --files <paths>        # Specific files to verify
   --domains <list>       # Only verify specific domains
   --json                 # JSON output
+```
+
+## MCP Server
+
+`spec-gen mcp` starts spec-gen as a [Model Context Protocol](https://modelcontextprotocol.io/) server over stdio, exposing static analysis as tools that any MCP-compatible AI agent (Cline, Claude Code, Cursor…) can call directly — no API key required.
+
+### Setup
+
+**Claude Code** — add a `.mcp.json` at your project root (the repo ships one):
+
+```json
+{
+  "mcpServers": {
+    "spec-gen": {
+      "command": "node",
+      "args": ["/absolute/path/to/spec-gen/dist/cli/index.js", "mcp"]
+    }
+  }
+}
+```
+
+**Cline** — add the same block under `mcpServers` in Cline's MCP settings JSON.
+
+### Tools
+
+| Tool | Description | Requires prior analysis |
+|------|-------------|------------------------|
+| `analyze_codebase` | Run full static analysis; returns project metadata, call graph stats, and top-10 refactor priorities. Results cached for 1 hour (bypass with `force: true`). | No |
+| `get_refactor_report` | Prioritized list of functions to refactor: unreachable code, hub overload (high fan-in), god functions (high fan-out), SRP violations, cyclic deps. | Yes |
+| `get_call_graph` | Hub functions, entry points, and architectural layer violations for the project. | Yes |
+| `get_signatures` | Compact function/class signatures per file. Filter by path substring with `filePattern`. | Yes |
+| `get_subgraph` | Depth-limited subgraph centred on a function name. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. | Yes |
+
+### Parameters
+
+**`analyze_codebase`**
+```
+directory  string   Absolute path to the project directory
+force      boolean  Force re-analysis even if cache is fresh (default: false)
+```
+
+**`get_refactor_report`**, **`get_call_graph`**
+```
+directory  string   Absolute path to the project directory
+```
+
+**`get_signatures`**
+```
+directory    string   Absolute path to the project directory
+filePattern  string   Optional path substring filter (e.g. "services", ".py")
+```
+
+**`get_subgraph`**
+```
+directory     string   Absolute path to the project directory
+functionName  string   Function name to centre on (case-insensitive partial match)
+direction     string   "downstream" | "upstream" | "both"  (default: "downstream")
+maxDepth      number   BFS traversal depth limit  (default: 3)
+```
+
+### Typical workflow
+
+```
+1. analyze_codebase({ directory: "/path/to/project" })
+2. get_refactor_report({ directory: "/path/to/project" })
+3. get_subgraph({ directory: "...", functionName: "run", direction: "downstream" })
 ```
 
 ## Output
@@ -406,11 +473,14 @@ Static analysis output is stored in `.spec-gen/analysis/`:
 
 ## Supported Languages
 
-| Language | Support Level |
-|----------|---------------|
-| JavaScript/TypeScript | Full |
-| Python | Basic |
-| Go | Basic |
+| Language | Signatures | Call Graph |
+|----------|-----------|------------|
+| TypeScript / JavaScript | Full | Full |
+| Python | Full | Full |
+| Go | Full | Full |
+| Rust | Full | Full |
+| Ruby | Full | Full |
+| Java | Full | Full |
 
 TypeScript projects get the best results due to richer type information.
 
@@ -441,11 +511,11 @@ spec-gen init && spec-gen analyze && spec-gen generate && spec-gen drift --insta
 npm install          # Install dependencies
 npm run dev          # Development mode (watch)
 npm run build        # Build
-npm run test:run     # Run tests (919 unit tests)
+npm run test:run     # Run tests (1052 unit tests)
 npm run typecheck    # Type check
 ```
 
-919 unit tests covering static analysis, spec mapping, drift detection, LLM enhancement, ADR generation, and the full CLI.
+1052 unit tests covering static analysis, call graph, refactor analysis, spec mapping, drift detection, LLM enhancement, ADR generation, and the full CLI.
 
 ## Links
 

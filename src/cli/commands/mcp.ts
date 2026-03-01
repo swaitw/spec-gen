@@ -25,13 +25,16 @@
  */
 
 import { Command } from 'commander';
+// We use the low-level `Server` class rather than the high-level `McpServer`
+// because our tool definitions use raw JSON Schema. `McpServer` requires Zod.
+// eslint-disable-next-line deprecation/deprecation
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { runAnalysis } from './analyze.js';
 import { analyzeForRefactoring } from '../../core/analyzer/refactor-analyzer.js';
@@ -175,15 +178,13 @@ async function readCachedContext(directory: string): Promise<LLMContext | null> 
   }
 }
 
-async function readCachedRepoStructure(directory: string): Promise<Record<string, unknown> | null> {
+/** Returns true if the cached analysis is present and less than 1 hour old. */
+async function isCacheFresh(directory: string): Promise<boolean> {
   try {
-    const raw = await readFile(
-      join(directory, '.spec-gen', 'analysis', 'repo-structure.json'),
-      'utf-8'
-    );
-    return JSON.parse(raw) as Record<string, unknown>;
+    const s = await stat(join(directory, '.spec-gen', 'analysis', 'llm-context.json'));
+    return Date.now() - s.mtimeMs < 60 * 60 * 1000;
   } catch {
-    return null;
+    return false;
   }
 }
 
@@ -191,12 +192,45 @@ async function readCachedRepoStructure(directory: string): Promise<Record<string
 // TOOL HANDLERS
 // ============================================================================
 
+/**
+ * Run a full static analysis pass on `directory` and return a compact summary.
+ *
+ * Always writes results to `<directory>/.spec-gen/analysis/`. The `force`
+ * flag bypasses the 1-hour cache and triggers a fresh analysis.
+ *
+ * Returned object includes: project metadata, file/dep/call-graph stats,
+ * detected domains, and the top-10 refactoring priorities (if a call graph
+ * was produced).
+ */
 async function handleAnalyzeCodebase(
   directory: string,
   force: boolean
 ): Promise<Record<string, unknown>> {
   const absDir = resolve(directory);
   const outputPath = join(absDir, '.spec-gen', 'analysis');
+
+  // Skip re-analysis if cache is fresh and force is not set
+  if (!force && await isCacheFresh(absDir)) {
+    const ctx = await readCachedContext(absDir);
+    if (ctx) {
+      const cg = ctx.callGraph;
+      const topRefactorIssues = cg
+        ? analyzeForRefactoring(cg as SerializedCallGraph).priorities.slice(0, 10).map(e => ({
+            function: e.function, file: e.file, issues: e.issues, priorityScore: e.priorityScore,
+          }))
+        : [];
+      return {
+        cached: true,
+        callGraph: cg
+          ? { totalNodes: cg.stats.totalNodes, totalEdges: cg.stats.totalEdges,
+              hubs: cg.hubFunctions.length, entryPoints: cg.entryPoints.length,
+              layerViolations: cg.layerViolations.length }
+          : null,
+        topRefactorIssues,
+        analysisPath: join('.spec-gen', 'analysis'),
+      };
+    }
+  }
 
   const result = await runAnalysis(absDir, outputPath, {
     maxFiles: 500,
@@ -247,6 +281,13 @@ async function handleAnalyzeCodebase(
   };
 }
 
+/**
+ * Return a prioritized refactor report from cached analysis.
+ *
+ * Detects five issue categories: unreachable code, high fan-in (hub overload),
+ * high fan-out (god function), SRP violations, and cyclic dependencies.
+ * Requires a prior successful `analyze_codebase` call.
+ */
 async function handleGetRefactorReport(directory: string): Promise<unknown> {
   const absDir = resolve(directory);
   const ctx = await readCachedContext(absDir);
@@ -261,6 +302,13 @@ async function handleGetRefactorReport(directory: string): Promise<unknown> {
   return analyzeForRefactoring(ctx.callGraph as SerializedCallGraph);
 }
 
+/**
+ * Return the call graph summary from cached analysis.
+ *
+ * Includes hub functions (high fan-in), entry points (no internal callers),
+ * and architectural layer violations. Supports TypeScript, JavaScript, Python,
+ * Go, Rust, Ruby, and Java. Requires a prior `analyze_codebase` call.
+ */
 async function handleGetCallGraph(directory: string): Promise<unknown> {
   const absDir = resolve(directory);
   const ctx = await readCachedContext(absDir);
@@ -293,6 +341,14 @@ async function handleGetCallGraph(directory: string): Promise<unknown> {
   };
 }
 
+/**
+ * Return compact function and class signatures for files in the project.
+ *
+ * Useful for understanding a codebase's public API without reading full source.
+ * Pass `filePattern` to filter by path substring (e.g. `"services"`, `".py"`).
+ * Multiple chunks are joined with a `---` separator.
+ * Requires a prior `analyze_codebase` call.
+ */
 async function handleGetSignatures(directory: string, filePattern?: string): Promise<string> {
   const absDir = resolve(directory);
   const ctx = await readCachedContext(absDir);
@@ -316,6 +372,19 @@ async function handleGetSignatures(directory: string, filePattern?: string): Pro
   return chunks.join('\n\n---\n\n');
 }
 
+/**
+ * Extract a depth-limited subgraph centred on a named function.
+ *
+ * `functionName` is matched case-insensitively as a substring against all node
+ * names; multiple seed nodes may be returned. Traversal direction:
+ *   - `downstream` — what this function calls (blast radius / impact analysis)
+ *   - `upstream`   — who calls this function (dependency tracing)
+ *   - `both`       — full neighbourhood
+ *
+ * `maxDepth` limits BFS depth (default: 3). Returns seed nodes, all reachable
+ * nodes with fan-in/fan-out metrics, and the edges within the subgraph.
+ * Requires a prior `analyze_codebase` call.
+ */
 async function handleGetSubgraph(
   directory: string,
   functionName: string,
