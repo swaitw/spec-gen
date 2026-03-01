@@ -354,7 +354,8 @@ spec-gen verify [options]
 | `get_refactor_report` | Prioritized list of functions to refactor: unreachable code, hub overload (high fan-in), god functions (high fan-out), SRP violations, cyclic deps. | Yes |
 | `get_call_graph` | Hub functions, entry points, and architectural layer violations for the project. | Yes |
 | `get_signatures` | Compact function/class signatures per file. Filter by path substring with `filePattern`. | Yes |
-| `get_subgraph` | Depth-limited subgraph centred on a function name. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. | Yes |
+| `get_subgraph` | Depth-limited subgraph centred on a function name. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. Output as JSON or Mermaid diagram. | Yes |
+| `get_mapping` | Requirement→function mapping from `spec-gen generate`. Shows which functions implement which spec requirements, confidence level, and orphan functions with no spec coverage. | Yes (generate) |
 
 ### Parameters
 
@@ -381,6 +382,14 @@ directory     string   Absolute path to the project directory
 functionName  string   Function name to centre on (case-insensitive partial match)
 direction     string   "downstream" | "upstream" | "both"  (default: "downstream")
 maxDepth      number   BFS traversal depth limit  (default: 3)
+format        string   "json" | "mermaid"  (default: "json")
+```
+
+**`get_mapping`**
+```
+directory    string    Absolute path to the project directory
+domain       string    Optional domain filter (e.g. "auth", "crawler")
+orphansOnly  boolean   Return only orphan functions (default: false)
 ```
 
 ### Typical workflow
@@ -388,7 +397,8 @@ maxDepth      number   BFS traversal depth limit  (default: 3)
 ```
 1. analyze_codebase({ directory: "/path/to/project" })
 2. get_refactor_report({ directory: "/path/to/project" })
-3. get_subgraph({ directory: "...", functionName: "run", direction: "downstream" })
+3. get_subgraph({ directory: "...", functionName: "run", direction: "downstream", format: "mermaid" })
+4. get_mapping({ directory: "...", orphansOnly: true })   # dead code candidates
 ```
 
 ## Output

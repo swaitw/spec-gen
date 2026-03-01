@@ -41,6 +41,7 @@ import { analyzeForRefactoring } from '../../core/analyzer/refactor-analyzer.js'
 import { formatSignatureMaps } from '../../core/analyzer/signature-extractor.js';
 import type { LLMContext } from '../../core/analyzer/artifact-generator.js';
 import type { SerializedCallGraph } from '../../core/analyzer/call-graph.js';
+import type { MappingArtifact } from '../../core/generator/mapping-generator.js';
 
 // ============================================================================
 // TOOL DEFINITIONS
@@ -156,8 +157,39 @@ const TOOL_DEFINITIONS = [
           type: 'number',
           description: 'Maximum traversal depth (default: 3)',
         },
+        format: {
+          type: 'string',
+          enum: ['json', 'mermaid'],
+          description: 'Output format: "json" (default) or "mermaid" flowchart diagram',
+        },
       },
       required: ['directory', 'functionName'],
+    },
+  },
+  {
+    name: 'get_mapping',
+    description:
+      'Return the requirement → function mapping produced by spec-gen generate. ' +
+      'Shows which functions implement which spec requirements, confidence level ' +
+      '(llm / heuristic), and orphan functions not covered by any requirement. ' +
+      'Requires spec-gen generate to have been run at least once.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory',
+        },
+        domain: {
+          type: 'string',
+          description: 'Filter by domain name (e.g. "auth", "crawler")',
+        },
+        orphansOnly: {
+          type: 'boolean',
+          description: 'Return only orphan functions (not covered by any requirement)',
+        },
+      },
+      required: ['directory'],
     },
   },
 ];
@@ -373,6 +405,47 @@ async function handleGetSignatures(directory: string, filePattern?: string): Pro
 }
 
 /**
+ * Return the requirement→function mapping from `mapping.json`.
+ *
+ * Pass `domain` to filter by domain name, `orphansOnly` to return only
+ * functions not covered by any requirement. Requires `spec-gen generate`
+ * to have been run at least once.
+ */
+async function handleGetMapping(
+  directory: string,
+  domain?: string,
+  orphansOnly?: boolean
+): Promise<unknown> {
+  const absDir = resolve(directory);
+  let raw: string;
+  try {
+    raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'mapping.json'), 'utf-8');
+  } catch {
+    return { error: 'No mapping found. Run spec-gen generate first.' };
+  }
+
+  const mapping = JSON.parse(raw) as MappingArtifact;
+
+  if (orphansOnly) {
+    const filtered = domain
+      ? mapping.orphanFunctions.filter(f => f.file.includes(domain))
+      : mapping.orphanFunctions;
+    return { generatedAt: mapping.generatedAt, stats: mapping.stats, orphanFunctions: filtered };
+  }
+
+  const filteredMappings = domain
+    ? mapping.mappings.filter(m => m.domain === domain)
+    : mapping.mappings;
+
+  return {
+    generatedAt: mapping.generatedAt,
+    stats: mapping.stats,
+    mappings: filteredMappings,
+    orphanFunctions: domain ? [] : mapping.orphanFunctions,
+  };
+}
+
+/**
  * Extract a depth-limited subgraph centred on a named function.
  *
  * `functionName` is matched case-insensitively as a substring against all node
@@ -381,15 +454,17 @@ async function handleGetSignatures(directory: string, filePattern?: string): Pro
  *   - `upstream`   — who calls this function (dependency tracing)
  *   - `both`       — full neighbourhood
  *
- * `maxDepth` limits BFS depth (default: 3). Returns seed nodes, all reachable
- * nodes with fan-in/fan-out metrics, and the edges within the subgraph.
+ * `maxDepth` limits BFS depth (default: 3). `format` controls output:
+ * `"json"` (default) returns structured data; `"mermaid"` returns a Mermaid
+ * flowchart diagram with seed nodes highlighted in orange.
  * Requires a prior `analyze_codebase` call.
  */
 async function handleGetSubgraph(
   directory: string,
   functionName: string,
   direction: 'downstream' | 'upstream' | 'both' = 'downstream',
-  maxDepth = 3
+  maxDepth = 3,
+  format: 'json' | 'mermaid' = 'json'
 ): Promise<unknown> {
   const absDir = resolve(directory);
   const ctx = await readCachedContext(absDir);
@@ -473,6 +548,36 @@ async function handleGetSubgraph(
       calleeFile: nodeMap.get(e.calleeId)?.filePath,
     }));
 
+  if (format === 'mermaid') {
+    // Assign stable numeric IDs to avoid Mermaid parsing issues with special chars
+    const idOf = new Map<string, string>();
+    subNodes.forEach((n, i) => idOf.set(n.name + '|' + n.file, `n${i}`));
+
+    const nodeLines = subNodes.map(n => {
+      const id = idOf.get(n.name + '|' + n.file)!;
+      const label = `"${n.name}\\n${n.file}"`;
+      return n.isSeed ? `    ${id}[${label}]:::seed` : `    ${id}["${n.name}\\n${n.file}"]`;
+    });
+
+    const edgeLines = subEdges.map(e => {
+      const fromId = idOf.get(e.caller + '|' + e.callerFile) ?? e.caller;
+      const toId   = idOf.get(e.callee + '|' + e.calleeFile) ?? e.callee;
+      return `    ${fromId} --> ${toId}`;
+    });
+
+    const deduped = [...new Set(edgeLines)];
+    const diagram = [
+      'flowchart LR',
+      '    classDef seed fill:#f5a623,stroke:#d4891a,color:#000',
+      ...nodeLines,
+      ...deduped,
+    ].join('\n');
+
+    return `\`\`\`mermaid\n${diagram}\n\`\`\`\n\n` +
+      `_${subNodes.length} nodes · ${deduped.length} edges · ` +
+      `seeds: ${seeds.map(s => s.name).join(', ')}_`;
+  }
+
   return {
     query: { functionName, direction, maxDepth },
     seeds: seeds.map(n => ({ name: n.name, file: n.filePath })),
@@ -515,9 +620,12 @@ async function startMcpServer(): Promise<void> {
         const { directory, filePattern } = args as { directory: string; filePattern?: string };
         result = await handleGetSignatures(directory, filePattern);
       } else if (name === 'get_subgraph') {
-        const { directory, functionName, direction = 'downstream', maxDepth = 3 } =
-          args as { directory: string; functionName: string; direction?: 'downstream' | 'upstream' | 'both'; maxDepth?: number };
-        result = await handleGetSubgraph(directory, functionName, direction, maxDepth);
+        const { directory, functionName, direction = 'downstream', maxDepth = 3, format = 'json' } =
+          args as { directory: string; functionName: string; direction?: 'downstream' | 'upstream' | 'both'; maxDepth?: number; format?: 'json' | 'mermaid' };
+        result = await handleGetSubgraph(directory, functionName, direction, maxDepth, format);
+      } else if (name === 'get_mapping') {
+        const { directory, domain, orphansOnly } = args as { directory: string; domain?: string; orphansOnly?: boolean };
+        result = await handleGetMapping(directory, domain, orphansOnly);
       } else {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
