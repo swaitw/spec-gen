@@ -126,6 +126,12 @@ interface RetryConfig {
 function disableSslVerification(): void {
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') return; // already disabled
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  // Warn prominently: this is process-global and affects all fetch calls.
+  console.warn(
+    '[spec-gen] WARNING: TLS certificate verification is DISABLED for this process.' +
+    ' All HTTPS connections (including LLM API calls) are vulnerable to MITM attacks.' +
+    ' Only use --insecure on trusted private networks with self-signed certificates.'
+  );
 }
 
 /**

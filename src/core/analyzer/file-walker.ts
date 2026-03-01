@@ -204,11 +204,16 @@ const TEST_FILE_PATTERNS = [
   /^spec_.*\.[^.]+$/,
 ];
 
+/** Maximum file size to read for line counting / shebang detection (10 MB). */
+const MAX_READ_SIZE = 10_000_000;
+
 /**
  * Check if a file has a shebang line
  */
 async function hasShebang(filePath: string): Promise<boolean> {
   try {
+    const s = await stat(filePath);
+    if (s.size > MAX_READ_SIZE) return false;
     const content = await readFile(filePath, { encoding: 'utf-8', flag: 'r' });
     return content.startsWith('#!');
   } catch {
@@ -217,10 +222,12 @@ async function hasShebang(filePath: string): Promise<boolean> {
 }
 
 /**
- * Count lines in a file
+ * Count lines in a file. Returns -1 for files larger than MAX_READ_SIZE.
  */
 async function countLines(filePath: string): Promise<number> {
   try {
+    const s = await stat(filePath);
+    if (s.size > MAX_READ_SIZE) return -1;
     const content = await readFile(filePath, 'utf-8');
     return content.split('\n').length;
   } catch {

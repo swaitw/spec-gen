@@ -195,6 +195,48 @@ const TOOL_DEFINITIONS = [
 ];
 
 // ============================================================================
+// INPUT VALIDATION
+// ============================================================================
+
+/**
+ * Resolve and validate a user-supplied directory path.
+ *
+ * Ensures the path resolves to an existing directory, which prevents path
+ * traversal attacks where a client supplies `"../../../../etc"` or a plain
+ * file path instead of a project directory.
+ */
+async function validateDirectory(directory: string): Promise<string> {
+  if (!directory || typeof directory !== 'string') {
+    throw new Error('directory parameter is required and must be a string');
+  }
+  const absDir = resolve(directory);
+  let s: Awaited<ReturnType<typeof stat>>;
+  try {
+    s = await stat(absDir);
+  } catch {
+    throw new Error(`Directory not found: ${absDir}`);
+  }
+  if (!s.isDirectory()) {
+    throw new Error(`Not a directory: ${absDir}`);
+  }
+  return absDir;
+}
+
+/**
+ * Strip common API key and token patterns from an error message before
+ * returning it to MCP clients, to prevent secret leakage via error responses.
+ */
+function sanitizeMcpError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg
+    .replace(/sk-ant-[A-Za-z0-9\-_]{10,}/g, '[REDACTED]')
+    .replace(/sk-[A-Za-z0-9\-_]{20,}/g, '[REDACTED]')
+    .replace(/Bearer\s+\S{10,}/g, 'Bearer [REDACTED]')
+    .replace(/Authorization:\s*\S+/gi, 'Authorization: [REDACTED]')
+    .replace(/api[_-]?key[=:]\s*\S{8,}/gi, 'api_key=[REDACTED]');
+}
+
+// ============================================================================
 // CACHE HELPERS
 // ============================================================================
 
@@ -238,7 +280,7 @@ async function handleAnalyzeCodebase(
   directory: string,
   force: boolean
 ): Promise<Record<string, unknown>> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   const outputPath = join(absDir, '.spec-gen', 'analysis');
 
   // Skip re-analysis if cache is fresh and force is not set
@@ -321,7 +363,7 @@ async function handleAnalyzeCodebase(
  * Requires a prior successful `analyze_codebase` call.
  */
 async function handleGetRefactorReport(directory: string): Promise<unknown> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);
 
   if (!ctx) {
@@ -342,7 +384,7 @@ async function handleGetRefactorReport(directory: string): Promise<unknown> {
  * Go, Rust, Ruby, and Java. Requires a prior `analyze_codebase` call.
  */
 async function handleGetCallGraph(directory: string): Promise<unknown> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);
 
   if (!ctx) {
@@ -382,7 +424,7 @@ async function handleGetCallGraph(directory: string): Promise<unknown> {
  * Requires a prior `analyze_codebase` call.
  */
 async function handleGetSignatures(directory: string, filePattern?: string): Promise<string> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);
 
   if (!ctx) {
@@ -416,7 +458,7 @@ async function handleGetMapping(
   domain?: string,
   orphansOnly?: boolean
 ): Promise<unknown> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   let raw: string;
   try {
     raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'mapping.json'), 'utf-8');
@@ -466,7 +508,7 @@ async function handleGetSubgraph(
   maxDepth = 3,
   format: 'json' | 'mermaid' = 'json'
 ): Promise<unknown> {
-  const absDir = resolve(directory);
+  const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);
 
   if (!ctx) {
@@ -640,9 +682,8 @@ async function startMcpServer(): Promise<void> {
         content: [{ type: 'text', text }],
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
       return {
-        content: [{ type: 'text', text: `Tool error: ${message}` }],
+        content: [{ type: 'text', text: `Tool error: ${sanitizeMcpError(err)}` }],
         isError: true,
       };
     }
