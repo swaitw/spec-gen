@@ -205,4 +205,61 @@ describe('runAnalysis integration — excludePatterns', () => {
 
     expect(paths.some(p => p.includes('service.proto'))).toBe(true);
   });
+
+  /**
+   * Metric verification — manually computed expected values
+   *
+   * Setup:
+   *   src/api.py, src/models.py, src/utils.py  → analyzed   (3 files)
+   *   static/swagger/swagger-ui-bundle.js       → excluded via excludePattern
+   *   static/swagger/redoc.standalone.js        → same excluded dir
+   *   .spec-gen/config.json                     → always skipped (SKIP_DIRECTORIES)
+   *
+   * Walker records 1 skip per skipped directory entry (not per file inside):
+   *   static/  → 1 skip  (shouldSkipDirectory via excludePatterns)
+   *   .spec-gen/ → 1 skip (shouldSkipDirectory via SKIP_DIRECTORIES)
+   *
+   * Expected metrics:
+   *   allFiles.length    = 3
+   *   analyzedFiles      = 3   (== allFiles.length)
+   *   skippedFiles       = 2   (1 per skipped directory)
+   *   totalFiles         = 5   (analyzedFiles + skippedFiles)
+   */
+  it('metrics match manually-computed expected values', async () => {
+    await createFile(tmpDir, '.spec-gen/config.json', SPEC_GEN_CONFIG(['static/**']));
+    await createFile(tmpDir, 'src/api.py',    'def get(): pass');
+    await createFile(tmpDir, 'src/models.py', 'class User: pass');
+    await createFile(tmpDir, 'src/utils.py',  'def helper(): pass');
+    await createFile(tmpDir, 'static/swagger/swagger-ui-bundle.js', '/* swagger */');
+    await createFile(tmpDir, 'static/swagger/redoc.standalone.js',  '/* redoc */');
+
+    const { repoMap } = await runAnalysis(tmpDir, outputDir, {
+      maxFiles: 500, include: [], exclude: [],
+    });
+
+    // ── allFiles content ──────────────────────────────────────────────────
+    const paths = repoMap.allFiles.map(f => f.path);
+    expect(paths).toEqual(expect.arrayContaining([
+      expect.stringContaining('api.py'),
+      expect.stringContaining('models.py'),
+      expect.stringContaining('utils.py'),
+    ]));
+    expect(paths.some(p => p.includes('swagger'))).toBe(false);
+    expect(paths.some(p => p.includes('redoc'))).toBe(false);
+
+    // ── exact counts ──────────────────────────────────────────────────────
+    expect(repoMap.allFiles).toHaveLength(3);
+
+    // analyzedFiles mirrors allFiles
+    expect(repoMap.summary.analyzedFiles).toBe(3);
+
+    // 1 skip per skipped directory (static/ and .spec-gen/)
+    expect(repoMap.summary.skippedFiles).toBe(2);
+
+    // totalFiles = analyzedFiles + skippedFiles
+    expect(repoMap.summary.totalFiles).toBe(
+      repoMap.summary.analyzedFiles + repoMap.summary.skippedFiles
+    );
+    expect(repoMap.summary.totalFiles).toBe(5);
+  });
 });
