@@ -44,7 +44,7 @@ Highlight any hub functions (fanIn ≥ 8) or layer violations detected.
 
 ## Step 5: Suggest next steps
 
-Based on the analysis, suggest one of:
-- Run the `refactor` workflow to address the top issues
-- Ask for `get_signatures` on a specific module to understand its API
-- Ask for `get_subgraph` on a specific function to map its dependencies
+Based on the analysis, guide the user through the natural next steps in order:
+1. Call `get_signatures` on the modules that contain the top issues to understand their public API
+2. Call `get_subgraph` on the highest-priority function to map its callers and callees
+3. Suggest running `/spec-gen-refactor-codebase` once the user has enough context to act
