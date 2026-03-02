@@ -344,7 +344,7 @@ spec-gen verify [options]
 
 ## MCP Server
 
-`spec-gen mcp` starts spec-gen as a [Model Context Protocol](https://modelcontextprotocol.io/) server over stdio, exposing static analysis as tools that any MCP-compatible AI agent (Cline, Claude Code, Cursor…) can call directly — no API key required.
+`spec-gen mcp` starts spec-gen as a [Model Context Protocol](https://modelcontextprotocol.io/) server over stdio, exposing static analysis as tools that any MCP-compatible AI agent (Cline, Roo Code, Kilocode, Claude Code, Cursor…) can call directly — no API key required.
 
 ### Setup
 
@@ -361,11 +361,64 @@ spec-gen verify [options]
 }
 ```
 
-**Cline** — add the same block under `mcpServers` in Cline's MCP settings JSON.
+**Cline / Roo Code / Kilocode** — add the same block under `mcpServers` in the MCP settings JSON of your editor.
+
+### Quick Start with Cline
+
+**1. Build and link spec-gen**
+
+```bash
+git clone https://github.com/clay-good/spec-gen
+cd spec-gen && npm install && npm run build
+```
+
+**2. Configure the MCP server in your editor**
+
+Open your editor's MCP settings (Cline / Roo Code / Kilocode: settings → MCP Servers) and add:
+
+```json
+{
+  "mcpServers": {
+    "spec-gen": {
+      "command": "node",
+      "args": ["/absolute/path/to/spec-gen/dist/cli/index.js", "mcp"]
+    }
+  }
+}
+```
+
+**3. Install the slash command workflows in your project**
+
+Cline, Roo Code, and Kilocode all load slash command workflows from `.clinerules/workflows/`:
+
+```bash
+cd /path/to/your-project
+mkdir -p .clinerules/workflows
+cp /path/to/spec-gen/examples/cline-workflows/*.md .clinerules/workflows/
+```
+
+**4. Generate specs once** (required for `/spec-gen-check-spec-drift` and naming alignment)
+
+```bash
+spec-gen init      # detect project type, create config
+spec-gen generate  # generate OpenSpec specs (requires LLM API key)
+```
+
+**5. Use the slash commands**
+
+In any Cline conversation, type one of:
+
+| Command | Needs API key | What it does |
+|---------|:---:|-------------|
+| `/spec-gen-analyze-codebase` | No | Architecture overview, call graph highlights, top refactor issues |
+| `/spec-gen-check-spec-drift` | No | Detect code changes not reflected in specs; per-kind remediation guidance |
+| `/spec-gen-refactor-codebase` | No | Full guided refactoring loop with impact analysis, coverage gate, and verification |
+
+`analyze_codebase`, `check_spec_drift`, and all refactoring tools run on **pure static analysis** — no LLM quota consumed. Only `spec-gen generate` (the one-time spec generation step) requires an API key.
 
 ### Cline Slash Commands
 
-`examples/cline-workflows/` contains two executable workflow files that drive the full analysis and refactoring loop as Cline slash commands. Copy them to your project's `.clinerules/workflows/` to activate them:
+`examples/cline-workflows/` contains three executable workflow files. Copy them to your project's `.clinerules/workflows/` to activate them as slash commands:
 
 ```bash
 mkdir -p .clinerules/workflows
@@ -375,9 +428,10 @@ cp /path/to/spec-gen/examples/cline-workflows/*.md .clinerules/workflows/
 | Command | What it does |
 |---------|-------------|
 | `/spec-gen-analyze-codebase` | Runs `analyze_codebase`, summarises the results (project type, file count, top 3 refactor issues, detected domains), shows the call graph highlights, and suggests next steps. |
-| `/spec-gen-refactor-codebase` | Full refactoring loop: static analysis → prioritized report → impact assessment → Mermaid subgraph → low-risk entry points → proposed changes → verification. Optional Step 10 covers dead-code detection and naming alignment (requires `spec-gen generate`). |
+| `/spec-gen-check-spec-drift` | Runs `check_spec_drift`, presents issues by severity (gap / stale / uncovered / orphaned-spec), shows per-kind remediation commands, and optionally drills into affected file signatures. |
+| `/spec-gen-refactor-codebase` | Full refactoring loop: static analysis → prioritized report with coverage gate → impact assessment → Mermaid subgraph → low-risk entry points → proposed changes → verification. Optional final step covers dead-code detection and naming alignment (requires `spec-gen generate`). |
 
-Both commands ask which directory to analyse, call the MCP tools directly, and guide you through the results without leaving the editor.
+All three commands ask which directory to use, call the MCP tools directly, and guide you through the results without leaving the editor. They work in Cline, Roo Code, Kilocode, and any editor that supports the `.clinerules/workflows/` convention.
 
 ### Tools
 
