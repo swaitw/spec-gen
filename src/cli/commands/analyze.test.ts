@@ -2,8 +2,64 @@
  * Tests for spec-gen analyze command
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { analyzeCommand, runAnalysis } from './analyze.js';
+
+// ============================================================================
+// MOCKS
+// ============================================================================
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: {
+    section: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn(),
+    success: vi.fn(), discovery: vi.fn(), analysis: vi.fn(), blank: vi.fn(),
+  },
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, writeFile: vi.fn().mockResolvedValue(undefined) };
+});
+
+vi.mock('../../core/analyzer/repository-mapper.js', () => {
+  const mockMap = vi.fn().mockResolvedValue({
+    allFiles: [],
+    highValueFiles: [],
+    summary: { totalFiles: 0, analyzedFiles: 0, skippedFiles: 0, languages: [] },
+  });
+  function MockRepositoryMapper(this: unknown, _root: string, _opts: unknown) {
+    Object.assign(this as object, { map: mockMap });
+  }
+  return { RepositoryMapper: vi.fn().mockImplementation(function(this: unknown, root: string, opts: unknown) {
+    Object.assign(this as object, { map: mockMap });
+    void root; void opts;
+  }) };
+});
+
+vi.mock('../../core/analyzer/dependency-graph.js', () => ({
+  DependencyGraphBuilder: vi.fn().mockImplementation(function(this: unknown) {
+    Object.assign(this as object, {
+      build: vi.fn().mockResolvedValue({
+        statistics: { nodeCount: 0, edgeCount: 0, clusterCount: 0, cycleCount: 0, avgDegree: 0 },
+      }),
+    });
+  }),
+}));
+
+vi.mock('../../core/analyzer/artifact-generator.js', () => ({
+  AnalysisArtifactGenerator: vi.fn().mockImplementation(function(this: unknown) {
+    Object.assign(this as object, {
+      generateAndSave: vi.fn().mockResolvedValue({
+        repoStructure: { architecture: { pattern: 'unknown' }, domains: [] },
+        llmContext: { callGraph: null },
+      }),
+    });
+  }),
+}));
+
+vi.mock('../../core/services/config-manager.js', () => ({
+  readSpecGenConfig: vi.fn(),
+}));
 
 describe('analyze command', () => {
   describe('command configuration', () => {
@@ -149,6 +205,86 @@ describe('analyze command', () => {
     it('should be exported', () => {
       expect(runAnalysis).toBeDefined();
       expect(typeof runAnalysis).toBe('function');
+    });
+  });
+
+  describe('runAnalysis — excludePatterns from config', () => {
+    let MockRepositoryMapper: ReturnType<typeof vi.fn>;
+    let readSpecGenConfig: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const mapperMod = await import('../../core/analyzer/repository-mapper.js');
+      MockRepositoryMapper = vi.mocked(mapperMod.RepositoryMapper);
+      MockRepositoryMapper.mockClear();
+
+      const cfgMod = await import('../../core/services/config-manager.js');
+      readSpecGenConfig = vi.mocked(cfgMod.readSpecGenConfig);
+    });
+
+    function makeConfig(excludePatterns: string[]) {
+      return {
+        version: '1.0.0',
+        projectType: 'nodejs' as const,
+        openspecPath: './openspec',
+        analysis: { maxFiles: 500, includePatterns: [], excludePatterns },
+        generation: { provider: 'openai' as const, model: 'gpt-4', domains: 'auto' as const },
+        createdAt: new Date().toISOString(),
+        lastRun: null,
+      };
+    }
+
+    function getMapperExcludePatterns(): string[] {
+      // Constructor second arg is options; check what excludePatterns was passed
+      const calls = MockRepositoryMapper.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return (calls[calls.length - 1][1] as { excludePatterns?: string[] })?.excludePatterns ?? [];
+    }
+
+    it('passes config excludePatterns to RepositoryMapper when caller passes none', async () => {
+      readSpecGenConfig.mockResolvedValue(makeConfig(['static/**', 'vendor/**']));
+
+      await runAnalysis('/fake/root', '/fake/root/.spec-gen/analysis', {
+        maxFiles: 500, include: [], exclude: [],
+      });
+
+      expect(getMapperExcludePatterns()).toEqual(
+        expect.arrayContaining(['static/**', 'vendor/**'])
+      );
+    });
+
+    it('merges config excludePatterns with caller-supplied exclude patterns', async () => {
+      readSpecGenConfig.mockResolvedValue(makeConfig(['static/**']));
+
+      await runAnalysis('/fake/root', '/fake/root/.spec-gen/analysis', {
+        maxFiles: 500, include: [], exclude: ['legacy/**'],
+      });
+
+      expect(getMapperExcludePatterns()).toEqual(
+        expect.arrayContaining(['static/**', 'legacy/**'])
+      );
+    });
+
+    it('deduplicates patterns that appear in both config and caller exclude', async () => {
+      readSpecGenConfig.mockResolvedValue(makeConfig(['node_modules/**']));
+
+      await runAnalysis('/fake/root', '/fake/root/.spec-gen/analysis', {
+        maxFiles: 500, include: [], exclude: ['node_modules/**'],
+      });
+
+      const patterns = getMapperExcludePatterns();
+      expect(patterns.filter(p => p === 'node_modules/**')).toHaveLength(1);
+    });
+
+    it('works when no config exists (null) and uses caller-supplied patterns only', async () => {
+      readSpecGenConfig.mockResolvedValue(null);
+
+      await runAnalysis('/fake/root', '/fake/root/.spec-gen/analysis', {
+        maxFiles: 500, include: [], exclude: ['dist/**'],
+      });
+
+      expect(getMapperExcludePatterns()).toEqual(
+        expect.arrayContaining(['dist/**'])
+      );
     });
   });
 });

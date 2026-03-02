@@ -1,0 +1,158 @@
+/**
+ * Integration tests for runAnalysis — excludePatterns end-to-end
+ *
+ * These tests run the real FileWalker + RepositoryMapper on a temporary
+ * directory and assert that files matching excludePatterns from the config
+ * are truly absent from the analysis results. Only the heavy downstream
+ * stages (DependencyGraphBuilder, AnalysisArtifactGenerator) are mocked to
+ * keep tests fast and free of LLM/tree-sitter dependencies.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { runAnalysis } from './analyze.js';
+
+// ============================================================================
+// PARTIAL MOCKS — only downstream heavy stages
+// ============================================================================
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: {
+    section: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn(),
+    success: vi.fn(), discovery: vi.fn(), analysis: vi.fn(), blank: vi.fn(),
+  },
+}));
+
+// writeFile used by runAnalysis to save dependency-graph.json
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    writeFile: vi.fn(async (path: unknown, data: unknown) => {
+      // Allow writes to tmp dirs; suppress everything else
+      if (typeof path === 'string' && path.includes(tmpdir())) {
+        return actual.writeFile(path as Parameters<typeof actual.writeFile>[0], data as Parameters<typeof actual.writeFile>[1]);
+      }
+    }),
+  };
+});
+
+vi.mock('../../core/analyzer/dependency-graph.js', () => ({
+  DependencyGraphBuilder: vi.fn().mockImplementation(function(this: unknown) {
+    Object.assign(this as object, {
+      build: vi.fn().mockResolvedValue({
+        statistics: { nodeCount: 0, edgeCount: 0, clusterCount: 0, cycleCount: 0, avgDegree: 0 },
+      }),
+    });
+  }),
+}));
+
+vi.mock('../../core/analyzer/artifact-generator.js', () => ({
+  AnalysisArtifactGenerator: vi.fn().mockImplementation(function(this: unknown) {
+    Object.assign(this as object, {
+      generateAndSave: vi.fn().mockResolvedValue({
+        repoStructure: { architecture: { pattern: 'unknown' }, domains: [] },
+        llmContext: { callGraph: null },
+      }),
+    });
+  }),
+}));
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+const SPEC_GEN_CONFIG = (excludePatterns: string[]) =>
+  JSON.stringify({
+    version: '1.0.0',
+    projectType: 'python',
+    openspecPath: './openspec',
+    analysis: { maxFiles: 500, includePatterns: [], excludePatterns },
+    generation: { provider: 'openai', model: 'gpt-4', domains: 'auto' },
+    createdAt: new Date().toISOString(),
+    lastRun: null,
+  }, null, 2);
+
+async function createFile(dir: string, relPath: string, content = ''): Promise<void> {
+  const full = join(dir, relPath);
+  await mkdir(join(full, '..'), { recursive: true });
+  await writeFile(full, content);
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+describe('runAnalysis integration — excludePatterns', () => {
+  let tmpDir: string;
+  let outputDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-integration-'));
+    outputDir = join(tmpDir, '.spec-gen', 'analysis');
+    await mkdir(outputDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('excludes files matching config excludePatterns from allFiles', async () => {
+    // Config excludes static/** (where swagger lives)
+    await createFile(tmpDir, '.spec-gen/config.json', SPEC_GEN_CONFIG(['static/**', '.spec-gen/**']));
+
+    // Files that SHOULD be included
+    await createFile(tmpDir, 'app/main.py', 'def main(): pass');
+    await createFile(tmpDir, 'app/models.py', 'class User: pass');
+
+    // Files that SHOULD be excluded
+    await createFile(tmpDir, 'static/swagger/swagger-ui-bundle.js', '/* swagger */');
+    await createFile(tmpDir, 'static/swagger/redoc.standalone.js', '/* redoc */');
+
+    const { repoMap } = await runAnalysis(tmpDir, outputDir, {
+      maxFiles: 500, include: [], exclude: [],
+    });
+
+    const paths = repoMap.allFiles.map(f => f.path);
+
+    expect(paths.some(p => p.includes('main.py'))).toBe(true);
+    expect(paths.some(p => p.includes('swagger'))).toBe(false);
+    expect(paths.some(p => p.includes('redoc'))).toBe(false);
+  });
+
+  it('caller-supplied exclude patterns also filter files', async () => {
+    await createFile(tmpDir, '.spec-gen/config.json', SPEC_GEN_CONFIG([]));
+
+    await createFile(tmpDir, 'app/main.py', 'def main(): pass');
+    await createFile(tmpDir, 'legacy/old_module.py', 'pass');
+
+    const { repoMap } = await runAnalysis(tmpDir, outputDir, {
+      maxFiles: 500, include: [], exclude: ['legacy/**'],
+    });
+
+    const paths = repoMap.allFiles.map(f => f.path);
+
+    expect(paths.some(p => p.includes('main.py'))).toBe(true);
+    expect(paths.some(p => p.includes('legacy'))).toBe(false);
+  });
+
+  it('merges config and caller patterns — both sets of files excluded', async () => {
+    await createFile(tmpDir, '.spec-gen/config.json', SPEC_GEN_CONFIG(['static/**']));
+
+    await createFile(tmpDir, 'app/main.py', 'def main(): pass');
+    await createFile(tmpDir, 'static/swagger/swagger-ui-bundle.js', '/* swagger */');
+    await createFile(tmpDir, 'legacy/old_module.py', 'pass');
+
+    const { repoMap } = await runAnalysis(tmpDir, outputDir, {
+      maxFiles: 500, include: [], exclude: ['legacy/**'],
+    });
+
+    const paths = repoMap.allFiles.map(f => f.path);
+
+    expect(paths.some(p => p.includes('main.py'))).toBe(true);
+    expect(paths.some(p => p.includes('swagger'))).toBe(false);
+    expect(paths.some(p => p.includes('legacy'))).toBe(false);
+  });
+});
