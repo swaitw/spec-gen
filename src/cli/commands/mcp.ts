@@ -114,6 +114,25 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'get_duplicate_report',
+    description:
+      'Detect duplicate code (clone groups) across the codebase using pure static analysis. ' +
+      'Detects Type 1 (exact clones — identical after whitespace/comment normalization), ' +
+      'Type 2 (structural clones — same structure with renamed variables), and ' +
+      'Type 3 (near-clones with Jaccard similarity ≥ 0.7 on token n-grams). ' +
+      'No LLM calls required. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory (must have been analyzed first)',
+        },
+      },
+      required: ['directory'],
+    },
+  },
+  {
     name: 'get_signatures',
     description:
       'Return compact function and class signatures for files in a project. ' +
@@ -575,6 +594,34 @@ export async function handleGetCallGraph(directory: string): Promise<unknown> {
     })),
     layerViolations: cg.layerViolations,
   };
+}
+
+/**
+ * Read the cached duplicate detection result produced during `analyze`.
+ *
+ * Returns clone groups (exact, structural, near) and summary stats.
+ * Requires a prior `analyze_codebase` call.
+ */
+export async function handleGetDuplicateReport(directory: string): Promise<unknown> {
+  const absDir = await validateDirectory(directory);
+  const cachePath = join(absDir, '.spec-gen', 'analysis', 'duplicates.json');
+
+  let raw: string;
+  try {
+    raw = await readFile(cachePath, 'utf-8');
+  } catch {
+    return {
+      error:
+        'No duplicate report found. Run analyze_codebase first ' +
+        '(duplicates.json is generated during analysis).',
+    };
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { error: 'Duplicate report cache is corrupted. Re-run analyze_codebase.' };
+  }
 }
 
 /**
@@ -1402,6 +1449,9 @@ async function startMcpServer(): Promise<void> {
         const { directory, limit = 10, minFanIn = 3 } =
           args as { directory: string; limit?: number; minFanIn?: number };
         result = await handleGetCriticalHubs(directory, limit, minFanIn);
+      } else if (name === 'get_duplicate_report') {
+        const { directory } = args as { directory: string };
+        result = await handleGetDuplicateReport(directory);
       } else if (name === 'check_spec_drift') {
         const { directory, base = 'auto', files = [], domains = [], failOn = 'warning', maxFiles = 100 } =
           args as { directory: string; base?: string; files?: string[]; domains?: string[]; failOn?: 'error' | 'warning' | 'info'; maxFiles?: number };
