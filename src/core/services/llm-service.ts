@@ -9,7 +9,161 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
 
+// FACTORY FUNCTIONS
 // ============================================================================
+
+/**
+ * Create an LLM service with the specified provider
+=======
+// ============================================================================
+// CLAUDE CODE PROVIDER (uses local `claude` CLI, no API key required)
+// ============================================================================
+
+/**
+ * Claude Code CLI provider
+ *
+ * Routes LLM calls through the local `claude` CLI binary in non-interactive
+ * mode (`claude -p ...`).  Authentication is handled by the Claude Code session
+ * (Max/Pro subscription) — no ANTHROPIC_API_KEY is required.
+ */
+export class ClaudeCodeProvider implements LLMProvider {
+  name = 'claude-code';
+  maxContextTokens = 200_000;
+  maxOutputTokens = 16_000;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    // Ignore the sentinel 'claude-code' string — let the CLI pick the default
+    this.model = model && model !== 'claude-code' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+
+    // Claude Code CLI takes a single prompt; combine system + user prompts
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+
+    const args = ['-p', fullPrompt, '--output-format', 'json'];
+    if (this.model) args.push('--model', this.model);
+
+    let raw: string;
+    try {
+      raw = execFileSync('claude', args, {
+        encoding: 'utf8',
+        maxBuffer: 50 * 1024 * 1024, // 50 MB
+        timeout: 300_000,             // 5 minutes
+      });
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
+      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      throw Object.assign(new Error(`claude CLI failed: ${detail}`), { retryable: false });
+    }
+
+    let parsed: { result: string; usage?: { input_tokens?: number; output_tokens?: number } };
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch {
+      throw new Error(`claude CLI returned non-JSON output: ${raw.slice(0, 200)}`);
+    }
+
+    const inputTokens = parsed.usage?.input_tokens ?? estimateTokens(fullPrompt);
+    const outputTokens = parsed.usage?.output_tokens ?? estimateTokens(parsed.result ?? '');
+
+    return {
+      content: parsed.result ?? '',
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'claude-code',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
+// MISTRAL VIBE PROVIDER (uses local `mistral-vibe` CLI, no API key required)
+// ============================================================================
+
+/**
+ * Mistral Vibe CLI provider
+ *
+ * Routes LLM calls through the local `mistral-vibe` CLI binary (standalone, no npm).
+ * No API key required — uses local LLM execution.
+ * If the binary is not on PATH, set MISTRAL_VIBE_CLI to its full path.
+ * The CLI is invoked as `vibe` (not `mistral-vibe`).
+ */
+export class MistralVibeProvider implements LLMProvider {
+  name = 'mistral-vibe';
+  maxContextTokens = 128_000;
+  maxOutputTokens = 4_096;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    // Ignore the sentinel 'mistral-vibe' string — let the CLI pick the default
+    this.model = model && model !== 'mistral-vibe' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+
+    // Mistral Vibe CLI takes a single prompt; combine system + user prompts
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+
+    // vibe CLI: -p for prompt, --output json for JSON, --agent for model/agent name
+    const args = ['-p', fullPrompt, '--output', 'json'];
+    if (this.model) args.push('--agent', this.model);
+
+    // Use MISTRAL_VIBE_CLI if set (standalone install not on PATH), else 'vibe'
+    const mistralVibeBin = process.env.MISTRAL_VIBE_CLI ?? 'vibe';
+
+    let raw: string;
+    try {
+      raw = execFileSync(mistralVibeBin, args, {
+        encoding: 'utf8',
+        maxBuffer: 50 * 1024 * 1024, // 50 MB
+        timeout: 300_000,             // 5 minutes
+      });
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
+      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      throw Object.assign(new Error(`mistral-vibe CLI failed: ${detail}`), { retryable: false });
+    }
+
+    let parsed: { result: string; usage?: { input_tokens?: number; output_tokens?: number } };
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch {
+      throw new Error(`mistral-vibe CLI returned non-JSON output: ${raw.slice(0, 200)}`);
+    }
+
+    const inputTokens = parsed.usage?.input_tokens ?? estimateTokens(fullPrompt);
+    const outputTokens = parsed.usage?.output_tokens ?? estimateTokens(parsed.result ?? '');
+
+    return {
+      content: parsed.result ?? '',
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'mistral-vibe',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
+// FACTORY FUNCTIONS
+// ============================================================================
+
+/**
+ * Create an LLM service with the specified provider============================================================================
 // TYPES
 // ============================================================================
 
@@ -50,7 +204,7 @@ export interface LLMProvider {
   maxOutputTokens: number;
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe';
 
 /**
  * Token usage tracking
@@ -254,6 +408,14 @@ const PRICING: Record<string, Record<string, { input: number; output: number }>>
     'gemini-1.5-pro':        { input: 1.25,  output: 5.0  },
     'gemini-1.5-flash':      { input: 0.075, output: 0.3  },
     default: { input: 0.1, output: 0.4 },
+  },
+  'claude-code': {
+    // No per-token cost: covered by Claude Max/Pro subscription
+    default: { input: 0, output: 0 },
+  },
+  'mistral-vibe': {
+    // No per-token cost: local CLI tool
+    default: { input: 0, output: 0 },
   },
 };
 
@@ -1124,8 +1286,12 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
       throw new Error('GEMINI_API_KEY environment variable is not set');
     }
     provider = new GeminiProvider(apiKey, options.model ?? 'gemini-2.0-flash');
+  } else if (providerName === 'claude-code') {
+    provider = new ClaudeCodeProvider(options.model);
+  } else if (providerName === 'mistral-vibe') {
+    provider = new MistralVibeProvider(options.model);
   } else {
-    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, gemini`);
+    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, gemini, claude-code, mistral-vibe`);
   }
 
   if (!sslVerify) {
