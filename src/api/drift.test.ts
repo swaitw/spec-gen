@@ -79,7 +79,7 @@ const MOCK_DRIFT_RESULT = {
   duration: 500,
 };
 const MOCK_SPEC_MAP = { byDomain: new Map(), byFile: new Map(), domainCount: 0, totalMappedFiles: 0 };
-const MOCK_ADR_MAP = new Map();
+const MOCK_ADR_MAP = { byId: new Map(), byDomain: new Map() };
 const MOCK_LLM_SERVICE = {
   complete: vi.fn(),
   completeJSON: vi.fn(),
@@ -95,7 +95,7 @@ function setupMocks() {
   mockBuildSpecMap.mockResolvedValue(MOCK_SPEC_MAP);
   mockBuildADRMap.mockResolvedValue(MOCK_ADR_MAP);
   mockDetectDrift.mockResolvedValue(MOCK_DRIFT_RESULT);
-  mockCreateLLMService.mockReturnValue(MOCK_LLM_SERVICE as ReturnType<typeof createLLMService>);
+  mockCreateLLMService.mockReturnValue(MOCK_LLM_SERVICE as unknown as ReturnType<typeof createLLMService>);
   process.env.ANTHROPIC_API_KEY = 'test-key';
 }
 
