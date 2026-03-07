@@ -21,6 +21,10 @@ import {
   AnalysisArtifactGenerator,
   type AnalysisArtifacts,
 } from '../../core/analyzer/artifact-generator.js';
+import {
+  buildArchitectureOverview,
+  writeArchitectureMd,
+} from '../../core/analyzer/architecture-writer.js';
 
 // ============================================================================
 // TYPES
@@ -511,13 +515,29 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
         console.log('');
       }
 
+      // Generate ARCHITECTURE.md from cached analysis (no LLM)
+      let architectureMdWritten = false;
+      try {
+        const ctx = artifacts.llmContext ?? null;
+        const overview = buildArchitectureOverview(depGraph, ctx, rootPath);
+        await writeArchitectureMd(rootPath, overview);
+        architectureMdWritten = true;
+      } catch {
+        // non-fatal — analysis still succeeded
+      }
+
       // Files generated
       console.log('  Output Files:');
       console.log(`    ├─ ${opts.output}repo-structure.json`);
       console.log(`    ├─ ${opts.output}dependency-graph.json`);
       console.log(`    ├─ ${opts.output}llm-context.json`);
       console.log(`    ├─ ${opts.output}dependencies.mermaid`);
-      console.log(`    └─ ${opts.output}SUMMARY.md`);
+      if (architectureMdWritten) {
+        console.log(`    ├─ ${opts.output}SUMMARY.md`);
+        console.log('    └─ ARCHITECTURE.md');
+      } else {
+        console.log(`    └─ ${opts.output}SUMMARY.md`);
+      }
       console.log('');
 
       // ========================================================================

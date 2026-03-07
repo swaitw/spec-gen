@@ -43,6 +43,7 @@ import { getFileGodFunctions, extractSubgraph } from '../../core/analyzer/subgra
 import type { LLMContext } from '../../core/analyzer/artifact-generator.js';
 import type { SerializedCallGraph, FunctionNode } from '../../core/analyzer/call-graph.js';
 import type { MappingArtifact } from '../../core/generator/mapping-generator.js';
+import { buildArchitectureOverview } from '../../core/analyzer/architecture-writer.js';
 import {
   isGitRepository,
   getChangedFiles,
@@ -74,6 +75,24 @@ const TOOL_DEFINITIONS = [
         force: {
           type: 'boolean',
           description: 'Force re-analysis even if a recent cache exists (default: false)',
+        },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_architecture_overview',
+    description:
+      'Return a high-level architecture map of the project: domain clusters with their ' +
+      'key files and roles, cross-cluster dependencies, global entry points, and critical hubs. ' +
+      'Start here when onboarding to an unknown codebase or before planning a large feature. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory (must have been analyzed first)',
         },
       },
       required: ['directory'],
@@ -715,6 +734,37 @@ export async function handleGetCallGraph(directory: string): Promise<unknown> {
     })),
     layerViolations: cg.layerViolations,
   };
+}
+
+// ============================================================================
+// GET ARCHITECTURE OVERVIEW
+// ============================================================================
+
+/**
+ * High-level architecture map: clusters, cross-cluster deps, entry points, hubs.
+ * Reads dependency-graph.json + llm-context.json (call graph).
+ * Ideal as a first tool call when exploring an unknown codebase.
+ */
+export async function handleGetArchitectureOverview(directory: string): Promise<unknown> {
+  const absDir = await validateDirectory(directory);
+
+  // Load dependency graph (clusters live here)
+  let depGraph: import('../../core/analyzer/dependency-graph.js').DependencyGraphResult | null = null;
+  try {
+    const raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'dependency-graph.json'), 'utf-8');
+    depGraph = JSON.parse(raw) as import('../../core/analyzer/dependency-graph.js').DependencyGraphResult;
+  } catch {
+    // ignore — report below
+  }
+
+  const ctx = await readCachedContext(absDir);
+
+  if (!depGraph && !ctx) {
+    return { error: 'No analysis found. Run analyze_codebase first.' };
+  }
+
+  const overview = buildArchitectureOverview(depGraph, ctx, absDir);
+  return { summary: overview.summary, clusters: overview.clusters, globalEntryPoints: overview.globalEntryPoints, criticalHubs: overview.criticalHubs };
 }
 
 /**
@@ -1911,6 +1961,9 @@ async function startMcpServer(): Promise<void> {
       if (name === 'analyze_codebase') {
         const { directory, force = false } = args as { directory: string; force?: boolean };
         result = await handleAnalyzeCodebase(directory, force);
+      } else if (name === 'get_architecture_overview') {
+        const { directory } = args as { directory: string };
+        result = await handleGetArchitectureOverview(directory);
       } else if (name === 'get_refactor_report') {
         const { directory } = args as { directory: string };
         result = await handleGetRefactorReport(directory);

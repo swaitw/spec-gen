@@ -43,6 +43,7 @@ export const viewCommand = new Command('view')
       const rootPath = process.cwd();
       const analysisDir = resolve(rootPath, options.analysis);
       const graphPath = join(analysisDir, 'dependency-graph.json');
+      const llmContextPath = join(analysisDir, 'llm-context.json');
       const refactorPath = join(analysisDir, 'refactor-priorities.json');
       const mappingPath = join(analysisDir, 'mapping.json');
       const specDir = resolve(rootPath, options.spec);
@@ -85,6 +86,23 @@ export const viewCommand = new Command('view')
               devServer.middlewares.use('/api/dependency-graph', async (_req, res) => {
                 try {
                   const json = await readFile(graphPath, 'utf-8');
+                  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                  res.statusCode = 200;
+                  res.end(json);
+                } catch (err) {
+                  res.statusCode = 500;
+                  res.end(JSON.stringify({ error: (err as Error).message }));
+                }
+              });
+
+              devServer.middlewares.use('/api/llm-context', async (_req, res) => {
+                try {
+                  if (!existsSync(llmContextPath)) {
+                    res.statusCode = 404;
+                    res.end(JSON.stringify({ error: 'llm-context.json not found' }));
+                    return;
+                  }
+                  const json = await readFile(llmContextPath, 'utf-8');
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(json);

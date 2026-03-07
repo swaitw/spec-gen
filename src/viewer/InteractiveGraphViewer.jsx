@@ -1205,9 +1205,281 @@ function FToggle({ active, onChange, label, badge, activeColor = '#7c6af7' }) {
   );
 }
 
+// ─── Architecture helpers ──────────────────────────────────────────────────────
+
+const ROLE_COLOR = {
+  entry_layer:    '#4ade80',
+  orchestrator:   '#7c6af7',
+  core_utilities: '#f97316',
+  api_layer:      '#3ecfcf',
+  internal:       '#475569',
+};
+const ROLE_LABEL = {
+  entry_layer:    'entry layer',
+  orchestrator:   'orchestrator',
+  core_utilities: 'core utilities',
+  api_layer:      'API layer',
+  internal:       'internal',
+};
+
+function inferClusterRole(entryCount, hubCount, fileCount) {
+  if (entryCount > fileCount * 0.5) return 'entry_layer';
+  if (hubCount > 0 && entryCount > 0) return 'orchestrator';
+  if (hubCount > 0) return 'core_utilities';
+  if (entryCount > 0) return 'api_layer';
+  return 'internal';
+}
+
+/** Build architecture overview from parsed graph + llmCtx (both can be null). */
+function computeArchOverview(graph, llmCtx) {
+  if (!graph) return null;
+
+  // hub / entry file sets (relative paths from call graph)
+  const hubFiles = new Set((llmCtx?.callGraph?.hubFunctions ?? []).map(h => h.filePath));
+  const entryFiles = new Set((llmCtx?.callGraph?.entryPoints ?? []).map(e => e.filePath));
+
+  // cluster id → cluster info
+  const clusterById = {};
+  (graph.clusters ?? []).forEach(cl => { clusterById[cl.id] = cl; });
+
+  // file path → cluster id (graph nodes use absolute paths as ids)
+  const clusterOfNode = {};
+  (graph.nodes ?? []).forEach(n => {
+    if (n.cluster?.id) clusterOfNode[n.id] = n.cluster.id;
+    // also index by relative path (strip leading '/')
+    const rel = n.path?.replace(/^\/+/, '') ?? '';
+    if (rel && n.cluster?.id) clusterOfNode[rel] = n.cluster.id;
+  });
+
+  // inter-cluster edges
+  const clusterEdges = {};
+  (graph.edges ?? []).forEach(e => {
+    const from = clusterOfNode[e.source];
+    const to = clusterOfNode[e.target];
+    if (from && to && from !== to) {
+      if (!clusterEdges[from]) clusterEdges[from] = new Set();
+      clusterEdges[from].add(to);
+    }
+  });
+
+  // per-cluster: count hubs / entries by matching relative paths
+  const clusters = (graph.clusters ?? []).map(cl => {
+    // cl.files are absolute paths in dep graph; graph.nodes have paths too
+    const clNodes = (graph.nodes ?? []).filter(n => n.cluster?.id === cl.id);
+    const relPaths = clNodes.map(n => n.path?.replace(/^\/+/, '') ?? '');
+    const hubCount = relPaths.filter(p => hubFiles.has(p)).length;
+    const entryCount = relPaths.filter(p => entryFiles.has(p)).length;
+    const role = inferClusterRole(entryCount, hubCount, clNodes.length || cl.files?.length || 1);
+    const dependsOn = [...(clusterEdges[cl.id] ?? [])];
+    const keyFiles = relPaths.filter(p => hubFiles.has(p) || entryFiles.has(p)).slice(0, 5);
+    return { id: cl.id, name: cl.name ?? cl.id, fileCount: clNodes.length || cl.files?.length || 0, role, entryPointCount: entryCount, hubCount, dependsOn, keyFiles, color: cl.color };
+  }).sort((a, b) => b.fileCount - a.fileCount);
+
+  const globalEntryPoints = (llmCtx?.callGraph?.entryPoints ?? []).slice(0, 20).map(n => ({ name: n.name, file: n.filePath, language: n.language }));
+  const criticalHubs = (llmCtx?.callGraph?.hubFunctions ?? []).slice(0, 10).map(n => ({ name: n.name, file: n.filePath, fanIn: n.fanIn, fanOut: n.fanOut }));
+
+  return {
+    summary: {
+      totalFiles: graph.statistics?.nodeCount ?? (graph.nodes?.length ?? 0),
+      totalClusters: clusters.length,
+      totalEdges: graph.statistics?.edgeCount ?? (graph.edges?.length ?? 0),
+      cycles: graph.statistics?.cycleCount ?? 0,
+      layerViolations: llmCtx?.callGraph?.layerViolations?.length ?? 0,
+    },
+    clusters,
+    globalEntryPoints,
+    criticalHubs,
+  };
+}
+
+/** Simple SVG cluster-map: boxes in a grid with arrows for dependsOn. */
+function ArchitectureView({ graph, llmCtx }) {
+  const overview = useMemo(() => computeArchOverview(graph, llmCtx), [graph, llmCtx]);
+  const [hovered, setHovered] = useState(null);
+
+  if (!overview) return <div style={{ color: '#3a3f5c', padding: 24, fontSize: 11 }}>No graph loaded.</div>;
+
+  const { summary, clusters, globalEntryPoints, criticalHubs } = overview;
+
+  // Layout: arrange clusters in a grid (max 4 cols)
+  const COLS = Math.min(4, clusters.length);
+  const BOX_W = 140, BOX_H = 64, GAP_X = 30, GAP_Y = 40;
+  const ROWS = Math.ceil(clusters.length / COLS);
+  const SVG_W = COLS * (BOX_W + GAP_X) + GAP_X;
+  const SVG_H = ROWS * (BOX_H + GAP_Y) + GAP_Y;
+
+  // Position map: cluster id → { cx, cy } (center of box)
+  const pos = {};
+  clusters.forEach((cl, i) => {
+    const col = i % COLS;
+    const row = Math.floor(i / COLS);
+    pos[cl.id] = {
+      x: GAP_X + col * (BOX_W + GAP_X),
+      y: GAP_Y + row * (BOX_H + GAP_Y),
+    };
+  });
+
+  // Draw arrows for dependsOn
+  const arrows = [];
+  clusters.forEach(cl => {
+    (cl.dependsOn ?? []).forEach(toId => {
+      const from = pos[cl.id];
+      const to = pos[toId];
+      if (!from || !to) return;
+      const fx = from.x + BOX_W / 2, fy = from.y + BOX_H / 2;
+      const tx = to.x + BOX_W / 2, ty = to.y + BOX_H / 2;
+      // shorten arrow to box edge
+      const dx = tx - fx, dy = ty - fy;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const sx = fx + (dx / len) * (BOX_W / 2 + 4);
+      const sy = fy + (dy / len) * (BOX_H / 2 + 4);
+      const ex = tx - (dx / len) * (BOX_W / 2 + 4);
+      const ey = ty - (dy / len) * (BOX_H / 2 + 4);
+      const isHov = hovered === cl.id || hovered === toId;
+      arrows.push(
+        <line
+          key={`${cl.id}→${toId}`}
+          x1={sx} y1={sy} x2={ex} y2={ey}
+          stroke={isHov ? '#7c6af7' : '#1e2240'}
+          strokeWidth={isHov ? 1.5 : 1}
+          markerEnd="url(#arrowhead)"
+          opacity={isHov ? 1 : 0.6}
+        />
+      );
+    });
+  });
+
+  const S = { fontSize: 9, fontFamily: 'inherit' };
+
+  return (
+    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+      {/* SVG cluster map */}
+      <div style={{ flex: 1, overflow: 'auto', padding: 12 }}>
+        {/* Summary bar */}
+        <div style={{ display: 'flex', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+          {[
+            ['files', summary.totalFiles],
+            ['clusters', summary.totalClusters],
+            ['edges', summary.totalEdges],
+            summary.cycles > 0 ? ['⚠ cycles', summary.cycles] : null,
+            summary.layerViolations > 0 ? ['⚠ violations', summary.layerViolations] : null,
+          ].filter(Boolean).map(([l, v]) => (
+            <div key={l} style={{ fontSize: 9, color: '#6a70a0', background: '#0e1028', borderRadius: 4, padding: '2px 8px', border: '1px solid #141830' }}>
+              <span style={{ color: l.startsWith('⚠') ? '#f97316' : '#c8cde8' }}>{v}</span> {l}
+            </div>
+          ))}
+        </div>
+
+        <svg width={SVG_W} height={SVG_H} style={{ display: 'block', minWidth: SVG_W }}>
+          <defs>
+            <marker id="arrowhead" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L6,3 z" fill="#3a3f6c" />
+            </marker>
+          </defs>
+
+          {/* Arrows below boxes */}
+          {arrows}
+
+          {/* Cluster boxes */}
+          {clusters.map(cl => {
+            const { x, y } = pos[cl.id] ?? { x: 0, y: 0 };
+            const color = ROLE_COLOR[cl.role] ?? '#475569';
+            const isHov = hovered === cl.id;
+            return (
+              <g
+                key={cl.id}
+                onMouseEnter={() => setHovered(cl.id)}
+                onMouseLeave={() => setHovered(null)}
+                style={{ cursor: 'default' }}
+              >
+                <rect
+                  x={x} y={y} width={BOX_W} height={BOX_H}
+                  rx={6} ry={6}
+                  fill={isHov ? '#12163a' : '#0b0e28'}
+                  stroke={isHov ? color : '#1e2240'}
+                  strokeWidth={isHov ? 1.5 : 1}
+                />
+                {/* Role color strip */}
+                <rect x={x} y={y} width={4} height={BOX_H} rx={3} ry={3} fill={color} opacity={0.8} />
+                {/* Name */}
+                <text x={x + 12} y={y + 18} fill="#c8cde8" fontSize={10} fontWeight="600" fontFamily="inherit">
+                  {cl.name.length > 18 ? cl.name.slice(0, 17) + '…' : cl.name}
+                </text>
+                {/* Role label */}
+                <text x={x + 12} y={y + 31} fill={color} fontSize={8} fontFamily="inherit" opacity={0.9}>
+                  {ROLE_LABEL[cl.role] ?? cl.role}
+                </text>
+                {/* File count */}
+                <text x={x + 12} y={y + 44} fill="#3a4060" fontSize={8} fontFamily="inherit">
+                  {cl.fileCount} files
+                  {cl.hubCount > 0 ? `  ·  ${cl.hubCount} hub${cl.hubCount > 1 ? 's' : ''}` : ''}
+                  {cl.entryPointCount > 0 ? `  ·  ${cl.entryPointCount} entry` : ''}
+                </text>
+                {/* dependsOn count badge */}
+                {cl.dependsOn.length > 0 && (
+                  <text x={x + BOX_W - 6} y={y + 18} fill="#3a4060" fontSize={7} fontFamily="inherit" textAnchor="end">
+                    →{cl.dependsOn.length}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* Legend */}
+        <div style={{ display: 'flex', gap: 12, marginTop: 12, flexWrap: 'wrap' }}>
+          {Object.entries(ROLE_LABEL).map(([role, label]) => (
+            <div key={role} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 8, color: '#3a4060' }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: ROLE_COLOR[role] }} />
+              {label}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Side panel: entry points + hubs */}
+      <div style={{ width: 220, borderLeft: '1px solid #0f1224', overflow: 'auto', padding: '12px 10px', flexShrink: 0 }}>
+        {globalEntryPoints.length > 0 && (
+          <>
+            <div style={{ ...S, color: '#4ade80', fontWeight: 600, marginBottom: 6, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+              Entry Points
+            </div>
+            {globalEntryPoints.map((ep, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <div style={{ ...S, color: '#c8cde8', fontWeight: 600 }}>{ep.name}</div>
+                <div style={{ ...S, color: '#3a4060', wordBreak: 'break-all' }}>{ep.file}</div>
+              </div>
+            ))}
+          </>
+        )}
+
+        {criticalHubs.length > 0 && (
+          <>
+            <div style={{ ...S, color: '#f97316', fontWeight: 600, marginBottom: 6, marginTop: 16, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+              Critical Hubs
+            </div>
+            {criticalHubs.map((hub, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <div style={{ ...S, color: '#c8cde8', fontWeight: 600 }}>{hub.name}</div>
+                <div style={{ ...S, color: '#3a4060', wordBreak: 'break-all' }}>{hub.file}</div>
+                <div style={{ ...S, color: '#f97316', opacity: 0.7 }}>fanIn {hub.fanIn}  ·  fanOut {hub.fanOut}</div>
+              </div>
+            ))}
+          </>
+        )}
+
+        {globalEntryPoints.length === 0 && criticalHubs.length === 0 && (
+          <div style={{ ...S, color: '#3a3f5c' }}>Run <code style={{ color: '#7c6af7' }}>spec-gen analyze</code> to populate call graph data.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '/api/spec' }) {
   const [graph, setGraph] = useState(null);
+  const [llmCtx, setLlmCtx] = useState(null);
   const [refReport, setRefReport] = useState(null);
   const [mapping, setMapping] = useState(null); // parsed mapping index
   const [specReqs, setSpecReqs] = useState({}); // requirementId → {title, body}
@@ -1282,6 +1554,14 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         loadGraph(text);
+
+        // Best-effort: load llm-context (call graph for architecture view)
+        try {
+          const ctxRes = await fetch('/api/llm-context');
+          if (ctxRes.ok) setLlmCtx(await ctxRes.json());
+        } catch {
+          /* ignore */
+        }
 
         // Best-effort: load refactor priorities if available
         try {
@@ -1598,6 +1878,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
           {[
             ['clusters', '⬡ clusters'],
             ['flat', '⊙ flat'],
+            ['architecture', '⬛ architecture'],
           ].map(([v, lbl]) => (
             <button
               key={v}
@@ -1760,7 +2041,9 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {/* Canvas */}
         <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-          {viewMode === 'clusters' ? (
+          {viewMode === 'architecture' ? (
+            <ArchitectureView graph={graph} llmCtx={llmCtx} />
+          ) : viewMode === 'clusters' ? (
             <ClusterGraph
               clusters={graph.clusters.filter(
                 (cl) => !filters.cluster || cl.name === filters.cluster
@@ -1816,7 +2099,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
             width: 282,
             borderLeft: '1px solid #0f1224',
             background: '#080b1e',
-            display: 'flex',
+            display: viewMode === 'architecture' ? 'none' : 'flex',
             flexDirection: 'column',
             overflow: 'hidden',
             flexShrink: 0,
