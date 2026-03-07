@@ -44,12 +44,13 @@ vi.mock('../../core/analyzer/embedding-service.js', () => ({
     fromConfig: vi.fn(),
   },
 }));
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   validateDirectory,
   sanitizeMcpError,
+  handleGetArchitectureOverview,
   handleGetRefactorReport,
   handleGetCallGraph,
   handleGetSignatures,
@@ -1329,5 +1330,187 @@ describe('handleSuggestInsertionPoints', () => {
     const result = await handleSuggestInsertionPoints(testDir, 'feature') as { count: number };
     expect(result.count).toBe(1);
     expect(EmbeddingService.fromConfig).toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// handleGetArchitectureOverview
+// ============================================================================
+
+describe('handleGetArchitectureOverview', () => {
+  let testDir: string;
+
+  // Minimal dep-graph fixture
+  const makeDepGraph = (overrides?: object) => ({
+    nodes: [
+      { file: { path: '/abs/src/cli/index.ts' }, metrics: { inDegree: 0, outDegree: 3 } },
+      { file: { path: '/abs/src/core/foo.ts' }, metrics: { inDegree: 2, outDegree: 1 } },
+    ],
+    edges: [
+      { source: '/abs/src/cli/index.ts', target: '/abs/src/core/foo.ts' },
+    ],
+    clusters: [
+      { id: 'cl-cli', name: 'CLI', files: ['/abs/src/cli/index.ts'] },
+      { id: 'cl-core', name: 'Core', files: ['/abs/src/core/foo.ts'] },
+    ],
+    cycles: [],
+    statistics: { nodeCount: 2, edgeCount: 1 },
+    ...overrides,
+  });
+
+  // Minimal llm-context fixture (with call graph)
+  const makeCtx = (overrides?: object) => ({
+    callGraph: {
+      entryPoints: [{ name: 'main', filePath: 'src/cli/index.ts', language: 'TypeScript', fanIn: 0, fanOut: 3 }],
+      hubFunctions: [{ name: 'process', filePath: 'src/core/foo.ts', language: 'TypeScript', fanIn: 5, fanOut: 2 }],
+      layerViolations: [],
+    },
+    ...overrides,
+  });
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), 'mcp-arch-test-'));
+    await mkdir(join(testDir, '.spec-gen', 'analysis'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('throws McpError when directory does not exist', async () => {
+    await expect(handleGetArchitectureOverview('/nonexistent/path')).rejects.toThrow();
+  });
+
+  it('returns error when no analysis files found', async () => {
+    const result = await handleGetArchitectureOverview(testDir) as { error: string };
+    expect(result.error).toMatch(/No analysis found/);
+  });
+
+  it('returns summary stats from dep-graph', async () => {
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      JSON.stringify(makeDepGraph()),
+      'utf-8'
+    );
+    const result = await handleGetArchitectureOverview(testDir) as {
+      summary: { totalFiles: number; totalClusters: number; totalEdges: number };
+    };
+    expect(result.summary.totalFiles).toBe(2);
+    expect(result.summary.totalClusters).toBe(2);
+    expect(result.summary.totalEdges).toBe(1);
+  });
+
+  it('identifies entry_layer role for cluster containing entry points', async () => {
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      JSON.stringify(makeDepGraph()),
+      'utf-8'
+    );
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      JSON.stringify(makeCtx()),
+      'utf-8'
+    );
+    // absDir for testDir, so toRel strips testDir prefix from absolute paths.
+    // But our fixture uses '/abs/...' which is not under testDir →
+    // hub/entry lookup is done via relative paths from llm-context,
+    // while cluster files are absolute '/abs/...' which won't match testDir prefix.
+    // Use testDir-based absolute paths to exercise the path normalization.
+    const depGraph = makeDepGraph({
+      nodes: [
+        { file: { path: join(testDir, 'src/cli/index.ts') }, metrics: { inDegree: 0, outDegree: 3 } },
+        { file: { path: join(testDir, 'src/core/foo.ts') }, metrics: { inDegree: 2, outDegree: 1 } },
+      ],
+      edges: [{ source: join(testDir, 'src/cli/index.ts'), target: join(testDir, 'src/core/foo.ts') }],
+      clusters: [
+        { id: 'cl-cli', name: 'CLI', files: [join(testDir, 'src/cli/index.ts')] },
+        { id: 'cl-core', name: 'Core', files: [join(testDir, 'src/core/foo.ts')] },
+      ],
+    });
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      JSON.stringify(depGraph),
+      'utf-8'
+    );
+    const ctx = makeCtx({
+      callGraph: {
+        entryPoints: [{ name: 'main', filePath: 'src/cli/index.ts', language: 'TypeScript', fanIn: 0, fanOut: 3 }],
+        hubFunctions: [],
+        layerViolations: [],
+      },
+    });
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      JSON.stringify(ctx),
+      'utf-8'
+    );
+    const result = await handleGetArchitectureOverview(testDir) as {
+      clusters: Array<{ id: string; role: string }>;
+    };
+    const cli = result.clusters.find(c => c.id === 'cl-cli');
+    expect(cli?.role).toBe('entry_layer');
+  });
+
+  it('builds inter-cluster dependencies', async () => {
+    const depGraph = makeDepGraph({
+      nodes: [
+        { file: { path: join(testDir, 'src/cli/index.ts') }, metrics: { inDegree: 0, outDegree: 1 } },
+        { file: { path: join(testDir, 'src/core/foo.ts') }, metrics: { inDegree: 1, outDegree: 0 } },
+      ],
+      edges: [{ source: join(testDir, 'src/cli/index.ts'), target: join(testDir, 'src/core/foo.ts') }],
+      clusters: [
+        { id: 'cl-cli', name: 'CLI', files: [join(testDir, 'src/cli/index.ts')] },
+        { id: 'cl-core', name: 'Core', files: [join(testDir, 'src/core/foo.ts')] },
+      ],
+    });
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      JSON.stringify(depGraph),
+      'utf-8'
+    );
+    const result = await handleGetArchitectureOverview(testDir) as {
+      clusters: Array<{ id: string; dependsOn: string[] }>;
+    };
+    const cli = result.clusters.find(c => c.id === 'cl-cli');
+    expect(cli?.dependsOn).toContain('cl-core');
+    const core = result.clusters.find(c => c.id === 'cl-core');
+    expect(core?.dependsOn).toHaveLength(0);
+  });
+
+  it('works with only llm-context (no dep-graph)', async () => {
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      JSON.stringify(makeCtx()),
+      'utf-8'
+    );
+    const result = await handleGetArchitectureOverview(testDir) as {
+      summary: { totalFiles: number; totalClusters: number };
+      globalEntryPoints: Array<{ name: string }>;
+    };
+    expect(result.summary.totalFiles).toBe(0);
+    expect(result.summary.totalClusters).toBe(0);
+    expect(result.globalEntryPoints[0].name).toBe('main');
+  });
+
+  it('clusters sorted by fileCount descending', async () => {
+    const depGraph = makeDepGraph({
+      nodes: [],
+      edges: [],
+      clusters: [
+        { id: 'small', name: 'Small', files: ['a.ts'] },
+        { id: 'big', name: 'Big', files: ['b.ts', 'c.ts', 'd.ts'] },
+      ],
+      statistics: { nodeCount: 4, edgeCount: 0 },
+    });
+    await writeFile(
+      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      JSON.stringify(depGraph),
+      'utf-8'
+    );
+    const result = await handleGetArchitectureOverview(testDir) as {
+      clusters: Array<{ id: string }>;
+    };
+    expect(result.clusters[0].id).toBe('big');
+    expect(result.clusters[1].id).toBe('small');
   });
 });
