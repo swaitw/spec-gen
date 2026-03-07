@@ -1552,6 +1552,8 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   const [semanticAvailable, setSemanticAvailable] = useState(true); // false if no index
   const semanticTimer = useRef(null);
   const [tab, setTab] = useState('node');
+  const [skeletonData, setSkeletonData] = useState(null); // {skeleton, language, reductionPct, ...}
+  const [skeletonLoading, setSkeletonLoading] = useState(false);
   const [viewMode, setViewMode] = useState('clusters');
   const [expandedClusters, setExpandedClusters] = useState(new Set());
   const [filters, setFilters] = useState({
@@ -1789,7 +1791,19 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
     setAffectedIds([]);
     setExpandedClusters(new Set());
     setSemanticResults([]);
+    setSkeletonData(null);
   }, []);
+
+  // Fetch skeleton when skeleton tab is active and a node is selected
+  const selectedPath = selectedNode?.path ?? null;
+  useEffect(() => {
+    if (tab !== 'skeleton' || !selectedPath) { setSkeletonData(null); return; }
+    setSkeletonLoading(true);
+    fetch(`/api/skeleton?file=${encodeURIComponent(selectedPath)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { setSkeletonData(d); setSkeletonLoading(false); })
+      .catch(() => setSkeletonLoading(false));
+  }, [tab, selectedPath]);
 
   // Escape key: deselect + collapse
   useEffect(() => {
@@ -2265,7 +2279,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
           }}
         >
           <div style={{ display: 'flex', borderBottom: '1px solid #0f1224', flexShrink: 0 }}>
-            {['node', 'links', 'blast', 'spec', 'info'].map((t) => (
+            {['node', 'links', 'blast', 'spec', 'skeleton', 'info'].map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -2757,6 +2771,44 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
                   </div>
                 );
               })()}
+
+            {/* SKELETON */}
+            {tab === 'skeleton' && !selectedNode && (
+              <Hint>Select a node to view its code skeleton.</Hint>
+            )}
+            {tab === 'skeleton' && selectedNode && (
+              <div>
+                {skeletonLoading && <Hint>Loading…</Hint>}
+                {!skeletonLoading && !skeletonData && <Hint>Skeleton unavailable for this file.</Hint>}
+                {!skeletonLoading && skeletonData && (
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                      <span style={{ fontSize: 9, color: '#6a70a0', fontFamily: 'inherit' }}>
+                        {skeletonData.language} · {skeletonData.skeletonLines}/{skeletonData.originalLines} lines
+                      </span>
+                      <span style={{ fontSize: 9, color: skeletonData.reductionPct >= 20 ? '#7c6af7' : '#3a3f5c', fontFamily: 'inherit' }}>
+                        -{skeletonData.reductionPct}%
+                      </span>
+                    </div>
+                    <pre style={{
+                      margin: 0,
+                      fontSize: 8,
+                      lineHeight: 1.6,
+                      color: '#9aa0c8',
+                      fontFamily: "'JetBrains Mono', monospace",
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      background: '#060819',
+                      border: '1px solid #0f1224',
+                      borderRadius: 4,
+                      padding: '8px 10px',
+                    }}>
+                      {skeletonData.skeleton}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* INFO */}
             {tab === 'info' && (

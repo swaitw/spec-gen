@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { logger } from '../../utils/logger.js';
 import { VectorIndex } from '../../core/analyzer/vector-index.js';
 import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
+import { getSkeletonContent, detectLanguage } from '../../core/analyzer/code-shaper.js';
 
 function openBrowser(url: string): void {
   const platform = process.platform;
@@ -289,6 +290,35 @@ export const viewCommand = new Command('view')
                   res.end(JSON.stringify(requirements));
                 } catch (err) {
                   res.statusCode = 500;
+                  res.end(JSON.stringify({ error: (err as Error).message }));
+                }
+              });
+
+              devServer.middlewares.use('/api/skeleton', async (req, res) => {
+                try {
+                  const url = new URL(req.url ?? '', 'http://localhost');
+                  const file = url.searchParams.get('file')?.trim() ?? '';
+                  if (!file) {
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: 'Missing ?file=' }));
+                    return;
+                  }
+                  const absFile = join(rootPath, file);
+                  const source = await readFile(absFile, 'utf-8');
+                  const language = detectLanguage(file);
+                  const skeleton = getSkeletonContent(source, language);
+                  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                  res.statusCode = 200;
+                  res.end(JSON.stringify({
+                    filePath: file,
+                    language,
+                    originalLines: source.split('\n').length,
+                    skeletonLines: skeleton.split('\n').length,
+                    reductionPct: Math.round((1 - skeleton.length / source.length) * 100),
+                    skeleton,
+                  }));
+                } catch (err) {
+                  res.statusCode = 404;
                   res.end(JSON.stringify({ error: (err as Error).message }));
                 }
               });
