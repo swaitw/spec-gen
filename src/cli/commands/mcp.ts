@@ -425,6 +425,40 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'suggest_insertion_points',
+    description:
+      'Find the best places in the codebase to implement a new feature described in natural language. ' +
+      'Combines semantic similarity with structural analysis (entry points, orchestrators, hubs) ' +
+      'to return ranked insertion candidates with an actionable strategy for each. ' +
+      'Ideal before implementing a feature: run this first, then use get_subgraph or ' +
+      'get_function_skeleton on the top candidates to understand the local context. ' +
+      'Requires a vector index built with "spec-gen analyze --embed".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory',
+        },
+        description: {
+          type: 'string',
+          description:
+            'Natural language description of the feature to implement, ' +
+            'e.g. "add retry mechanism for HTTP requests" or "validate user email on registration"',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of candidates to return (default: 5)',
+        },
+        language: {
+          type: 'string',
+          description: 'Filter by language: "TypeScript", "Python", "Go", "Rust", "Ruby", "Java"',
+        },
+      },
+      required: ['directory', 'description'],
+    },
+  },
+  {
     name: 'search_code',
     description:
       'Semantic search over indexed functions using a natural language query. ' +
@@ -1669,6 +1703,192 @@ export async function handleSearchCode(
 }
 
 // ============================================================================
+// SUGGEST INSERTION POINTS
+// ============================================================================
+
+type InsertionRole = 'entry_point' | 'orchestrator' | 'hub' | 'utility' | 'internal';
+type InsertionStrategy =
+  | 'extend_entry_point'
+  | 'add_orchestration_step'
+  | 'cross_cutting_hook'
+  | 'extract_shared_logic'
+  | 'call_alongside';
+
+interface InsertionCandidate {
+  rank: number;
+  score: number;          // composite score (0–1, higher = better)
+  semanticDistance: number; // raw cosine distance (lower = closer)
+  name: string;
+  filePath: string;
+  className?: string;
+  language: string;
+  signature?: string;
+  docstring?: string;
+  role: InsertionRole;
+  insertionStrategy: InsertionStrategy;
+  reason: string;
+  fanIn: number;
+  fanOut: number;
+  isHub: boolean;
+  isEntryPoint: boolean;
+}
+
+function classifyRole(fanIn: number, fanOut: number, isHub: boolean, isEntryPoint: boolean): InsertionRole {
+  if (isEntryPoint) return 'entry_point';
+  if (isHub) return 'hub';
+  if (fanOut >= 5) return 'orchestrator';
+  if (fanIn <= 1) return 'utility';
+  return 'internal';
+}
+
+function deriveStrategy(role: InsertionRole): InsertionStrategy {
+  switch (role) {
+    case 'entry_point':   return 'extend_entry_point';
+    case 'orchestrator':  return 'add_orchestration_step';
+    case 'hub':           return 'cross_cutting_hook';
+    case 'utility':       return 'extract_shared_logic';
+    default:              return 'call_alongside';
+  }
+}
+
+function buildReason(
+  name: string,
+  role: InsertionRole,
+  strategy: InsertionStrategy,
+  fanIn: number,
+  fanOut: number
+): string {
+  switch (strategy) {
+    case 'extend_entry_point':
+      return `${name} is an entry point (no internal callers). Add your feature here or create a sibling entry point that delegates to it.`;
+    case 'add_orchestration_step':
+      return `${name} orchestrates ${fanOut} downstream calls. Insert your feature as a new step in this pipeline.`;
+    case 'cross_cutting_hook':
+      return `${name} is called by ${fanIn} functions — adding logic here affects the entire callsite surface.`;
+    case 'extract_shared_logic':
+      return `${name} is a low-traffic utility. Shared logic for your feature can live here or be extracted alongside it.`;
+    default:
+      return `${name} is semantically close to your feature and operates in the same domain. Extend or call alongside it.`;
+  }
+}
+
+/**
+ * Composite score = (1 - semanticDistance) * 0.6 + structuralBonus * 0.4
+ * Structural bonus rewards entry points and orchestrators (most actionable insertion spots).
+ */
+function compositeScore(
+  semanticDistance: number,
+  role: InsertionRole
+): number {
+  const semantic = Math.max(0, 1 - semanticDistance);
+  const structuralBonus: Record<InsertionRole, number> = {
+    entry_point:  1.0,
+    orchestrator: 0.8,
+    hub:          0.6,
+    internal:     0.4,
+    utility:      0.3,
+  };
+  return semantic * 0.6 + structuralBonus[role] * 0.4;
+}
+
+/**
+ * Find the best places in the codebase to implement a new feature.
+ * Combines semantic similarity with structural analysis.
+ */
+export async function handleSuggestInsertionPoints(
+  directory: string,
+  description: string,
+  limit = 5,
+  language?: string
+): Promise<unknown> {
+  const absDir = await validateDirectory(directory);
+  const outputDir = join(absDir, '.spec-gen', 'analysis');
+
+  const { VectorIndex } = await import('../../core/analyzer/vector-index.js');
+  const { EmbeddingService } = await import('../../core/analyzer/embedding-service.js');
+
+  if (!VectorIndex.exists(outputDir)) {
+    return {
+      error:
+        'No vector index found. Run "spec-gen analyze --embed" first, ' +
+        'then configure EMBED_BASE_URL and EMBED_MODEL.',
+    };
+  }
+
+  let embedSvc: InstanceType<typeof EmbeddingService>;
+  try {
+    embedSvc = EmbeddingService.fromEnv();
+  } catch {
+    const cfg = await readSpecGenConfig(absDir);
+    if (!cfg) {
+      return {
+        error:
+          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, ' +
+          'or add an "embedding" section to .spec-gen/config.json.',
+      };
+    }
+    const svcFromConfig = EmbeddingService.fromConfig(cfg);
+    if (!svcFromConfig) {
+      return {
+        error:
+          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, ' +
+          'or add an "embedding" section to .spec-gen/config.json.',
+      };
+    }
+    embedSvc = svcFromConfig;
+  }
+
+  limit = Math.max(1, Math.min(limit, 20));
+
+  // Fetch more candidates than needed; re-rank by composite score
+  const rawResults = await VectorIndex.search(outputDir, description, embedSvc, {
+    limit: limit * 4,
+    language,
+  });
+
+  const candidates: InsertionCandidate[] = rawResults.map(r => {
+    const role = classifyRole(r.record.fanIn, r.record.fanOut, r.record.isHub, r.record.isEntryPoint);
+    const strategy = deriveStrategy(role);
+    const score = compositeScore(r.score, role);
+    return {
+      rank: 0, // assigned below
+      score,
+      semanticDistance: r.score,
+      name: r.record.name,
+      filePath: r.record.filePath,
+      className: r.record.className || undefined,
+      language: r.record.language,
+      signature: r.record.signature || undefined,
+      docstring: r.record.docstring || undefined,
+      role,
+      insertionStrategy: strategy,
+      reason: buildReason(r.record.name, role, strategy, r.record.fanIn, r.record.fanOut),
+      fanIn: r.record.fanIn,
+      fanOut: r.record.fanOut,
+      isHub: r.record.isHub,
+      isEntryPoint: r.record.isEntryPoint,
+    };
+  });
+
+  candidates.sort((a, b) => b.score - a.score);
+  const top = candidates.slice(0, limit).map((c, i) => ({ ...c, rank: i + 1 }));
+
+  return {
+    description,
+    count: top.length,
+    candidates: top,
+    nextSteps: top.length > 0
+      ? [
+          `Run get_function_skeleton on "${top[0].filePath}" to see the internal structure of ${top[0].name}`,
+          `Run get_subgraph on "${top[0].name}" to understand its call neighborhood`,
+          `After implementing, run check_spec_drift to verify the code matches the spec`,
+        ]
+      : ['No candidates found. Try a broader description or run "spec-gen analyze --embed" to build the index.'],
+  };
+}
+
+
+// ============================================================================
 // MCP SERVER
 // ============================================================================
 
@@ -1741,6 +1961,10 @@ async function startMcpServer(): Promise<void> {
         const { directory, query, limit = 10, language, minFanIn } =
           args as { directory: string; query: string; limit?: number; language?: string; minFanIn?: number };
         result = await handleSearchCode(directory, query, limit, language, minFanIn);
+      } else if (name === 'suggest_insertion_points') {
+        const { directory, description, limit = 5, language } =
+          args as { directory: string; description: string; limit?: number; language?: string };
+        result = await handleSuggestInsertionPoints(directory, description, limit, language);
       } else {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
