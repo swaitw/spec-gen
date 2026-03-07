@@ -14,6 +14,8 @@ import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../../utils/logger.js';
+import { VectorIndex } from '../../core/analyzer/vector-index.js';
+import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
 
 function openBrowser(url: string): void {
   const platform = process.platform;
@@ -285,6 +287,37 @@ export const viewCommand = new Command('view')
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(JSON.stringify(requirements));
+                } catch (err) {
+                  res.statusCode = 500;
+                  res.end(JSON.stringify({ error: (err as Error).message }));
+                }
+              });
+
+              devServer.middlewares.use('/api/search', async (req, res) => {
+                try {
+                  const url = new URL(req.url ?? '', 'http://localhost');
+                  const q = url.searchParams.get('q')?.trim() ?? '';
+                  if (!q) {
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: 'Missing query parameter ?q=' }));
+                    return;
+                  }
+                  if (!VectorIndex.exists(analysisDir)) {
+                    res.statusCode = 404;
+                    res.end(JSON.stringify({ error: 'No vector index found. Run spec-gen analyze --embed first.' }));
+                    return;
+                  }
+                  const embedSvc = EmbeddingService.fromEnv();
+                  const results = await VectorIndex.search(analysisDir, q, embedSvc, { limit: 5 });
+                  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                  res.statusCode = 200;
+                  res.end(JSON.stringify(results.map(r => ({
+                    id: r.record.id,
+                    name: r.record.name,
+                    filePath: r.record.filePath,
+                    language: r.record.language,
+                    score: r.score,
+                  }))));
                 } catch (err) {
                   res.statusCode = 500;
                   res.end(JSON.stringify({ error: (err as Error).message }));

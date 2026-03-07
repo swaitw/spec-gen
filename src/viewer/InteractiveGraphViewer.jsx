@@ -1538,6 +1538,9 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   const [affectedIds, setAffectedIds] = useState([]);
   const [focusedIds, setFocusedIds] = useState([]);
   const [search, setSearch] = useState('');
+  const [semanticResults, setSemanticResults] = useState([]); // [{id,name,filePath,score}]
+  const [semanticAvailable, setSemanticAvailable] = useState(true); // false if no index
+  const semanticTimer = useRef(null);
   const [tab, setTab] = useState('node');
   const [viewMode, setViewMode] = useState('clusters');
   const [expandedClusters, setExpandedClusters] = useState(new Set());
@@ -1720,6 +1723,8 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
     setSearch(q);
     if (!q.trim()) {
       setFocusedIds([]);
+      setSemanticResults([]);
+      clearTimeout(semanticTimer.current);
       return;
     }
     const lo = q.toLowerCase();
@@ -1735,6 +1740,16 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         )
         .map((n) => n.id)
     );
+    if (!semanticAvailable || q.trim().length < 3) return;
+    clearTimeout(semanticTimer.current);
+    semanticTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q.trim())}`);
+        if (res.status === 404) { setSemanticAvailable(false); return; }
+        if (!res.ok) return;
+        setSemanticResults(await res.json());
+      } catch { /* ignore */ }
+    }, 400);
   };
 
   const handleSelect = useCallback(
@@ -1763,6 +1778,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
     setSelectedId(null);
     setAffectedIds([]);
     setExpandedClusters(new Set());
+    setSemanticResults([]);
   }, []);
 
   // Escape key: deselect + collapse
@@ -2008,6 +2024,55 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
             >
               {focusedIds.length}
             </span>
+          )}
+          {semanticResults.length > 0 && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '100%',
+                right: 0,
+                marginTop: 4,
+                width: 280,
+                background: '#0d0f22',
+                border: '1px solid #1a1f38',
+                borderRadius: 5,
+                zIndex: 100,
+                boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+                overflow: 'hidden',
+              }}
+            >
+              <div style={{ padding: '4px 8px', borderBottom: '1px solid #1a1f38', fontSize: 8, color: '#3a3f5c', fontFamily: 'inherit' }}>
+                ✦ semantic matches
+              </div>
+              {semanticResults.map((r) => {
+                const node = graph?.nodes.find((n) => n.path === r.filePath || n.path.endsWith(r.filePath) || r.filePath.endsWith(n.path));
+                return (
+                  <div
+                    key={r.id}
+                    onClick={() => { if (node) { handleSelect(node.id); setSemanticResults([]); setSearch(''); } }}
+                    style={{
+                      padding: '5px 8px',
+                      cursor: node ? 'pointer' : 'default',
+                      borderBottom: '1px solid #111428',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 2,
+                      opacity: node ? 1 : 0.4,
+                    }}
+                    onMouseEnter={(e) => { if (node) e.currentTarget.style.background = '#131630'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: 9, color: '#c8cde8', fontFamily: "'JetBrains Mono',monospace" }}>{r.name}</span>
+                      <span style={{ fontSize: 8, color: '#4a3f7a', fontFamily: 'inherit' }}>{(1 - r.score).toFixed(2)}</span>
+                    </div>
+                    <span style={{ fontSize: 8, color: '#3a3f5c', fontFamily: 'inherit', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {r.filePath.split('/').slice(-2).join('/')}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
         <button
