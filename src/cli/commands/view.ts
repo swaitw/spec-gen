@@ -437,7 +437,6 @@ export const viewCommand = new Command('view')
               devServer.middlewares.use('/api/chat/models', async (req, res) => {
                 try {
                   const cfg = await resolveProviderConfig(rootPath);
-                  logger.info('chat/models', `provider=${cfg.kind} model=${cfg.model}`);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
                   let models: string[] = [];
@@ -445,7 +444,6 @@ export const viewCommand = new Command('view')
                     const r = await fetch(
                       `https://generativelanguage.googleapis.com/v1beta/models?key=${cfg.apiKey}`
                     );
-                    logger.info('chat/models', `Gemini status=${r.status}`);
                     if (r.ok) {
                       const data = await r.json() as { models?: Array<{ name: string; supportedGenerationMethods?: string[] }> };
                       models = (data.models ?? [])
@@ -456,7 +454,6 @@ export const viewCommand = new Command('view')
                     const r = await fetch(`${cfg.baseUrl}/models`, {
                       headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01' },
                     });
-                    logger.info('chat/models', `Anthropic status=${r.status}`);
                     if (r.ok) {
                       const data = await r.json() as { data?: Array<{ id: string }> };
                       models = (data.data ?? []).map(m => m.id);
@@ -465,17 +462,12 @@ export const viewCommand = new Command('view')
                     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                     if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
                     const r = await fetch(`${cfg.baseUrl}/models`, { headers });
-                    logger.info('chat/models', `OpenAI-compat status=${r.status} url=${cfg.baseUrl}/models`);
                     if (r.ok) {
                       const data = await r.json() as { data?: Array<{ id: string }> };
                       models = (data.data ?? []).map(m => m.id).sort();
-                    } else {
-                      const errText = await r.text().catch(() => '');
-                      logger.error(`chat/models: fetch failed: ${errText.slice(0, 200)}`);
                     }
                   }
 
-                  logger.info('chat/models', `returning ${models.length} models`);
                   res.statusCode = 200;
                   res.end(JSON.stringify({ provider: cfg.kind, currentModel: cfg.model, models }));
                 } catch (err) {
