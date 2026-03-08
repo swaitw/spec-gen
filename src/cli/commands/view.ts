@@ -348,7 +348,9 @@ export const viewCommand = new Command('view')
                 }
               });
 
-              devServer.middlewares.use('/api/chat', async (req, res) => {
+              devServer.middlewares.use('/api/chat', async (req, res, next) => {
+                // Only handle the exact /api/chat path — let sub-paths (e.g. /models) fall through
+                if (req.url && req.url !== '/' && req.url !== '') { next(); return; }
                 if (req.method !== 'POST') {
                   res.statusCode = 405;
                   res.end(JSON.stringify({ error: 'Method not allowed' }));
