@@ -467,6 +467,7 @@ spec-gen analyze [options]
   --exclude <glob>       # Additional exclude patterns
   --force                # Force re-analysis (bypass 1-hour cache)
   --embed                # Build semantic vector index after analysis (requires embedding config)
+  --reindex-specs        # Re-index OpenSpec specs into the vector index without re-running full analysis
 ```
 
 ### Verify Options
@@ -524,6 +525,8 @@ curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/clin
 curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/cline-workflows/spec-gen-check-spec-drift.md -o .clinerules/workflows/spec-gen-check-spec-drift.md
 curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/cline-workflows/spec-gen-plan-refactor.md -o .clinerules/workflows/spec-gen-plan-refactor.md
 curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/cline-workflows/spec-gen-execute-refactor.md -o .clinerules/workflows/spec-gen-execute-refactor.md
+curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/cline-workflows/spec-gen-implement-feature.md -o .clinerules/workflows/spec-gen-implement-feature.md
+curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/examples/cline-workflows/spec-gen-refactor-codebase.md -o .clinerules/workflows/spec-gen-refactor-codebase.md
 ```
 
 Available commands:
@@ -534,8 +537,10 @@ Available commands:
 | `/spec-gen-check-spec-drift` | Runs `check_spec_drift`, presents issues by severity (gap / stale / uncovered / orphaned-spec), shows per-kind remediation commands, and optionally drills into affected file signatures. |
 | `/spec-gen-plan-refactor` | Runs static analysis, picks the highest-priority target with coverage gate, assesses impact and call graph, then writes a detailed plan to `.spec-gen/refactor-plan.md`. No code changes. |
 | `/spec-gen-execute-refactor` | Reads `.spec-gen/refactor-plan.md`, establishes a green baseline, and applies each planned change one at a time -- with diff verification and test run after every step. Optional final step covers dead-code detection and naming alignment (requires `spec-gen generate`). |
+| `/spec-gen-implement-feature` | Plans and implements a new feature with full architectural context: architecture overview, OpenSpec requirements, insertion points, implementation, and drift check. |
+| `/spec-gen-refactor-codebase` | Convenience redirect that runs `/spec-gen-plan-refactor` followed by `/spec-gen-execute-refactor`. |
 
-All four commands ask which directory to use, call the MCP tools directly, and guide you through the results without leaving the editor. They work in any editor that supports the `.clinerules/workflows/` convention.
+All six commands ask which directory to use, call the MCP tools directly, and guide you through the results without leaving the editor. They work in any editor that supports the `.clinerules/workflows/` convention.
 
 ### Claude Skills
 
@@ -708,9 +713,10 @@ fanOutThreshold  number   Minimum fan-out to be considered a god function (defau
 
 **`suggest_insertion_points`**
 ```
-directory  string   Absolute path to the project directory
-query      string   Natural-language description of the feature to implement
-limit      number   Max candidates to return (default: 5)
+directory    string   Absolute path to the project directory
+description  string   Natural-language description of the feature to implement
+limit        number   Max candidates to return (default: 5)
+language     string   Filter by language: "TypeScript" | "Python" | "Go" | ...
 ```
 
 **`search_code`**
@@ -942,6 +948,9 @@ The index is stored in `.spec-gen/analysis/vector-index/` and is automatically u
 | `OPENAI_COMPAT_API_KEY` | `openai-compat` | API key for OpenAI-compatible server |
 | `OPENAI_COMPAT_BASE_URL` | `openai-compat` | Base URL, e.g. `https://api.mistral.ai/v1` |
 | `GEMINI_API_KEY` | `gemini` | Google Gemini API key |
+| `EMBED_BASE_URL` | embedding | Base URL for the embedding API (e.g. `http://localhost:11434/v1`) |
+| `EMBED_MODEL` | embedding | Embedding model name (e.g. `nomic-embed-text`) |
+| `EMBED_API_KEY` | embedding | API key for the embedding service (defaults to `OPENAI_API_KEY`) |
 | `DEBUG` | -- | Enable stack traces on errors |
 | `CI` | -- | Auto-detected; enables timestamps in output |
 

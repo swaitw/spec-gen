@@ -133,7 +133,7 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
       kind:    'anthropic',
       baseUrl: 'https://api.anthropic.com/v1',
       apiKey:  anthropicKey,
-      model:   envModel || cfgModel || 'claude-sonnet-4-6',
+      model:   envModel || cfgModel || 'claude-sonnet-4-20250514',
     };
   }
 

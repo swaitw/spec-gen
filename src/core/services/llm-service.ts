@@ -518,7 +518,7 @@ export class AnthropicProvider implements LLMProvider {
   private model: string;
   private baseUrl: string;
 
-  constructor(apiKey: string, model = 'claude-3-5-sonnet-20241022', baseUrl?: string, sslVerify = true) {
+  constructor(apiKey: string, model = 'claude-sonnet-4-20250514', baseUrl?: string, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl ? normalizeApiBase(baseUrl) : 'https://api.anthropic.com/v1';
@@ -1386,7 +1386,7 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
       throw new Error('ANTHROPIC_API_KEY environment variable is not set');
     }
     const apiBase = options.apiBase ?? process.env.ANTHROPIC_API_BASE ?? undefined;
-    provider = new AnthropicProvider(apiKey, options.model ?? 'claude-3-5-sonnet-20241022', apiBase, sslVerify);
+    provider = new AnthropicProvider(apiKey, options.model ?? 'claude-sonnet-4-20250514', apiBase, sslVerify);
   } else if (providerName === 'openai') {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {

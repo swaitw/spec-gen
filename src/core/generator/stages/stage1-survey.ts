@@ -110,7 +110,9 @@ ${fileListingSection}`;
  */
 export function mergeStage1Results(results: StageResult<ProjectSurveyResult>[]): StageResult<ProjectSurveyResult> {
   const successful = results.filter(r => r.success && r.data);
-  if (successful.length === 0) return results[0];
+  if (successful.length === 0) {
+    return results[0] ?? { stage: 'survey' as const, success: false, error: 'No survey results available', tokens: 0, duration: 0 };
+  }
 
   const best = successful.reduce((a, b) => (a.data!.confidence >= b.data!.confidence ? a : b));
 

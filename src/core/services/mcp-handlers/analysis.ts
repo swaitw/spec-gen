@@ -214,7 +214,12 @@ export async function handleGetMapping(
     return { error: 'No mapping found. Run spec-gen generate first.' };
   }
 
-  const mapping = JSON.parse(raw) as MappingArtifact;
+  let mapping: MappingArtifact;
+  try {
+    mapping = JSON.parse(raw) as MappingArtifact;
+  } catch {
+    return { error: 'Mapping file is corrupted. Re-run spec-gen generate.' };
+  }
 
   if (orphansOnly) {
     const filtered = domain

@@ -38,7 +38,7 @@ program
       'Philosophy: "Archaeology over Creativity" — We extract the truth of what\n' +
       'code does, grounded in static analysis, not LLM hallucinations.'
   )
-  .version('1.0.0')
+  .version('1.1.0')
   .option('-q, --quiet', 'Minimal output (errors only)', false)
   .option('-v, --verbose', 'Show debug information', false)
   .option('--no-color', 'Disable colored output (also enables timestamps)')
