@@ -624,3 +624,106 @@ describe('CallGraphBuilder — layer violations', () => {
     expect(result.layerViolations).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// C++
+// ---------------------------------------------------------------------------
+
+describe('CallGraphBuilder — C++', () => {
+  it('extracts free functions and resolves calls', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/main.cpp',
+      language: 'C++',
+      content: `
+        void emit() {}
+        void greet() { emit(); }
+        void main() { greet(); emit(); }
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(['emit', 'greet', 'main']);
+    expect(edgePairs(result)).toEqual(['greet→emit', 'main→emit', 'main→greet'].sort());
+    expect(fanIn(result, 'emit')).toBe(2);
+    expect(fanOut(result, 'main')).toBe(2);
+  });
+
+  it('extracts inline class methods and detects class context', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/service.cpp',
+      language: 'C++',
+      content: `
+        class UserService {
+        public:
+          void getUser() { fetch(); }
+          void fetch() {}
+        };
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(['fetch', 'getUser']);
+    expect(result.nodes.get('src/service.cpp::UserService.getUser')?.className).toBe('UserService');
+    expect(result.nodes.get('src/service.cpp::UserService.fetch')?.className).toBe('UserService');
+    expect(fanIn(result, 'fetch')).toBe(1);
+  });
+
+  it('extracts out-of-class method definitions (Foo::bar)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/service.cpp',
+      language: 'C++',
+      content: `
+        void MyClass::process() { validate(); }
+        void MyClass::validate() {}
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('process');
+    expect(nodeNames(result)).toContain('validate');
+    const processNode = Array.from(result.nodes.values()).find(n => n.name === 'process');
+    expect(processNode?.className).toBe('MyClass');
+  });
+
+  it('resolves cross-function calls via member calls (obj.method)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/app.cpp',
+      language: 'C++',
+      content: `
+        void render() {}
+        void run() { render(); }
+      `,
+    }]);
+
+    expect(edgePairs(result)).toContain('run→render');
+  });
+
+  it('does not mark C++ functions as async', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/coro.cpp',
+      language: 'C++',
+      content: `void fetchData() {}`,
+    }]);
+
+    const node = Array.from(result.nodes.values()).find(n => n.name === 'fetchData');
+    expect(node?.isAsync).toBe(false);
+    expect(node?.language).toBe('C++');
+  });
+
+  it('ignores C++ stdlib builtins as call targets', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/io.cpp',
+      language: 'C++',
+      content: `
+        void print() { printf("hello"); }
+        void store() { push_back(1); malloc(10); }
+      `,
+    }]);
+
+    // printf, push_back, malloc are in IGNORED_CALLEES — no edges expected
+    expect(result.edges).toHaveLength(0);
+  });
+});
