@@ -1,0 +1,461 @@
+/**
+ * Shared constants for spec-gen
+ *
+ * Centralises magic numbers so they're easy to find, reason about, and change.
+ */
+
+// ============================================================================
+// DIRECTORY / PATH NAMES
+// ============================================================================
+
+/** Hidden directory where spec-gen stores its state */
+export const SPEC_GEN_DIR = '.spec-gen';
+
+/** Analysis artifacts sub-directory */
+export const SPEC_GEN_ANALYSIS_SUBDIR = 'analysis';
+
+/** LLM log sub-directory */
+export const SPEC_GEN_LOGS_SUBDIR = 'logs';
+
+/** Verification reports sub-directory */
+export const SPEC_GEN_VERIFICATION_SUBDIR = 'verification';
+
+/** Generation outputs sub-directory */
+export const SPEC_GEN_OUTPUTS_SUBDIR = 'outputs';
+
+/** Spec backups sub-directory */
+export const SPEC_GEN_BACKUPS_SUBDIR = 'backups';
+
+/** Generation intermediate files sub-directory */
+export const SPEC_GEN_GENERATION_SUBDIR = 'generation';
+
+/** Run metadata sub-directory */
+export const SPEC_GEN_RUNS_SUBDIR = 'runs';
+
+/** Config file name inside SPEC_GEN_DIR */
+export const SPEC_GEN_CONFIG_FILENAME = 'config.json';
+
+/** Relative path to the spec-gen config file */
+export const SPEC_GEN_CONFIG_REL_PATH = `${SPEC_GEN_DIR}/${SPEC_GEN_CONFIG_FILENAME}`;
+
+/** Relative path to the analysis output directory */
+export const SPEC_GEN_ANALYSIS_REL_PATH = `${SPEC_GEN_DIR}/${SPEC_GEN_ANALYSIS_SUBDIR}`;
+
+/** Default openspec root directory name */
+export const OPENSPEC_DIR = 'openspec';
+
+/** Default relative path used when creating a new openspec directory */
+export const DEFAULT_OPENSPEC_PATH = './openspec';
+
+/** Default openspec specs sub-directory */
+export const OPENSPEC_SPECS_SUBDIR = 'specs';
+
+/** Default openspec decisions sub-directory */
+export const OPENSPEC_DECISIONS_SUBDIR = 'decisions';
+
+/** Config file name inside the openspec directory */
+export const OPENSPEC_CONFIG_FILENAME = 'config.yaml';
+
+// ============================================================================
+// ANALYSIS ARTIFACT FILENAMES
+// ============================================================================
+
+/** Filename for the repository structure artifact */
+export const ARTIFACT_REPO_STRUCTURE = 'repo-structure.json';
+
+/** Filename for the dependency graph artifact */
+export const ARTIFACT_DEPENDENCY_GRAPH = 'dependency-graph.json';
+
+/** Filename for the LLM context artifact */
+export const ARTIFACT_LLM_CONTEXT = 'llm-context.json';
+
+/** Filename for the requirement mapping artifact */
+export const ARTIFACT_MAPPING = 'mapping.json';
+
+/** Filename for the refactor priorities artifact */
+export const ARTIFACT_REFACTOR_PRIORITIES = 'refactor-priorities.json';
+
+/** Filename for the repository map artifact (saved by RepositoryMapper) */
+export const ARTIFACT_REPOSITORY_MAP = 'repository-map.json';
+
+/** Filename for the generation report saved to outputs/ */
+export const ARTIFACT_GENERATION_REPORT = 'generation-report.json';
+
+/** Filename for the shutdown state file */
+export const ARTIFACT_SHUTDOWN_STATE = 'shutdown-state.json';
+
+// ============================================================================
+// LLM / PROVIDER LIMITS
+// ============================================================================
+
+/** Default maximum context window for Claude models (tokens) */
+export const CLAUDE_MAX_CONTEXT_TOKENS = 200_000;
+
+/** Default maximum context window for Mistral Vibe (tokens) */
+export const MISTRAL_VIBE_MAX_CONTEXT_TOKENS = 128_000;
+
+/** Default maximum output tokens for Claude models */
+export const CLAUDE_MAX_OUTPUT_TOKENS = 16_000;
+
+/** Default maximum output tokens for Mistral Vibe */
+export const MISTRAL_VIBE_MAX_OUTPUT_TOKENS = 4_096;
+
+/** Maximum buffer size for LLM CLI output (bytes) — 50 MB */
+export const LLM_CLI_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
+
+/** Timeout for LLM CLI calls (ms) — 5 minutes */
+export const LLM_CLI_TIMEOUT_MS = 300_000;
+
+// ============================================================================
+// ANALYSIS
+// ============================================================================
+
+/** Default maximum number of files to include in analysis */
+export const DEFAULT_MAX_FILES = 500;
+
+/** Default maximum number of changed files to check in drift detection */
+export const DEFAULT_DRIFT_MAX_FILES = 100;
+
+/** How old (ms) an analysis can be before being considered stale (1 hour) */
+export const ANALYSIS_STALE_THRESHOLD_MS = 60 * 60 * 1000;
+
+/** How old (ms) an analysis can be before being re-used in 'run' (1 hour) */
+export const ANALYSIS_REUSE_THRESHOLD_MS = 60 * 60 * 1000;
+
+// ============================================================================
+// VIEWER / SERVER
+// ============================================================================
+
+/** Default port for the Vite viewer server */
+export const DEFAULT_VIEWER_PORT = 5173;
+
+/** Default host for the Vite viewer server */
+export const DEFAULT_VIEWER_HOST = '127.0.0.1';
+
+/** Maximum allowed chat request body size (bytes) — 512 KB */
+export const MAX_CHAT_BODY_BYTES = 512 * 1024;
+
+/** Maximum search query length (characters) */
+export const MAX_QUERY_LENGTH = 1_000;
+
+// ============================================================================
+// GENERATION
+// ============================================================================
+
+/** Estimated system prompt overhead per LLM call (tokens) */
+export const LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS = 500;
+
+/** Estimated output / input token ratio for spec generation tasks */
+export const GENERATION_OUTPUT_RATIO = 0.4;
+
+// ============================================================================
+// DEFAULT MODELS (per provider)
+// ============================================================================
+
+export const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514';
+export const DEFAULT_OPENAI_MODEL = 'gpt-4o';
+export const DEFAULT_OPENAI_COMPAT_MODEL = 'mistral-large-latest';
+export const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash';
+/** Lighter model used for interactive chat (lower cost, faster) */
+export const DEFAULT_CHAT_OPENAI_MODEL = 'gpt-4o-mini';
+
+// ============================================================================
+// DOCTOR / ENVIRONMENT CHECKS
+// ============================================================================
+
+/** Minimum Node.js major version required */
+export const MIN_NODE_MAJOR_VERSION = 20;
+
+/** Analysis age (hours) beyond which doctor warns it may be stale */
+export const ANALYSIS_AGE_WARNING_HOURS = 24;
+
+/** Minimum available disk space (MB) before doctor reports failure */
+export const MIN_DISK_SPACE_FAIL_MB = 200;
+
+/** Minimum available disk space (MB) before doctor reports a warning */
+export const MIN_DISK_SPACE_WARN_MB = 500;
+
+// ============================================================================
+// LLM SERVICE DEFAULTS
+// ============================================================================
+
+/** Default maximum number of retries for LLM API calls */
+export const DEFAULT_LLM_MAX_RETRIES = 3;
+
+/** Default initial retry delay (ms) */
+export const DEFAULT_LLM_INITIAL_DELAY_MS = 1_000;
+
+/** Default maximum retry delay (ms) */
+export const DEFAULT_LLM_MAX_DELAY_MS = 30_000;
+
+/** Default timeout for LLM API calls (ms) — 2 minutes */
+export const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+
+/** Default cost warning threshold (USD) */
+export const DEFAULT_LLM_COST_WARNING_THRESHOLD = 10.0;
+
+/** Fraction of max context tokens at which a warning is emitted */
+export const CONTEXT_LIMIT_WARNING_RATIO = 0.9;
+
+// ============================================================================
+// DIFF / GIT
+// ============================================================================
+
+/** Maximum characters of diff content passed to LLM context */
+export const DIFF_MAX_CHARS = 4_000;
+
+// ============================================================================
+// GENERATION PIPELINE — per-stage LLM output token budgets
+// ============================================================================
+
+/** Stage 1 (project survey) max output tokens */
+export const STAGE1_MAX_TOKENS = 3_000;
+
+/** Stage 2 (entity extraction) max output tokens per file chunk */
+export const STAGE2_MAX_TOKENS = 4_000;
+
+/** Stage 3 (service analysis) max output tokens per file chunk */
+export const STAGE3_MAX_TOKENS = 4_000;
+
+/** Stage 4 (API extraction) max output tokens per file chunk */
+export const STAGE4_MAX_TOKENS = 4_000;
+
+/** Stage 5 (architecture synthesis) max output tokens */
+export const STAGE5_MAX_TOKENS = 3_000;
+
+/** Stage 6 (ADR enrichment) max output tokens */
+export const STAGE6_MAX_TOKENS = 5_000;
+
+/** Max file content characters passed per chunk to stages 2–4 */
+export const STAGE_CHUNK_MAX_CHARS = 8_000;
+
+/** Max characters of skeleton excerpt appended to graph prompt */
+export const SKELETON_EXCERPT_MAX_CHARS = 4_000;
+
+/** Verification engine: max tokens for file-purpose prediction */
+export const VERIFICATION_PREDICTION_MAX_TOKENS = 1_000;
+
+/** Drift detector: max tokens for LLM change classification */
+export const DRIFT_CLASSIFICATION_MAX_TOKENS = 200;
+
+// ============================================================================
+// CHAT AGENT
+// ============================================================================
+
+/** Max output tokens for chat agent turns (Anthropic) */
+export const CHAT_AGENT_MAX_TOKENS = 4_096;
+
+/** Characters of API error body included in error messages */
+export const API_ERROR_PREVIEW_LENGTH = 300;
+
+// ============================================================================
+// ANALYSIS / COST ESTIMATION
+// ============================================================================
+
+/** Fallback estimated tokens for the project survey phase when not yet computed */
+export const DEFAULT_SURVEY_ESTIMATED_TOKENS = 2_000;
+
+// ============================================================================
+// REPOSITORY MAPPER — slice limits for summary output
+// ============================================================================
+
+/** Max high-value files retained after scoring */
+export const HIGH_VALUE_FILES_LIMIT = 50;
+
+/** Max high-value files shown in text summary */
+export const HIGH_VALUE_FILES_PREVIEW_LIMIT = 20;
+
+/** Max entry points shown in text summary */
+export const ENTRY_POINTS_PREVIEW_LIMIT = 10;
+
+/** Max languages shown in text summary */
+export const LANGUAGES_PREVIEW_LIMIT = 10;
+
+/** Max directories shown in text summary */
+export const DIRECTORIES_PREVIEW_LIMIT = 15;
+
+// ============================================================================
+// GRAPH ANALYSIS — risk scoring
+// ============================================================================
+
+/** Risk score weight for fan-in (callers) */
+export const RISK_SCORE_FAN_IN_WEIGHT = 4;
+
+/** Risk score weight for fan-out (callees) */
+export const RISK_SCORE_FAN_OUT_WEIGHT = 2;
+
+/** Risk score bonus when the node is a hub */
+export const RISK_SCORE_HUB_BONUS = 20;
+
+/** Risk score weight for blast radius */
+export const RISK_SCORE_BLAST_RADIUS_WEIGHT = 1.5;
+
+/** Risk score at or below which a function is considered low-risk */
+export const RISK_SCORE_LOW_THRESHOLD = 20;
+
+/** Risk score at or below which a function is considered medium-risk */
+export const RISK_SCORE_MEDIUM_THRESHOLD = 45;
+
+/** Fan-out at or above which a function is treated as a god-function */
+export const GOD_FUNCTION_FAN_OUT_THRESHOLD = 8;
+
+/** Fan-out threshold for SRP (single-responsibility) refactoring recommendation */
+export const REFACTOR_SRP_FAN_OUT_THRESHOLD = 5;
+
+/** Maximum fan-in for a node to be a low-risk refactor candidate */
+export const LOW_RISK_MAX_FAN_IN = 2;
+
+/** Maximum fan-out for a node to be a low-risk refactor candidate */
+export const LOW_RISK_MAX_FAN_OUT = 3;
+
+/** Default minimum fan-in to be classified as a critical hub */
+export const CRITICAL_HUBS_DEFAULT_MIN_FAN_IN = 3;
+
+/** Default subgraph traversal depth */
+export const SUBGRAPH_DEFAULT_MAX_DEPTH = 3;
+
+/** Maximum allowed subgraph traversal depth */
+export const SUBGRAPH_MAX_DEPTH_LIMIT = 20;
+
+/** Criticality score weight for fan-in */
+export const CRITICALITY_FAN_IN_WEIGHT = 3;
+
+/** Criticality score weight for fan-out */
+export const CRITICALITY_FAN_OUT_WEIGHT = 1.5;
+
+/** Criticality score bonus when a node has layer violations */
+export const CRITICALITY_VIOLATION_BONUS = 10;
+
+/** Fan-in at or above which a hub is treated as heavily depended-upon */
+export const HUB_HIGH_FAN_IN_THRESHOLD = 8;
+
+/** Fan-out at or above which a hub is treated as an orchestration-heavy god-function */
+export const HUB_HIGH_FAN_OUT_THRESHOLD = 5;
+
+/** Stability score at or above which a hub can be refactored now */
+export const STABILITY_SCORE_CAN_REFACTOR = 60;
+
+/** Stability score at or above which a hub can be refactored after stabilising deps */
+export const STABILITY_SCORE_STABILISE_FIRST = 30;
+
+/** Default number of refactor candidates to return */
+export const LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT = 5;
+
+/** Default number of leaf functions to return */
+export const LEAF_FUNCTIONS_DEFAULT_LIMIT = 20;
+
+// ============================================================================
+// MAPPING GENERATOR — similarity scoring
+// ============================================================================
+
+/** Similarity score returned for containment matches (one name includes the other) */
+export const SIMILARITY_CONTAINMENT_SCORE = 0.8;
+
+/** Weight applied to Jaccard token-overlap similarity */
+export const SIMILARITY_TOKEN_OVERLAP_WEIGHT = 0.7;
+
+/** Minimum heuristic similarity score to include a function as a candidate match */
+export const HEURISTIC_MATCH_MIN_SCORE = 0.7;
+
+/** Maximum number of heuristic fallback matches returned per operation */
+export const MAX_HEURISTIC_MATCHES_PER_OP = 2;
+
+// ============================================================================
+// STAGE 5 — architecture synthesis prompt limits
+// ============================================================================
+
+/** Max hub functions included in Stage 5 architecture prompt */
+export const STAGE5_HUB_FUNCTIONS_LIMIT = 8;
+
+/** Max entry points included in Stage 5 architecture prompt */
+export const STAGE5_ENTRY_POINTS_LIMIT = 8;
+
+/** Max layer violations included in Stage 5 architecture prompt */
+export const STAGE5_VIOLATIONS_LIMIT = 5;
+
+// ============================================================================
+// ARTIFACT GENERATOR
+// ============================================================================
+
+/** Approximate tokens per character used for LLM context token estimation (~4 chars/token) */
+export const TOKENS_PER_CHAR_DEFAULT = 0.25;
+
+/** Max characters of file content included per file in Phase 2 (deep analysis) */
+export const PHASE2_FILE_CONTENT_MAX_CHARS = 10_000;
+
+/** Max characters of file content included per file in Phase 3 (validation) */
+export const PHASE3_FILE_CONTENT_MAX_CHARS = 5_000;
+
+/** Max files shown in dependency diagram (Mermaid) */
+export const DEPENDENCY_DIAGRAM_MAX_FILES = 30;
+
+// ============================================================================
+// MCP HANDLERS
+// ============================================================================
+
+/** Max number of top refactor issues returned by analyze_codebase */
+export const TOP_REFACTOR_ISSUES_LIMIT = 10;
+
+/** Composite score semantic weight for suggest_insertion_points */
+export const INSERTION_SEMANTIC_WEIGHT = 0.6;
+
+/** Composite score structural weight for suggest_insertion_points */
+export const INSERTION_STRUCTURAL_WEIGHT = 0.4;
+
+/** Structural bonus scores per insertion role */
+export const INSERTION_ROLE_BONUS_ENTRY_POINT = 1.0;
+export const INSERTION_ROLE_BONUS_ORCHESTRATOR = 0.8;
+export const INSERTION_ROLE_BONUS_HUB = 0.6;
+export const INSERTION_ROLE_BONUS_INTERNAL = 0.4;
+export const INSERTION_ROLE_BONUS_UTILITY = 0.3;
+
+/** Fan-out threshold at or above which a node is classified as an orchestrator */
+export const INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD = 5;
+
+// ============================================================================
+// ANALYSIS ARTIFACT — LLM context file selection
+// ============================================================================
+
+/** Maximum files included in LLM deep analysis phase */
+export const MAX_DEEP_ANALYSIS_FILES = 20;
+
+/** Fraction of high-value files selected for LLM deep analysis */
+export const DEEP_ANALYSIS_FILE_RATIO = 0.3;
+
+/** Maximum files included in LLM validation phase */
+export const MAX_VALIDATION_FILES = 5;
+
+// ============================================================================
+// GENERATE COMMAND
+// ============================================================================
+
+/** Estimated cost (USD) above which the generate command prompts for confirmation */
+export const COST_CONFIRMATION_THRESHOLD = 0.5;
+
+// ============================================================================
+// REFACTOR ANALYZER — priority scoring
+// ============================================================================
+
+/** Base score added for each fan-in/fan-out excess block */
+export const REFACTOR_EXCESS_BASE_SCORE = 2;
+
+/** Maximum proportional score boost for excess fan-in */
+export const MAX_FAN_IN_SCORE_BOOST = 3;
+
+/** Maximum proportional score boost for excess fan-out */
+export const MAX_FAN_OUT_SCORE_BOOST = 3;
+
+/** Base score added for SRP violations */
+export const SRP_BASE_SCORE = 1.5;
+
+/** Per-requirement penalty above SRP_MAX_REQUIREMENTS */
+export const SRP_PER_REQUIREMENT_PENALTY = 0.5;
+
+/** Score added for clone group membership */
+export const CLONE_GROUP_MEMBERSHIP_SCORE = 1.5;
+
+/** Maximum call-graph depth considered "shallow" (bonus for refactoring) */
+export const SHALLOW_FUNCTION_DEPTH_MAX = 2;
+
+/** Score bonus for shallow functions with issues */
+export const SHALLOW_FUNCTION_SCORE_BONUS = 0.5;

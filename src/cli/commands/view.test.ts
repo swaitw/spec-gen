@@ -1,0 +1,293 @@
+/**
+ * Tests for spec-gen view command
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { viewCommand, sanitizeErrorMessage, safePath } from './view.js';
+
+// ============================================================================
+// MOCKS
+// ============================================================================
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: {
+    section: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn(),
+    success: vi.fn(), discovery: vi.fn(), analysis: vi.fn(), blank: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+vi.mock('../../utils/command-helpers.js', () => ({
+  fileExists: vi.fn().mockResolvedValue(false),
+}));
+
+// Mock vite and react plugin to avoid heavy imports in test environment
+vi.mock('vite', () => ({
+  createServer: vi.fn().mockResolvedValue({
+    listen: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  }),
+}));
+
+vi.mock('@vitejs/plugin-react', () => ({
+  default: vi.fn().mockReturnValue({ name: 'vite:react' }),
+}));
+
+vi.mock('node:child_process', () => ({
+  spawn: vi.fn().mockReturnValue({ unref: vi.fn() }),
+}));
+
+vi.mock('../../core/analyzer/vector-index.js', () => ({
+  VectorIndex: {
+    exists: vi.fn().mockReturnValue(false),
+    search: vi.fn().mockResolvedValue([]),
+  },
+}));
+
+vi.mock('../../core/analyzer/embedding-service.js', () => ({
+  EmbeddingService: {
+    fromEnv: vi.fn().mockReturnValue({}),
+  },
+}));
+
+vi.mock('../../core/analyzer/code-shaper.js', () => ({
+  getSkeletonContent: vi.fn().mockReturnValue(''),
+  detectLanguage: vi.fn().mockReturnValue('typescript'),
+}));
+
+vi.mock('../../core/services/chat-agent.js', () => ({
+  runChatAgent: vi.fn().mockResolvedValue({ reply: '', filePaths: [] }),
+  resolveProviderConfig: vi.fn().mockResolvedValue({ kind: 'anthropic', model: 'claude', baseUrl: '', apiKey: '' }),
+}));
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+describe('view command', () => {
+  beforeEach(() => {
+    process.exitCode = undefined;
+    vi.clearAllMocks();
+  });
+
+  // --------------------------------------------------------------------------
+  describe('command configuration', () => {
+    it('should have correct name', () => {
+      expect(viewCommand.name()).toBe('view');
+    });
+
+    it('should describe the viewer', () => {
+      expect(viewCommand.description()).toContain('viewer');
+    });
+
+    it('should have --analysis option with default', () => {
+      const opt = viewCommand.options.find(o => o.long === '--analysis');
+      expect(opt).toBeDefined();
+      expect(opt?.defaultValue).toContain('.spec-gen');
+      expect(opt?.defaultValue).toContain('analysis');
+    });
+
+    it('should have --spec option with default', () => {
+      const opt = viewCommand.options.find(o => o.long === '--spec');
+      expect(opt).toBeDefined();
+      expect(opt?.defaultValue).toContain('openspec');
+      expect(opt?.defaultValue).toContain('specs');
+    });
+
+    it('should have --port option with numeric default', () => {
+      const opt = viewCommand.options.find(o => o.long === '--port');
+      expect(opt).toBeDefined();
+      expect(Number(opt?.defaultValue)).toBeGreaterThan(0);
+    });
+
+    it('should have --host option', () => {
+      const opt = viewCommand.options.find(o => o.long === '--host');
+      expect(opt).toBeDefined();
+    });
+
+    it('should have --no-open option', () => {
+      const opt = viewCommand.options.find(o => o.long === '--no-open');
+      expect(opt).toBeDefined();
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('missing analysis file validation', () => {
+    it('should set exitCode=1 when analysis directory has no graph file', async () => {
+      const { fileExists } = await import('../../utils/command-helpers.js');
+      vi.mocked(fileExists).mockResolvedValue(false);
+
+      await viewCommand.parseAsync(['node', 'view'], { from: 'user' });
+
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should log error when graph file is missing', async () => {
+      const { fileExists } = await import('../../utils/command-helpers.js');
+      vi.mocked(fileExists).mockResolvedValue(false);
+      const { logger } = await import('../../utils/logger.js');
+
+      await viewCommand.parseAsync(['node', 'view'], { from: 'user' });
+
+      expect(logger.error).toHaveBeenCalled();
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('port validation', () => {
+    it('should set exitCode=1 for invalid port (non-numeric)', async () => {
+      const { fileExists } = await import('../../utils/command-helpers.js');
+      // Make graph exist, but viewer assets missing — will fail there
+      // First call (graph): true, second call (viewer index.html): false
+      vi.mocked(fileExists).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+      await viewCommand.parseAsync(['node', 'view', '--port', 'abc'], { from: 'user' });
+
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should set exitCode=1 for port 0', async () => {
+      const { fileExists } = await import('../../utils/command-helpers.js');
+      vi.mocked(fileExists).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+      await viewCommand.parseAsync(['node', 'view', '--port', '0'], { from: 'user' });
+
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should set exitCode=1 for port > 65535', async () => {
+      const { fileExists } = await import('../../utils/command-helpers.js');
+      vi.mocked(fileExists).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+      await viewCommand.parseAsync(['node', 'view', '--port', '99999'], { from: 'user' });
+
+      expect(process.exitCode).toBe(1);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('default option values use constants', () => {
+    it('analysis default should not be a raw hardcoded string', () => {
+      const opt = viewCommand.options.find(o => o.long === '--analysis');
+      // Should reference the actual computed path, not a raw literal
+      expect(opt?.defaultValue).toMatch(/\.spec-gen.analysis/);
+    });
+
+    it('spec default should not be a raw hardcoded string', () => {
+      const opt = viewCommand.options.find(o => o.long === '--spec');
+      expect(opt?.defaultValue).toMatch(/openspec.specs/);
+    });
+  });
+});
+
+// ============================================================================
+// PURE UTILITY FUNCTION TESTS
+// ============================================================================
+
+describe('sanitizeErrorMessage', () => {
+  // -- Filesystem path redaction --
+  it('should redact macOS paths (/Users/...)', () => {
+    expect(sanitizeErrorMessage('ENOENT: /Users/alice/project/src/foo.ts'))
+      .toBe('ENOENT: [path]');
+  });
+
+  it('should redact Linux paths (/home/...)', () => {
+    expect(sanitizeErrorMessage('Error reading /home/deploy/app/config.json'))
+      .toBe('Error reading [path]');
+  });
+
+  it('should redact Windows paths (C:\\...)', () => {
+    expect(sanitizeErrorMessage('Not found: C:\\Users\\bob\\project\\file.ts'))
+      .toBe('Not found: [path]');
+  });
+
+  it('should redact multiple paths in one message', () => {
+    const msg = 'Copy /Users/a/src to /Users/b/dst failed';
+    const result = sanitizeErrorMessage(msg);
+    expect(result).not.toContain('/Users/');
+  });
+
+  // -- API key redaction --
+  it('should redact Gemini-style ?key= parameters', () => {
+    expect(sanitizeErrorMessage('Request to https://api.google.com?key=AIzaSyB1234567890abcdefg failed'))
+      .toContain('?key=[REDACTED]');
+    expect(sanitizeErrorMessage('Request to https://api.google.com?key=AIzaSyB1234567890abcdefg failed'))
+      .not.toContain('AIzaSyB');
+  });
+
+  it('should redact Anthropic API keys (sk-ant-...)', () => {
+    expect(sanitizeErrorMessage('Auth failed with sk-ant-api03-abcdefghij1234567890'))
+      .toContain('[REDACTED]');
+    expect(sanitizeErrorMessage('Auth failed with sk-ant-api03-abcdefghij1234567890'))
+      .not.toContain('sk-ant-');
+  });
+
+  it('should redact OpenAI API keys (sk-...)', () => {
+    expect(sanitizeErrorMessage('Key: sk-proj-abcdefghijklmnopqrstuvwx'))
+      .toContain('[REDACTED]');
+    expect(sanitizeErrorMessage('Key: sk-proj-abcdefghijklmnopqrstuvwx'))
+      .not.toContain('sk-proj-');
+  });
+
+  it('should redact Bearer tokens', () => {
+    expect(sanitizeErrorMessage('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload'))
+      .toContain('Bearer [REDACTED]');
+    expect(sanitizeErrorMessage('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload'))
+      .not.toContain('eyJhbG');
+  });
+
+  it('should redact x-api-key header values', () => {
+    expect(sanitizeErrorMessage('x-api-key: sk-ant-api03-abcdef1234567890'))
+      .toContain('x-api-key: [REDACTED]');
+  });
+
+  // -- Pass-through --
+  it('should not alter messages without sensitive content', () => {
+    const msg = 'Connection refused on port 8080';
+    expect(sanitizeErrorMessage(msg)).toBe(msg);
+  });
+
+  it('should handle empty string', () => {
+    expect(sanitizeErrorMessage('')).toBe('');
+  });
+});
+
+// ============================================================================
+// safePath — path traversal prevention
+// ============================================================================
+
+describe('safePath', () => {
+  it('should allow a path within the project root', () => {
+    const result = safePath('/project', 'src/foo.ts');
+    expect(result).toBe('/project/src/foo.ts');
+  });
+
+  it('should allow the project root itself', () => {
+    const result = safePath('/project', '.');
+    expect(result).toBe('/project');
+  });
+
+  it('should reject path traversal above root', () => {
+    expect(safePath('/project', '../../../etc/passwd')).toBeNull();
+  });
+
+  it('should reject absolute paths outside root', () => {
+    expect(safePath('/project', '/etc/passwd')).toBeNull();
+  });
+
+  it('should allow nested paths', () => {
+    const result = safePath('/project', 'src/core/deep/file.ts');
+    expect(result).toBe('/project/src/core/deep/file.ts');
+  });
+
+  it('should reject prefix trick (e.g. /project-evil)', () => {
+    // "/project-evil" starts with "/project" but is NOT inside it
+    expect(safePath('/project', '../project-evil/hack.ts')).toBeNull();
+  });
+
+  it('should handle relative paths that resolve inside root', () => {
+    // src/../src/file.ts resolves to /project/src/file.ts
+    const result = safePath('/project', 'src/../src/file.ts');
+    expect(result).toBe('/project/src/file.ts');
+  });
+});

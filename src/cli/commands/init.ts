@@ -28,6 +28,11 @@ import {
   isInGitignore,
   addToGitignore,
 } from '../../core/services/gitignore-manager.js';
+import {
+  SPEC_GEN_DIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+  DEFAULT_OPENSPEC_PATH,
+} from '../../constants.js';
 import type { InitOptions } from '../../types/index.js';
 
 export const initCommand = new Command('init')
@@ -36,7 +41,7 @@ export const initCommand = new Command('init')
   .option(
     '--openspec-path <path>',
     'Custom path for openspec/ output directory',
-    './openspec'
+    DEFAULT_OPENSPEC_PATH
   )
   .addHelpText(
     'after',
@@ -59,7 +64,8 @@ After initialization, run 'spec-gen analyze' to scan your codebase.
   )
   .action(async (options: Partial<InitOptions>) => {
     const rootPath = process.cwd();
-    const openspecPath = resolve(rootPath, options.openspecPath ?? './openspec');
+    const openspecRelPath = options.openspecPath ?? DEFAULT_OPENSPEC_PATH;
+    const openspecPath = resolve(rootPath, openspecRelPath);
     const force = options.force ?? false;
 
     // Prevent path traversal — openspec directory must be within the project root
@@ -107,7 +113,7 @@ After initialization, run 'spec-gen analyze' to scan your codebase.
     const existingOpenspecConfig = await openspecConfigExists(openspecPath);
 
     if (existingSpecGenConfig && !force) {
-      logger.warning('.spec-gen/config.json already exists');
+      logger.warning(`${SPEC_GEN_CONFIG_REL_PATH} already exists`);
 
       const existingConfig = await readSpecGenConfig(rootPath);
       if (existingConfig) {
@@ -156,15 +162,15 @@ After initialization, run 'spec-gen analyze' to scan your codebase.
     // Step 3: Create configuration
     logger.analysis('Creating configuration...');
 
-    const config = getDefaultConfig(detection.projectType, options.openspecPath ?? './openspec');
+    const config = getDefaultConfig(detection.projectType, openspecRelPath);
 
     await writeSpecGenConfig(rootPath, config);
-    logger.success('Created .spec-gen/config.json');
+    logger.success(`Created ${SPEC_GEN_CONFIG_REL_PATH}`);
 
     // Step 4: Create OpenSpec structure if needed
     if (!existingOpenspecDir) {
       await createOpenSpecStructure(openspecPath);
-      logger.success(`Created ${options.openspecPath ?? './openspec'}/ directory structure`);
+      logger.success(`Created ${openspecRelPath}/ directory structure`);
     }
 
     // Step 5: Update .gitignore
@@ -172,31 +178,31 @@ After initialization, run 'spec-gen analyze' to scan your codebase.
     logger.discovery('Checking .gitignore...');
 
     const hasGitignore = await gitignoreExists(rootPath);
-    const alreadyIgnored = hasGitignore && (await isInGitignore(rootPath, '.spec-gen/'));
+    const alreadyIgnored = hasGitignore && (await isInGitignore(rootPath, `${SPEC_GEN_DIR}/`));
 
     if (alreadyIgnored) {
-      logger.debug('.spec-gen/ already in .gitignore');
+      logger.debug(`${SPEC_GEN_DIR}/ already in .gitignore`);
     } else if (hasGitignore) {
       // Check if running in TTY for interactive prompt
       let shouldAdd = true;
 
       if (process.stdin.isTTY) {
         shouldAdd = await confirm({
-          message: 'Add .spec-gen/ to .gitignore? (recommended)',
+          message: `Add ${SPEC_GEN_DIR}/ to .gitignore? (recommended)`,
           default: true,
         });
       }
 
       if (shouldAdd) {
-        await addToGitignore(rootPath, '.spec-gen/', 'spec-gen analysis artifacts');
-        logger.success('Added .spec-gen/ to .gitignore');
+        await addToGitignore(rootPath, `${SPEC_GEN_DIR}/`, 'spec-gen analysis artifacts');
+        logger.success(`Added ${SPEC_GEN_DIR}/ to .gitignore`);
       } else {
-        logger.warning('.spec-gen/ not added to .gitignore');
+        logger.warning(`${SPEC_GEN_DIR}/ not added to .gitignore`);
         logger.debug('Analysis artifacts may be committed to version control');
       }
     } else {
       logger.debug('No .gitignore file found');
-      logger.debug('Consider creating one to exclude .spec-gen/');
+      logger.debug(`Consider creating one to exclude ${SPEC_GEN_DIR}/`);
     }
 
     // Step 6: Output summary
@@ -204,8 +210,8 @@ After initialization, run 'spec-gen analyze' to scan your codebase.
     logger.section('Initialization Complete');
 
     logger.info('Project type', getProjectTypeName(detection.projectType));
-    logger.info('Config file', '.spec-gen/config.json');
-    logger.info('Output path', options.openspecPath ?? './openspec');
+    logger.info('Config file', SPEC_GEN_CONFIG_REL_PATH);
+    logger.info('Output path', openspecRelPath);
 
     if (existingOpenspecDir) {
       logger.info('Integration', 'Will add to existing OpenSpec setup');

@@ -4,6 +4,21 @@
  */
 
 import { join } from 'node:path';
+import {
+  INSERTION_SEMANTIC_WEIGHT,
+  INSERTION_STRUCTURAL_WEIGHT,
+  INSERTION_ROLE_BONUS_ENTRY_POINT,
+  INSERTION_ROLE_BONUS_ORCHESTRATOR,
+  INSERTION_ROLE_BONUS_HUB,
+  INSERTION_ROLE_BONUS_INTERNAL,
+  INSERTION_ROLE_BONUS_UTILITY,
+  INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+} from '../../../constants.js';
+import { fileExists } from '../../../utils/command-helpers.js';
 import { validateDirectory } from './utils.js';
 import { readSpecGenConfig } from '../config-manager.js';
 
@@ -41,7 +56,7 @@ export interface InsertionCandidate {
 export function classifyRole(fanIn: number, fanOut: number, isHub: boolean, isEntryPoint: boolean): InsertionRole {
   if (isEntryPoint) return 'entry_point';
   if (isHub) return 'hub';
-  if (fanOut >= 5) return 'orchestrator';
+  if (fanOut >= INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD) return 'orchestrator';
   if (fanIn <= 1) return 'utility';
   return 'internal';
 }
@@ -77,17 +92,17 @@ export function buildReason(
   }
 }
 
-/** Composite score = (1 - semanticDistance) * 0.6 + structuralBonus * 0.4 */
+/** Composite score = semantic * INSERTION_SEMANTIC_WEIGHT + structuralBonus * INSERTION_STRUCTURAL_WEIGHT */
 export function compositeScore(semanticDistance: number, role: InsertionRole): number {
   const semantic = Math.max(0, 1 - semanticDistance);
   const structuralBonus: Record<InsertionRole, number> = {
-    entry_point:  1.0,
-    orchestrator: 0.8,
-    hub:          0.6,
-    internal:     0.4,
-    utility:      0.3,
+    entry_point:  INSERTION_ROLE_BONUS_ENTRY_POINT,
+    orchestrator: INSERTION_ROLE_BONUS_ORCHESTRATOR,
+    hub:          INSERTION_ROLE_BONUS_HUB,
+    internal:     INSERTION_ROLE_BONUS_INTERNAL,
+    utility:      INSERTION_ROLE_BONUS_UTILITY,
   };
-  return semantic * 0.6 + structuralBonus[role] * 0.4;
+  return semantic * INSERTION_SEMANTIC_WEIGHT + structuralBonus[role] * INSERTION_STRUCTURAL_WEIGHT;
 }
 
 // ============================================================================
@@ -105,7 +120,7 @@ export async function handleSearchCode(
   minFanIn?: number
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, '.spec-gen', 'analysis');
+  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
@@ -165,7 +180,7 @@ export async function handleSuggestInsertionPoints(
   language?: string
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, '.spec-gen', 'analysis');
+  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
@@ -239,13 +254,12 @@ export async function handleSuggestInsertionPoints(
  * Useful for the agent to discover what domains exist before doing a targeted search.
  */
 export async function handleListSpecDomains(directory: string): Promise<unknown> {
-  const { existsSync } = await import('node:fs');
   const { readdir } = await import('node:fs/promises');
   const { join: pjoin } = await import('node:path');
   const absDir = await validateDirectory(directory);
 
-  const specsDir = pjoin(absDir, 'openspec', 'specs');
-  if (!existsSync(specsDir)) {
+  const specsDir = pjoin(absDir, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
+  if (!(await fileExists(specsDir))) {
     return { domains: [], note: 'No openspec/specs/ directory found. Run "spec-gen generate" first.' };
   }
 
@@ -256,8 +270,8 @@ export async function handleListSpecDomains(directory: string): Promise<unknown>
     return { domains: [] };
   }
 
-  const { existsSync: ex2 } = await import('node:fs');
-  const domains = entries.filter(e => ex2(pjoin(specsDir, e, 'spec.md')));
+  const domainChecks = await Promise.all(entries.map(e => fileExists(pjoin(specsDir, e, 'spec.md'))));
+  const domains = entries.filter((_, i) => domainChecks[i]);
   return { domains, count: domains.length };
 }
 
@@ -273,7 +287,7 @@ export async function handleSearchSpecs(
   section?: string
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, '.spec-gen', 'analysis');
+  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
   const { EmbeddingService } = await import('../../analyzer/embedding-service.js');

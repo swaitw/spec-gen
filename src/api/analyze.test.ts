@@ -41,6 +41,21 @@ vi.mock('../core/analyzer/artifact-generator.js', () => ({
   AnalysisArtifactGenerator: vi.fn().mockImplementation(function (this: unknown) {
     Object.assign(this as object, { generateAndSave: vi.fn() });
   }),
+  repoStructureToRepoMap: vi.fn().mockImplementation((rs: Record<string, unknown>) => {
+    const stats = (rs.statistics ?? {}) as Record<string, number>;
+    return {
+      metadata: { projectName: '', projectType: 'nodejs', rootPath: '', analyzedAt: '', version: '' },
+      summary: {
+        totalFiles: stats.totalFiles ?? 0,
+        analyzedFiles: stats.analyzedFiles ?? 0,
+        skippedFiles: stats.skippedFiles ?? 0,
+        languages: [], frameworks: [], directories: [],
+      },
+      highValueFiles: [], entryPoints: [], schemaFiles: [], configFiles: [],
+      clusters: { byDirectory: {}, byDomain: {}, byLayer: { presentation: [], business: [], data: [], infrastructure: [] } },
+      allFiles: [],
+    };
+  }),
 }));
 
 import { access, stat, readFile } from 'node:fs/promises';

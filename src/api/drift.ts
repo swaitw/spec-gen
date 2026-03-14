@@ -6,7 +6,8 @@
  */
 
 import { join } from 'node:path';
-import { access } from 'node:fs/promises';
+import { DEFAULT_DRIFT_MAX_FILES, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_LOGS_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_REPO_STRUCTURE } from '../constants.js';
+import { fileExists } from '../utils/command-helpers.js';
 import { readSpecGenConfig } from '../core/services/config-manager.js';
 import {
   getChangedFiles,
@@ -22,15 +23,6 @@ import type { DriftApiOptions, ProgressCallback } from './types.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'drift', step, status, detail });
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -52,7 +44,7 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
   const domains = options.domains ?? [];
   const llmEnhanced = options.llmEnhanced ?? false;
   const failOn = options.failOn ?? 'warning';
-  const maxFiles = options.maxFiles ?? 100;
+  const maxFiles = options.maxFiles ?? DEFAULT_DRIFT_MAX_FILES;
   const { onProgress } = options;
 
   // Validate git repo
@@ -67,27 +59,41 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
   }
 
   // Check specs exist
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? 'openspec');
-  const specsPath = join(openspecPath, 'specs');
+  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
   if (!(await fileExists(specsPath))) {
     throw new Error('No specs found. Run specGenGenerate() first.');
   }
 
-  // Create LLM service if needed
+  // Create LLM service if needed — support all four providers
   let llm: LLMService | undefined;
   if (llmEnhanced) {
     const anthropicKey = process.env.ANTHROPIC_API_KEY;
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!anthropicKey && !openaiKey) {
-      throw new Error('No LLM API key found. LLM-enhanced drift requires ANTHROPIC_API_KEY or OPENAI_API_KEY.');
+    const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
+      throw new Error('No LLM API key found. LLM-enhanced drift requires ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY.');
     }
-    const provider = options.provider ?? (anthropicKey ? 'anthropic' : 'openai');
+    const envDetectedProvider = anthropicKey ? 'anthropic'
+      : geminiKey ? 'gemini'
+      : openaiCompatKey ? 'openai-compat'
+      : 'openai';
+    const provider = options.provider ?? envDetectedProvider;
+    const defaultModels: Record<string, string> = {
+      anthropic: DEFAULT_ANTHROPIC_MODEL,
+      gemini: DEFAULT_GEMINI_MODEL,
+      'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
+      openai: DEFAULT_OPENAI_MODEL,
+    };
     llm = createLLMService({
       provider,
+      model: options.model ?? defaultModels[provider] ?? DEFAULT_ANTHROPIC_MODEL,
       apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
+      openaiCompatBaseUrl: options.openaiCompatBaseUrl,
       sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
       enableLogging: true,
-      logDir: join(rootPath, '.spec-gen', 'logs'),
+      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
     });
   }
 
@@ -123,7 +129,7 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
 
   // Build spec map
   progress(onProgress, 'Loading spec mappings', 'start');
-  const repoStructurePath = join(rootPath, '.spec-gen', 'analysis', 'repo-structure.json');
+  const repoStructurePath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
   const hasRepoStructure = await fileExists(repoStructurePath);
 
   const specMap = await buildSpecMap({
@@ -148,7 +154,7 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
     changedFiles: gitResult.files,
     failOn,
     domainFilter: domains.length > 0 ? domains : undefined,
-    openspecRelPath: specGenConfig.openspecPath ?? 'openspec',
+    openspecRelPath: specGenConfig.openspecPath ?? OPENSPEC_DIR,
     llm,
     baseRef: gitResult.resolvedBase,
     adrMap: adrMap ?? undefined,

@@ -357,4 +357,51 @@ describe('verify command', () => {
       expect(logger.error).toBeDefined();
     });
   });
+
+  describe('input validation', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      process.exitCode = undefined;
+    });
+
+    it('should reject --samples 0', async () => {
+      const { verifyCommand } = await import('./verify.js');
+      const { logger } = await import('../../utils/logger.js');
+      await verifyCommand.parseAsync(['--samples', '0'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--samples must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should reject --samples -1', async () => {
+      const { verifyCommand } = await import('./verify.js');
+      const { logger } = await import('../../utils/logger.js');
+      await verifyCommand.parseAsync(['--samples', '-1'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--samples must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should reject --threshold 1.5', async () => {
+      const { verifyCommand } = await import('./verify.js');
+      const { logger } = await import('../../utils/logger.js');
+      await verifyCommand.parseAsync(['--samples', '5', '--threshold', '1.5'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('Threshold must be a number between 0 and 1');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should reject --threshold -0.1', async () => {
+      const { verifyCommand } = await import('./verify.js');
+      const { logger } = await import('../../utils/logger.js');
+      await verifyCommand.parseAsync(['--samples', '5', '--threshold', '-0.1'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('Threshold must be a number between 0 and 1');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should reject non-numeric --threshold', async () => {
+      const { verifyCommand } = await import('./verify.js');
+      const { logger } = await import('../../utils/logger.js');
+      await verifyCommand.parseAsync(['--samples', '5', '--threshold', 'abc'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('Threshold must be a number between 0 and 1');
+      expect(process.exitCode).toBe(1);
+    });
+  });
 });

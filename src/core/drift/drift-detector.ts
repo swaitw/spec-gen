@@ -7,6 +7,7 @@
 
 import { access } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import { DRIFT_CLASSIFICATION_MAX_TOKENS, SPEC_GEN_DIR, OPENSPEC_DIR } from '../../constants.js';
 import type {
   ChangedFile,
   DriftIssue,
@@ -57,7 +58,7 @@ const HIGH_VALUE_PATTERNS = [
  * Filters out test files, generated files, lock files, assets, etc.
  * @param openspecRelPath - relative path to the openspec directory (default: "openspec")
  */
-export function isSpecRelevantChange(file: ChangedFile, openspecRelPath: string = 'openspec'): boolean {
+export function isSpecRelevantChange(file: ChangedFile, openspecRelPath: string = OPENSPEC_DIR): boolean {
   // Always skip tests and generated files
   if (file.isTest || file.isGenerated) return false;
 
@@ -65,7 +66,7 @@ export function isSpecRelevantChange(file: ChangedFile, openspecRelPath: string 
   // Normalize leading "./" from config paths to match git-reported paths
   const normalizedSpecPath = openspecRelPath.replace(/^\.\//, '').replace(/\/$/, '');
   const specPrefix = normalizedSpecPath + '/';
-  if (file.path.startsWith(specPrefix) || file.path.startsWith('.spec-gen/')) return false;
+  if (file.path.startsWith(specPrefix) || file.path.startsWith(`${SPEC_GEN_DIR}/`)) return false;
 
   // Skip markdown files: docs, changelogs, readmes, contributing guides, etc.
   // Only source-embedded .md in non-root src directories could be spec-relevant.
@@ -154,7 +155,7 @@ export function computeSeverity(kind: DriftIssueKind, file: ChangedFile): DriftS
  *
  * @param openspecRelPath - relative path prefix for spec files (default: "openspec")
  */
-export function extractChangedSpecDomains(changedFiles: ChangedFile[], openspecRelPath: string = 'openspec'): Set<string> {
+export function extractChangedSpecDomains(changedFiles: ChangedFile[], openspecRelPath: string = OPENSPEC_DIR): Set<string> {
   const domains = new Set<string>();
   // Normalize: strip leading "./" and trailing slash, escape for regex
   const prefix = openspecRelPath.replace(/^\.\//, '').replace(/\/$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -334,7 +335,7 @@ export async function detectOrphanedSpecs(specMap: SpecMap, rootPath: string): P
  * Extract ADR IDs that were changed in this changeset.
  * Matches files like: openspec/decisions/adr-0001-foo.md
  */
-export function extractChangedADRIds(changedFiles: ChangedFile[], openspecRelPath: string = 'openspec'): Set<string> {
+export function extractChangedADRIds(changedFiles: ChangedFile[], openspecRelPath: string = OPENSPEC_DIR): Set<string> {
   const ids = new Set<string>();
   const prefix = openspecRelPath.replace(/^\.\//, '').replace(/\/$/, '');
   const pattern = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/decisions/adr-(\\d+)-`);
@@ -526,7 +527,7 @@ export async function enhanceGapsWithLLM(
         systemPrompt: LLM_SYSTEM_PROMPT,
         userPrompt,
         temperature: 0.1,
-        maxTokens: 200,
+        maxTokens: DRIFT_CLASSIFICATION_MAX_TOKENS,
         responseFormat: 'json',
       });
 
@@ -684,7 +685,7 @@ export async function detectDrift(options: DriftDetectorOptions): Promise<DriftR
 
   return {
     timestamp: new Date().toISOString(),
-    baseRef: '', // Will be filled by the caller
+    baseRef: options.baseRef ?? '',
     totalChangedFiles: changedFiles.length,
     specRelevantFiles,
     issues: dedupedIssues,

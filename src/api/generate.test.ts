@@ -174,7 +174,9 @@ describe('specGenGenerate', () => {
     });
 
     it('throws if no analysis found', async () => {
-      mockAccess.mockRejectedValue(new Error('ENOENT'));
+      // Simulate repo-structure.json not existing by rejecting readFile with ENOENT
+      const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      mockReadFile.mockRejectedValue(enoent);
       await expect(specGenGenerate({ rootPath: ROOT })).rejects.toThrow();
     });
 
@@ -249,14 +251,133 @@ describe('specGenGenerate', () => {
 
   describe('missing llm-context.json', () => {
     it('uses empty context when llm-context.json missing', async () => {
-      // access fails for llm-context.json → loadAnalysisData uses empty context
-      mockAccess.mockImplementation((path) => {
-        if (String(path).includes('llm-context')) return Promise.reject(new Error('ENOENT'));
-        return Promise.resolve(undefined);
+      // readFile rejects with ENOENT for llm-context.json → loadAnalysisData uses empty context
+      const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      mockReadFile.mockImplementation((path) => {
+        const p = String(path);
+        if (p.includes('llm-context')) return Promise.reject(enoent);
+        if (p.includes('repo-structure')) return Promise.resolve(JSON.stringify(MOCK_REPO_STRUCTURE));
+        if (p.includes('dependency-graph')) return Promise.resolve(JSON.stringify({ statistics: { nodeCount: 0, edgeCount: 0, clusterCount: 0, cycleCount: 0, avgDegree: 0 } }));
+        return Promise.resolve('{}');
       });
 
       const result = await specGenGenerate({ rootPath: ROOT });
       expect(result.report).toBeDefined();
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Provider auto-detection
+  // --------------------------------------------------------------------------
+
+  describe('provider auto-detection', () => {
+    it('uses anthropic when only ANTHROPIC_API_KEY is set', async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.OPENAI_COMPAT_API_KEY;
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'anthropic' })
+      );
+    });
+
+    it('uses gemini when only GEMINI_API_KEY is set', async () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      process.env.GEMINI_API_KEY = 'gemini-key';
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_COMPAT_API_KEY;
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'gemini' })
+      );
+    });
+
+    it('uses openai-compat when only OPENAI_COMPAT_API_KEY is set', async () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      process.env.OPENAI_COMPAT_API_KEY = 'compat-key';
+      delete process.env.OPENAI_API_KEY;
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'openai-compat' })
+      );
+    });
+
+    it('uses openai when only OPENAI_API_KEY is set', async () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.OPENAI_COMPAT_API_KEY;
+      process.env.OPENAI_API_KEY = 'sk-openai-test';
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'openai' })
+      );
+    });
+
+    it('anthropic takes priority over gemini when both keys are set', async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+      process.env.GEMINI_API_KEY = 'gemini-test';
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'anthropic' })
+      );
+    });
+
+    it('explicit provider option overrides env auto-detection', async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+
+      await specGenGenerate({ rootPath: ROOT, provider: 'gemini' });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'gemini' })
+      );
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // Model fallback map
+  // --------------------------------------------------------------------------
+
+  describe('model fallback map', () => {
+    it('uses a claude model as default for anthropic provider', async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+      delete process.env.OPENAI_API_KEY;
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      const call = mockCreateLLMService.mock.calls[0]?.[0];
+      expect(call?.model).toMatch(/claude/i);
+    });
+
+    it('uses a gemini model as default for gemini provider', async () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      process.env.GEMINI_API_KEY = 'gemini-key';
+
+      await specGenGenerate({ rootPath: ROOT });
+
+      const call = mockCreateLLMService.mock.calls[0]?.[0];
+      expect(call?.model).toMatch(/gemini/i);
+    });
+
+    it('explicit model option overrides the default model', async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+
+      await specGenGenerate({ rootPath: ROOT, model: 'custom-model-v99' });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'custom-model-v99' })
+      );
     });
   });
 });

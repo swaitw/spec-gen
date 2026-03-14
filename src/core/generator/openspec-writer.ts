@@ -5,9 +5,21 @@
  * Handles initialization, merging with existing specs, and output tracking.
  */
 
-import { readFile, writeFile, mkdir, access, copyFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { join, dirname, relative } from 'node:path';
 import logger from '../../utils/logger.js';
+import {
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_BACKUPS_SUBDIR,
+  SPEC_GEN_OUTPUTS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+  OPENSPEC_DECISIONS_SUBDIR,
+  ARTIFACT_GENERATION_REPORT,
+} from '../../constants.js';
+import { fileExists } from '../../utils/command-helpers.js';
 import {
   OpenSpecConfigManager,
   buildDetectedContext,
@@ -89,8 +101,8 @@ export class OpenSpecWriter {
 
   constructor(options: OpenSpecWriterOptions) {
     this.rootPath = options.rootPath;
-    this.openspecRoot = join(options.rootPath, 'openspec');
-    this.specGenRoot = join(options.rootPath, '.spec-gen');
+    this.openspecRoot = join(options.rootPath, OPENSPEC_DIR);
+    this.specGenRoot = join(options.rootPath, SPEC_GEN_DIR);
     this.options = {
       rootPath: options.rootPath,
       writeMode: options.writeMode ?? 'replace',
@@ -107,15 +119,15 @@ export class OpenSpecWriter {
    */
   async initialize(): Promise<void> {
     // Create openspec directory structure
-    await mkdir(join(this.openspecRoot, 'specs'), { recursive: true });
-    await mkdir(join(this.openspecRoot, 'decisions'), { recursive: true });
+    await mkdir(join(this.openspecRoot, OPENSPEC_SPECS_SUBDIR), { recursive: true });
+    await mkdir(join(this.openspecRoot, OPENSPEC_DECISIONS_SUBDIR), { recursive: true });
     await mkdir(join(this.openspecRoot, 'changes', 'archive'), { recursive: true });
 
     // Create .spec-gen directory structure
-    await mkdir(join(this.specGenRoot, 'analysis'), { recursive: true });
-    await mkdir(join(this.specGenRoot, 'backups'), { recursive: true });
-    await mkdir(join(this.specGenRoot, 'outputs'), { recursive: true });
-    await mkdir(join(this.specGenRoot, 'logs'), { recursive: true });
+    await mkdir(join(this.specGenRoot, SPEC_GEN_ANALYSIS_SUBDIR), { recursive: true });
+    await mkdir(join(this.specGenRoot, SPEC_GEN_BACKUPS_SUBDIR), { recursive: true });
+    await mkdir(join(this.specGenRoot, SPEC_GEN_OUTPUTS_SUBDIR), { recursive: true });
+    await mkdir(join(this.specGenRoot, SPEC_GEN_LOGS_SUBDIR), { recursive: true });
 
     logger.success('Initialized OpenSpec directory structure');
   }
@@ -202,7 +214,7 @@ export class OpenSpecWriter {
 
     try {
       // Check if file exists
-      const exists = await this.fileExists(fullPath);
+      const exists = await fileExists(fullPath);
 
       if (exists) {
         switch (this.options.writeMode) {
@@ -267,10 +279,10 @@ export class OpenSpecWriter {
 
       // Check if already has generated section
       const generatedMarker = '## Generated Analysis';
-      if (existingContent.includes(generatedMarker)) {
-        // Replace the generated section
-        const parts = existingContent.split(generatedMarker);
-        const humanContent = parts[0].trimEnd();
+      const markerIndex = existingContent.indexOf(generatedMarker);
+      if (markerIndex !== -1) {
+        // Replace everything from the first marker onward
+        const humanContent = existingContent.slice(0, markerIndex).trimEnd();
         const mergedContent = `${humanContent}\n\n${generatedMarker}\n\n${this.extractGeneratedSection(spec.content)}`;
         await writeFile(fullPath, mergedContent, 'utf-8');
       } else {
@@ -395,7 +407,7 @@ export class OpenSpecWriter {
    * Save generation report to .spec-gen/outputs/
    */
   private async saveReport(report: GenerationReport): Promise<void> {
-    const reportPath = join(this.specGenRoot, 'outputs', 'generation-report.json');
+    const reportPath = join(this.specGenRoot, 'outputs', ARTIFACT_GENERATION_REPORT);
     await mkdir(dirname(reportPath), { recursive: true });
     await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf-8');
     logger.discovery(`Saved generation report to ${relative(this.rootPath, reportPath)}`);
@@ -405,52 +417,39 @@ export class OpenSpecWriter {
    * Log summary to console
    */
   private logSummary(report: GenerationReport): void {
-    console.log('');
+    logger.blank();
     logger.success('=== Generation Complete ===');
-    console.log('');
+    logger.blank();
 
     if (report.filesWritten.length > 0) {
-      console.log(`  ✓ ${report.filesWritten.length} spec(s) written`);
+      logger.success(`${report.filesWritten.length} spec(s) written`);
     }
     if (report.filesMerged.length > 0) {
-      console.log(`  ✓ ${report.filesMerged.length} spec(s) merged`);
+      logger.success(`${report.filesMerged.length} spec(s) merged`);
     }
     if (report.filesSkipped.length > 0) {
-      console.log(`  ○ ${report.filesSkipped.length} spec(s) skipped (already exist)`);
+      logger.info('Skipped', `${report.filesSkipped.length} spec(s) already exist`);
     }
     if (report.filesBackedUp.length > 0) {
-      console.log(`  ↩ ${report.filesBackedUp.length} backup(s) created`);
+      logger.info('Backups', `${report.filesBackedUp.length} created`);
     }
     if (report.configUpdated) {
-      console.log('  ✓ config.yaml updated');
+      logger.success('config.yaml updated');
     }
 
     if (report.warnings.length > 0) {
-      console.log('');
-      console.log('  Warnings:');
+      logger.blank();
       for (const warning of report.warnings) {
-        console.log(`    ⚠ ${warning}`);
+        logger.warning(warning);
       }
     }
 
-    console.log('');
-    console.log('  Next steps:');
+    logger.blank();
+    logger.info('Next steps', '');
     for (let i = 0; i < report.nextSteps.length; i++) {
-      console.log(`    ${i + 1}. ${report.nextSteps[i]}`);
+      logger.info(`  ${i + 1}.`, report.nextSteps[i]);
     }
-    console.log('');
-  }
-
-  /**
-   * Check if file exists
-   */
-  private async fileExists(path: string): Promise<boolean> {
-    try {
-      await access(path);
-      return true;
-    } catch {
-      return false;
-    }
+    logger.blank();
   }
 
   /**

@@ -7,7 +7,9 @@
  */
 
 import { join } from 'node:path';
-import { access, stat, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, stat, mkdir, writeFile } from 'node:fs/promises';
+import { ANALYSIS_REUSE_THRESHOLD_MS, DEFAULT_MAX_FILES, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_LOGS_SUBDIR, SPEC_GEN_CONFIG_REL_PATH, SPEC_GEN_GENERATION_SUBDIR, SPEC_GEN_RUNS_SUBDIR, DEFAULT_OPENSPEC_PATH, ARTIFACT_REPO_STRUCTURE, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_LLM_CONTEXT } from '../constants.js';
+import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import {
   detectProjectType,
   getProjectTypeName,
@@ -28,9 +30,9 @@ import {
 import { createLLMService } from '../core/services/llm-service.js';
 import type { LLMService } from '../core/services/llm-service.js';
 import { RepositoryMapper } from '../core/analyzer/repository-mapper.js';
-import { DependencyGraphBuilder } from '../core/analyzer/dependency-graph.js';
-import { AnalysisArtifactGenerator } from '../core/analyzer/artifact-generator.js';
-import type { RepoStructure, LLMContext } from '../core/analyzer/artifact-generator.js';
+import { DependencyGraphBuilder, type DependencyGraphResult } from '../core/analyzer/dependency-graph.js';
+import { AnalysisArtifactGenerator, repoStructureToRepoMap } from '../core/analyzer/artifact-generator.js';
+import type { RepoStructure, LLMContext, AnalysisArtifacts } from '../core/analyzer/artifact-generator.js';
 import { SpecGenerationPipeline } from '../core/generator/spec-pipeline.js';
 import { OpenSpecFormatGenerator } from '../core/generator/openspec-format-generator.js';
 import { OpenSpecWriter } from '../core/generator/openspec-writer.js';
@@ -41,13 +43,24 @@ function progress(onProgress: ProgressCallback | undefined, step: string, status
   onProgress?.({ phase: 'run', step, status, detail });
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
+/**
+ * Load cached analysis artifacts from disk.
+ */
+async function loadCachedArtifacts(
+  analysisPath: string,
+  repoStructure: RepoStructure,
+): Promise<AnalysisArtifacts> {
+  const llmContext = await readJsonFile<LLMContext>(
+    join(analysisPath, ARTIFACT_LLM_CONTEXT),
+    ARTIFACT_LLM_CONTEXT,
+  ) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
+
+  let summaryMarkdown = '';
+  let dependencyDiagram = '';
+  try { summaryMarkdown = await readFile(join(analysisPath, 'SUMMARY.md'), 'utf-8'); } catch { /* optional */ }
+  try { dependencyDiagram = await readFile(join(analysisPath, 'dependencies.mermaid'), 'utf-8'); } catch { /* optional */ }
+
+  return { repoStructure, summaryMarkdown, dependencyDiagram, llmContext };
 }
 
 /**
@@ -64,7 +77,7 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
   const rootPath = options.rootPath ?? process.cwd();
   const force = options.force ?? false;
   const reanalyze = options.reanalyze ?? false;
-  const maxFiles = options.maxFiles ?? 500;
+  const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
   const adr = options.adr ?? false;
   const { onProgress } = options;
 
@@ -82,14 +95,14 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
 
   if (configExists && !force) {
     initResult = {
-      configPath: '.spec-gen/config.json',
-      openspecPath: specGenConfig?.openspecPath ?? './openspec',
+      configPath: SPEC_GEN_CONFIG_REL_PATH,
+      openspecPath: specGenConfig?.openspecPath ?? DEFAULT_OPENSPEC_PATH,
       projectType,
       created: false,
     };
     progress(onProgress, 'Initialization', 'skip', 'Config exists');
   } else {
-    const openspecPath = './openspec';
+    const openspecPath = DEFAULT_OPENSPEC_PATH;
     specGenConfig = getDefaultConfig(detection.projectType, openspecPath);
     await writeSpecGenConfig(rootPath, specGenConfig);
 
@@ -100,14 +113,14 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
 
     const hasGitignore = await gitignoreExists(rootPath);
     if (hasGitignore) {
-      const alreadyIgnored = await isInGitignore(rootPath, '.spec-gen/');
+      const alreadyIgnored = await isInGitignore(rootPath, `${SPEC_GEN_DIR}/`);
       if (!alreadyIgnored) {
-        await addToGitignore(rootPath, '.spec-gen/', 'spec-gen analysis artifacts');
+        await addToGitignore(rootPath, `${SPEC_GEN_DIR}/`, 'spec-gen analysis artifacts');
       }
     }
 
     initResult = {
-      configPath: '.spec-gen/config.json',
+      configPath: SPEC_GEN_CONFIG_REL_PATH,
       openspecPath: openspecPath,
       projectType,
       created: true,
@@ -128,40 +141,39 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
   // ========================================================================
   progress(onProgress, 'Analysis', 'start');
 
-  const analysisPath = join(rootPath, '.spec-gen', 'analysis');
+  const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
   let analyzeResult: AnalyzeResult;
 
   // Check for existing recent analysis
-  const repoStructurePath = join(analysisPath, 'repo-structure.json');
+  const repoStructurePath = join(analysisPath, ARTIFACT_REPO_STRUCTURE);
   let useExisting = false;
 
   if (await fileExists(repoStructurePath)) {
     const stats = await stat(repoStructurePath);
     const age = Date.now() - stats.mtime.getTime();
-    const oneHour = 60 * 60 * 1000;
-    if (age < oneHour && !reanalyze && !force) {
+    if (age < ANALYSIS_REUSE_THRESHOLD_MS && !reanalyze && !force) {
       useExisting = true;
     }
   }
 
   if (useExisting) {
-    const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-    const repoStructure = JSON.parse(repoStructureContent);
-    let depGraph;
-    const depGraphPath = join(analysisPath, 'dependency-graph.json');
-    if (await fileExists(depGraphPath)) {
-      const content = await readFile(depGraphPath, 'utf-8');
-      depGraph = JSON.parse(content);
+    const repoStructure = await readJsonFile<RepoStructure>(repoStructurePath, ARTIFACT_REPO_STRUCTURE);
+    if (!repoStructure) {
+      throw new Error(`Failed to load ${ARTIFACT_REPO_STRUCTURE} — run spec-gen analyze to regenerate`);
     }
+    const depGraph = await readJsonFile<DependencyGraphResult>(
+      join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+      ARTIFACT_DEPENDENCY_GRAPH,
+    ) ?? undefined;
 
     analyzeResult = {
-      repoMap: repoStructure,
+      repoMap: repoStructureToRepoMap(repoStructure),
       depGraph: depGraph ?? {
         nodes: [], edges: [], clusters: [], structuralClusters: [], cycles: [],
         rankings: { byImportance: [], byConnectivity: [], clusterCenters: [], leafNodes: [], bridgeNodes: [], orphanNodes: [] },
         statistics: { nodeCount: 0, edgeCount: 0, importEdgeCount: 0, httpEdgeCount: 0, avgDegree: 0, density: 0, clusterCount: 0, structuralClusterCount: 0, cycleCount: 0 },
       },
-      artifacts: { repoStructure } as AnalyzeResult['artifacts'],
+      artifacts: await loadCachedArtifacts(analysisPath, repoStructure),
       duration: 0,
     };
     progress(onProgress, 'Analysis', 'skip', 'Recent analysis exists');
@@ -183,7 +195,7 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
     const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
 
     await writeFile(
-      join(analysisPath, 'dependency-graph.json'),
+      join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
       JSON.stringify(depGraph, null, 2)
     );
 
@@ -228,16 +240,28 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
 
   progress(onProgress, 'Generation', 'start');
 
-  // Check for API key
+  // Check for API key — support all four providers
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
-  if (!anthropicKey && !openaiKey) {
-    throw new Error('No LLM API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.');
+  const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
+    throw new Error('No LLM API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY.');
   }
 
   // Create LLM service
-  const provider = options.provider ?? (anthropicKey ? 'anthropic' : 'openai');
-  const model = options.model ?? 'claude-sonnet-4-20250514';
+  const envDetectedProvider = anthropicKey ? 'anthropic'
+    : geminiKey ? 'gemini'
+    : openaiCompatKey ? 'openai-compat'
+    : 'openai';
+  const provider = options.provider ?? envDetectedProvider;
+  const defaultModels: Record<string, string> = {
+    anthropic: DEFAULT_ANTHROPIC_MODEL,
+    gemini: DEFAULT_GEMINI_MODEL,
+    'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
+    openai: DEFAULT_OPENAI_MODEL,
+  };
+  const model = options.model ?? defaultModels[provider] ?? DEFAULT_ANTHROPIC_MODEL;
   let llm: LLMService;
   try {
     llm = createLLMService({
@@ -247,32 +271,30 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
       sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
       openaiCompatBaseUrl: options.openaiCompatBaseUrl,
       enableLogging: true,
-      logDir: join(rootPath, '.spec-gen', 'logs'),
+      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
     });
   } catch (error) {
     throw new Error(`Failed to create LLM service: ${(error as Error).message}`);
   }
 
   // Load analysis data for pipeline
-  const llmContextPath = join(analysisPath, 'llm-context.json');
-  let llmContext: LLMContext;
-  if (await fileExists(llmContextPath)) {
-    const content = await readFile(llmContextPath, 'utf-8');
-    llmContext = JSON.parse(content) as LLMContext;
-  } else {
-    llmContext = {
-      phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
-      phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
-      phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
-    };
-  }
+  const llmContext = await readJsonFile<LLMContext>(
+    join(analysisPath, ARTIFACT_LLM_CONTEXT),
+    ARTIFACT_LLM_CONTEXT,
+  ) ?? {
+    phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
+    phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
+    phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
+  };
 
-  const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-  const repoStructure = JSON.parse(repoStructureContent) as RepoStructure;
+  const repoStructure = await readJsonFile<RepoStructure>(repoStructurePath, ARTIFACT_REPO_STRUCTURE);
+  if (!repoStructure) {
+    throw new Error(`Failed to load ${ARTIFACT_REPO_STRUCTURE} — run spec-gen analyze to regenerate`);
+  }
 
   // Run pipeline
   const pipeline = new SpecGenerationPipeline(llm, {
-    outputDir: join(rootPath, '.spec-gen', 'generation'),
+    outputDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_GENERATION_SUBDIR),
     saveIntermediate: true,
     generateADRs: adr,
   });
@@ -321,7 +343,7 @@ export async function specGenRun(options: RunApiOptions = {}): Promise<RunResult
 
   // Save run metadata
   const duration = Date.now() - startTime;
-  const runsDir = join(rootPath, '.spec-gen', 'runs');
+  const runsDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_RUNS_SUBDIR);
   await mkdir(runsDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   await writeFile(

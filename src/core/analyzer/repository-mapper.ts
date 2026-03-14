@@ -7,6 +7,17 @@
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import {
+  DEFAULT_MAX_FILES,
+  HIGH_VALUE_FILES_LIMIT,
+  HIGH_VALUE_FILES_PREVIEW_LIMIT,
+  ENTRY_POINTS_PREVIEW_LIMIT,
+  LANGUAGES_PREVIEW_LIMIT,
+  DIRECTORIES_PREVIEW_LIMIT,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  ARTIFACT_REPOSITORY_MAP,
+} from '../../constants.js';
 import type { ProjectType, ScoredFile, FileMetadata } from '../../types/index.js';
 import { FileWalker, type FileWalkerOptions } from './file-walker.js';
 import { SignificanceScorer, type ScoringConfig } from './significance-scorer.js';
@@ -520,12 +531,12 @@ export class RepositoryMapper {
   constructor(rootPath: string, options: RepositoryMapperOptions = {}) {
     this.rootPath = rootPath;
     this.options = {
-      maxFiles: options.maxFiles ?? 500,
+      maxFiles: options.maxFiles ?? DEFAULT_MAX_FILES,
       includePatterns: options.includePatterns ?? [],
       excludePatterns: options.excludePatterns ?? [],
       scoringConfig: options.scoringConfig ?? {},
       onProgress: options.onProgress ?? (() => {}),
-      outputDir: options.outputDir ?? join(rootPath, '.spec-gen', 'analysis'),
+      outputDir: options.outputDir ?? join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR),
     };
   }
 
@@ -745,7 +756,7 @@ export class RepositoryMapper {
       includePatterns: this.options.includePatterns,
       excludePatterns: this.options.excludePatterns,
       onProgress: (progress) => {
-        const pct = 10 + Math.round((progress.filesFound / (this.options.maxFiles ?? 500)) * 30);
+        const pct = 10 + Math.round((progress.filesFound / (this.options.maxFiles ?? DEFAULT_MAX_FILES)) * 30);
         this.options.onProgress?.('walking', Math.min(pct, 40));
       },
     };
@@ -767,7 +778,7 @@ export class RepositoryMapper {
     const frameworks = this.detectFrameworks(walkResult.files);
 
     // Extract special file categories
-    const highValueFiles = scoredFiles.slice(0, 50); // Top 50
+    const highValueFiles = scoredFiles.slice(0, HIGH_VALUE_FILES_LIMIT);
     const entryPoints = scoredFiles.filter(f => f.isEntryPoint);
     const schemaFiles = scoredFiles.filter(f =>
       f.tags.includes('schema') ||
@@ -819,7 +830,7 @@ export class RepositoryMapper {
     await mkdir(this.options.outputDir!, { recursive: true });
 
     // Write JSON map
-    const mapPath = join(this.options.outputDir!, 'repository-map.json');
+    const mapPath = join(this.options.outputDir!, ARTIFACT_REPOSITORY_MAP);
     await writeFile(mapPath, JSON.stringify(map, null, 2), 'utf-8');
 
     // Write summary markdown
@@ -853,7 +864,7 @@ export class RepositoryMapper {
     lines.push('');
     lines.push('| Language | Files | Percentage |');
     lines.push('|----------|-------|------------|');
-    for (const lang of map.summary.languages.slice(0, 10)) {
+    for (const lang of map.summary.languages.slice(0, LANGUAGES_PREVIEW_LIMIT)) {
       lines.push(`| ${lang.language} | ${lang.fileCount} | ${lang.percentage}% |`);
     }
     lines.push('');
@@ -872,11 +883,11 @@ export class RepositoryMapper {
     }
 
     // High Value Files
-    lines.push('## High Value Files (Top 20)');
+    lines.push(`## High Value Files (Top ${HIGH_VALUE_FILES_PREVIEW_LIMIT})`);
     lines.push('');
     lines.push('| File | Score | Tags |');
     lines.push('|------|-------|------|');
-    for (const file of map.highValueFiles.slice(0, 20)) {
+    for (const file of map.highValueFiles.slice(0, HIGH_VALUE_FILES_PREVIEW_LIMIT)) {
       const tags = file.tags.join(', ') || '-';
       lines.push(`| ${file.path} | ${file.score} | ${tags} |`);
     }
@@ -886,7 +897,7 @@ export class RepositoryMapper {
     if (map.entryPoints.length > 0) {
       lines.push('## Entry Points');
       lines.push('');
-      for (const file of map.entryPoints.slice(0, 10)) {
+      for (const file of map.entryPoints.slice(0, ENTRY_POINTS_PREVIEW_LIMIT)) {
         lines.push(`- ${file.path} (score: ${file.score})`);
       }
       lines.push('');
@@ -911,7 +922,7 @@ export class RepositoryMapper {
     lines.push('');
     lines.push('| Directory | Files | Purpose | Avg Score |');
     lines.push('|-----------|-------|---------|-----------|');
-    for (const dir of map.summary.directories.slice(0, 15)) {
+    for (const dir of map.summary.directories.slice(0, DIRECTORIES_PREVIEW_LIMIT)) {
       lines.push(`| ${dir.path} | ${dir.fileCount} | ${dir.purpose} | ${dir.avgScore} |`);
     }
     lines.push('');
@@ -930,9 +941,7 @@ export async function mapRepository(
   const mapper = new RepositoryMapper(rootPath, options);
   const map = await mapper.map();
 
-  if (options?.outputDir !== undefined || options?.outputDir === undefined) {
-    await mapper.writeOutput(map);
-  }
+  await mapper.writeOutput(map);
 
   return map;
 }

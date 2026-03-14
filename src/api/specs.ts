@@ -29,8 +29,9 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MAPPING } from '../constants.js';
+import { fileExists } from '../utils/command-helpers.js';
 import type { BaseOptions } from './types.js';
 
 export type SpecRequirement = {
@@ -52,12 +53,12 @@ export async function specGenGetSpecRequirements(options: BaseOptions = {}): Pro
   requirements: Record<string, SpecRequirement>;
 }> {
   const rootPath = options.rootPath ?? process.cwd();
-  const mappingPath = join(rootPath, '.spec-gen', 'analysis', 'mapping.json');
+  const mappingPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
 
   const result: Record<string, SpecRequirement> = {};
   let generatedAt: string | undefined = undefined;
 
-  if (!existsSync(mappingPath)) {
+  if (!(await fileExists(mappingPath))) {
     // No mapping available; return empty map
     return { generatedAt, requirements: result };
   }
@@ -88,7 +89,7 @@ export async function specGenGetSpecRequirements(options: BaseOptions = {}): Pro
       }
 
       const specFileAbs = resolve(rootPath, specFileRel);
-      if (!existsSync(specFileAbs)) {
+      if (!(await fileExists(specFileAbs))) {
         result[reqKey] = {
           title: reqKey,
           body: '',

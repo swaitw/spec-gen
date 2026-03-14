@@ -6,24 +6,34 @@
  */
 
 import { Command } from 'commander';
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { fileExists } from '../../utils/command-helpers.js';
 import { createServer } from 'vite';
 import react from '@vitejs/plugin-react';
 import { join, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../../utils/logger.js';
+import {
+  MAX_QUERY_LENGTH,
+  MAX_CHAT_BODY_BYTES,
+  DEFAULT_VIEWER_PORT,
+  DEFAULT_VIEWER_HOST,
+  SPEC_GEN_ANALYSIS_REL_PATH,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_REFACTOR_PRIORITIES,
+  ARTIFACT_MAPPING,
+} from '../../constants.js';
 import { VectorIndex } from '../../core/analyzer/vector-index.js';
 import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
 import { getSkeletonContent, detectLanguage } from '../../core/analyzer/code-shaper.js';
 import { runChatAgent, resolveProviderConfig } from '../../core/services/chat-agent.js';
 
-const MAX_QUERY_LENGTH = 1000;
-const MAX_CHAT_BODY_BYTES = 512 * 1024; // 512 KB limit for chat requests
-
 /** Strip internal filesystem paths and API keys from error messages before sending to clients. */
-function sanitizeErrorMessage(msg: string): string {
+export function sanitizeErrorMessage(msg: string): string {
   return msg
     .replace(/\/Users\/[^\s:]+/g, '[path]')
     .replace(/\/home\/[^\s:]+/g, '[path]')
@@ -36,7 +46,7 @@ function sanitizeErrorMessage(msg: string): string {
 }
 
 /** Ensure a resolved path stays within the project root. Returns null if invalid. */
-function safePath(rootPath: string, userPath: string): string | null {
+export function safePath(rootPath: string, userPath: string): string | null {
   const root = resolve(rootPath);
   const abs = resolve(rootPath, userPath);
   if (abs !== root && !abs.startsWith(root + sep)) {
@@ -57,10 +67,10 @@ function openBrowser(url: string): void {
 
 export const viewCommand = new Command('view')
   .description('Start an interactive graph viewer (React) for .spec-gen/analysis')
-  .option('--analysis <path>', 'Path to analysis directory', '.spec-gen/analysis/')
-  .option('--spec <path>', 'Path to spec files directory', './openspec/specs/')
-  .option('--port <n>', 'Port to run the viewer on', '5173')
-  .option('--host <host>', 'Host to bind (use 0.0.0.0 for LAN)', '127.0.0.1')
+  .option('--analysis <path>', 'Path to analysis directory', `${SPEC_GEN_ANALYSIS_REL_PATH}/`)
+  .option('--spec <path>', 'Path to spec files directory', `./${OPENSPEC_DIR}/${OPENSPEC_SPECS_SUBDIR}/`)
+  .option('--port <n>', 'Port to run the viewer on', String(DEFAULT_VIEWER_PORT))
+  .option('--host <host>', 'Host to bind (use 0.0.0.0 for LAN)', DEFAULT_VIEWER_HOST)
   .option('--no-open', 'Do not open the browser automatically', false)
   .action(
     async (options: {
@@ -72,13 +82,13 @@ export const viewCommand = new Command('view')
     }) => {
       const rootPath = process.cwd();
       const analysisDir = resolve(rootPath, options.analysis);
-      const graphPath = join(analysisDir, 'dependency-graph.json');
-      const llmContextPath = join(analysisDir, 'llm-context.json');
-      const refactorPath = join(analysisDir, 'refactor-priorities.json');
-      const mappingPath = join(analysisDir, 'mapping.json');
+      const graphPath = join(analysisDir, ARTIFACT_DEPENDENCY_GRAPH);
+      const llmContextPath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
+      const refactorPath = join(analysisDir, ARTIFACT_REFACTOR_PRIORITIES);
+      const mappingPath = join(analysisDir, ARTIFACT_MAPPING);
       const specDir = resolve(rootPath, options.spec);
 
-      if (!existsSync(graphPath)) {
+      if (!(await fileExists(graphPath))) {
         logger.error(`Missing graph file: ${graphPath}`);
         logger.info('Tip', 'Run "spec-gen analyze" first (or pass --analysis)');
         process.exitCode = 1;
@@ -88,9 +98,9 @@ export const viewCommand = new Command('view')
       const here = fileURLToPath(new URL('.', import.meta.url));
       const candidateA = resolve(join(here, '../../viewer/app')); // when running from src/cli/commands
       const candidateB = resolve(join(here, '../../../src/viewer/app')); // when running from dist/cli/commands
-      const viewerRoot = existsSync(join(candidateA, 'index.html')) ? candidateA : candidateB;
+      const viewerRoot = await fileExists(join(candidateA, 'index.html')) ? candidateA : candidateB;
 
-      if (!existsSync(join(viewerRoot, 'index.html'))) {
+      if (!(await fileExists(join(viewerRoot, 'index.html')))) {
         logger.error(
           `Viewer assets not found (expected index.html). Tried: ${candidateA} and ${candidateB}`
         );
@@ -98,8 +108,14 @@ export const viewCommand = new Command('view')
         return;
       }
 
-      const port = Number.parseInt(options.port, 10) || 5173;
-      const host = options.host || '127.0.0.1';
+      const parsedPort = Number.parseInt(options.port, 10);
+      if (options.port && (isNaN(parsedPort) || parsedPort < 1 || parsedPort > 65535)) {
+        logger.error('--port must be a number between 1 and 65535');
+        process.exitCode = 1;
+        return;
+      }
+      const port = isNaN(parsedPort) ? DEFAULT_VIEWER_PORT : parsedPort;
+      const host = options.host || DEFAULT_VIEWER_HOST;
 
       logger.section('Starting Graph Viewer');
       logger.info('Analysis', analysisDir);
@@ -127,7 +143,7 @@ export const viewCommand = new Command('view')
 
               devServer.middlewares.use('/api/llm-context', async (_req, res) => {
                 try {
-                  if (!existsSync(llmContextPath)) {
+                  if (!(await fileExists(llmContextPath))) {
                     res.statusCode = 404;
                     res.end(JSON.stringify({ error: 'llm-context.json not found' }));
                     return;
@@ -144,7 +160,7 @@ export const viewCommand = new Command('view')
 
               devServer.middlewares.use('/api/refactor-priorities', async (_req, res) => {
                 try {
-                  if (!existsSync(refactorPath)) {
+                  if (!(await fileExists(refactorPath))) {
                     res.statusCode = 404;
                     res.end(JSON.stringify({ error: 'refactor-priorities.json not found' }));
                     return;
@@ -161,7 +177,7 @@ export const viewCommand = new Command('view')
 
               devServer.middlewares.use('/api/mapping', async (_req, res) => {
                 try {
-                  if (!existsSync(mappingPath)) {
+                  if (!(await fileExists(mappingPath))) {
                     res.statusCode = 404;
                     res.end(JSON.stringify({ error: 'mapping.json not found' }));
                     return;
@@ -178,7 +194,7 @@ export const viewCommand = new Command('view')
 
               devServer.middlewares.use('/api/spec', async (_req, res) => {
                 try {
-                  if (!existsSync(specDir)) {
+                  if (!(await fileExists(specDir))) {
                     res.statusCode = 404;
                     res.end(JSON.stringify({ error: 'spec directory not found' }));
                     return;
@@ -230,7 +246,7 @@ export const viewCommand = new Command('view')
 
               devServer.middlewares.use('/api/spec-requirements', async (_req, res) => {
                 try {
-                  if (!existsSync(mappingPath)) {
+                  if (!(await fileExists(mappingPath))) {
                     res.statusCode = 404;
                     res.end(JSON.stringify({ error: 'mapping.json not found' }));
                     return;
@@ -260,7 +276,7 @@ export const viewCommand = new Command('view')
                     if (!specFileRel || !reqName) continue;
 
                     const specFileAbs = safePath(rootPath, specFileRel);
-                    if (!specFileAbs || !existsSync(specFileAbs)) continue;
+                    if (!specFileAbs || !(await fileExists(specFileAbs))) continue;
 
                     try {
                       const content = await readFile(specFileAbs, 'utf-8');

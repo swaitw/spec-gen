@@ -2,8 +2,24 @@
  * Tests for spec-gen run command (full pipeline)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runCommand } from './run.js';
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: {
+    section: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+    discovery: vi.fn(),
+    analysis: vi.fn(),
+    inference: vi.fn(),
+    blank: vi.fn(),
+    debug: vi.fn(),
+    listItem: vi.fn(),
+  },
+}));
 
 describe('run command', () => {
   describe('command configuration', () => {
@@ -304,6 +320,34 @@ describe('run command', () => {
 
       const display = `[Step ${currentStep}/${steps.length}] ${steps[currentStep - 1]}`;
       expect(display).toBe('[Step 2/3] Analysis');
+    });
+  });
+
+  describe('--max-files input validation', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      process.exitCode = undefined;
+    });
+
+    it('rejects --max-files 0', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      await runCommand.parseAsync(['--max-files', '0'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects --max-files -5', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      await runCommand.parseAsync(['--max-files', '-5'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects non-numeric --max-files', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      await runCommand.parseAsync(['--max-files', 'abc'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
     });
   });
 });

@@ -4,9 +4,10 @@
  * Detects the project type by checking for language-specific manifest files.
  */
 
-import { access, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ProjectType } from '../../types/index.js';
+import { fileExists } from '../../utils/command-helpers.js';
 
 /**
  * Project detection result
@@ -34,18 +35,6 @@ const MANIFEST_MAP: { file: string; type: ProjectType; priority: number }[] = [
   { file: 'Gemfile', type: 'ruby', priority: 1 },
   { file: 'composer.json', type: 'php', priority: 1 },
 ];
-
-/**
- * Check if a file exists
- */
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Detect if the directory is a git repository

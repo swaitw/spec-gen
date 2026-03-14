@@ -13,6 +13,7 @@ vi.mock('../../utils/logger.js', () => ({
   logger: {
     section: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn(),
     success: vi.fn(), discovery: vi.fn(), analysis: vi.fn(), blank: vi.fn(),
+    debug: vi.fn(),
   },
 }));
 
@@ -499,6 +500,43 @@ describe('analyze command', () => {
 
       expect(process.exitCode).toBe(1);
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Permission denied'));
+    });
+  });
+
+  describe('--max-files input validation', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      process.exitCode = undefined;
+    });
+
+    it('rejects --max-files 0', async () => {
+      const loggerMod = await import('../../utils/logger.js');
+      const errorSpy = vi.mocked(loggerMod.logger.error);
+
+      await analyzeCommand.parseAsync(['--max-files', '0'], { from: 'user' });
+
+      expect(errorSpy).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects --max-files -10', async () => {
+      const loggerMod = await import('../../utils/logger.js');
+      const errorSpy = vi.mocked(loggerMod.logger.error);
+
+      await analyzeCommand.parseAsync(['--max-files', '-10'], { from: 'user' });
+
+      expect(errorSpy).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects non-numeric --max-files', async () => {
+      const loggerMod = await import('../../utils/logger.js');
+      const errorSpy = vi.mocked(loggerMod.logger.error);
+
+      await analyzeCommand.parseAsync(['--max-files', 'abc'], { from: 'user' });
+
+      expect(errorSpy).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
     });
   });
 });

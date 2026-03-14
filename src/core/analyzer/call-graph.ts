@@ -1018,8 +1018,11 @@ export class CallGraphBuilder {
           allNodes.set(node.id, node);
         }
         allRawEdges.push(...result.rawEdges);
-      } catch {
+      } catch (error) {
         // Skip files that fail to parse (syntax errors, encoding issues, etc.)
+        if (process.env.DEBUG) {
+          console.debug(`[call-graph] Failed to parse ${file.path}: ${(error as Error).message}`);
+        }
       }
     }
 

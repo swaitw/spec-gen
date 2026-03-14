@@ -4,20 +4,9 @@
  * Handles adding entries to .gitignore
  */
 
-import { access, readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-
-/**
- * Check if a file exists
- */
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
+import { fileExists } from '../../utils/command-helpers.js';
 
 /**
  * Check if .gitignore exists

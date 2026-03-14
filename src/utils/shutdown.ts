@@ -4,6 +4,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { SPEC_GEN_DIR, ARTIFACT_SHUTDOWN_STATE } from '../constants.js';
 
 export interface ShutdownState {
   /** Current phase when interrupted */
@@ -30,7 +31,7 @@ export class ShutdownManager {
   private handlersAttached = false;
 
   constructor(projectPath: string = process.cwd(), options?: { skipHandlers?: boolean }) {
-    this.stateFile = path.join(projectPath, '.spec-gen', 'shutdown-state.json');
+    this.stateFile = path.join(projectPath, SPEC_GEN_DIR, ARTIFACT_SHUTDOWN_STATE);
     // Skip handlers in test environment or when explicitly disabled
     if (!options?.skipHandlers && process.env.NODE_ENV !== 'test') {
       this.setupHandlers();
@@ -96,8 +97,8 @@ export class ShutdownManager {
       await this.saveState();
     }
 
-    // Run cleanup callbacks in reverse order
-    for (const callback of this.callbacks.reverse()) {
+    // Run cleanup callbacks in reverse order (copy to avoid mutating the array)
+    for (const callback of [...this.callbacks].reverse()) {
       try {
         await callback();
       } catch (error) {

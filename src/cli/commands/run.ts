@@ -6,8 +6,27 @@
  */
 
 import { Command } from 'commander';
-import { access, stat, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { stat, mkdir, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import { createRequire } from 'node:module';
+import { fileExists, formatDuration, formatAge, readJsonFile } from '../../utils/command-helpers.js';
+import {
+  ANALYSIS_REUSE_THRESHOLD_MS,
+  DEFAULT_MAX_FILES,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_SURVEY_ESTIMATED_TOKENS,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+  SPEC_GEN_GENERATION_SUBDIR,
+  SPEC_GEN_RUNS_SUBDIR,
+  DEFAULT_OPENSPEC_PATH,
+  ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_GENERATION_REPORT,
+} from '../../constants.js';
 import { confirm } from '@inquirer/prompts';
 import { logger } from '../../utils/logger.js';
 import {
@@ -30,6 +49,7 @@ import {
 import { runAnalysis } from './analyze.js';
 import {
   createLLMService,
+  lookupPricing,
   type LLMService,
 } from '../../core/services/llm-service.js';
 import {
@@ -46,6 +66,9 @@ import {
 import { ADRGenerator } from '../../core/generator/adr-generator.js';
 import type { RepoStructure, LLMContext } from '../../core/analyzer/artifact-generator.js';
 import type { DependencyGraphResult } from '../../core/analyzer/dependency-graph.js';
+
+const _require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = _require('../../../package.json') as { version: string };
 
 // ============================================================================
 // TYPES
@@ -79,44 +102,11 @@ interface RunMetadata {
 // ============================================================================
 
 /**
- * Check if a file exists
- */
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Format time duration for display
- */
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-/**
- * Format age in human-readable form
- */
-function formatAge(ms: number): string {
-  if (ms < 60000) return 'just now';
-  if (ms < 3600000) return `${Math.floor(ms / 60000)} minutes ago`;
-  if (ms < 86400000) return `${Math.floor(ms / 3600000)} hours ago`;
-  return `${Math.floor(ms / 86400000)} days ago`;
-}
-
-/**
  * Get analysis age if it exists
  */
 async function getAnalysisAge(analysisPath: string): Promise<number | null> {
   try {
-    const repoStructurePath = join(analysisPath, 'repo-structure.json');
+    const repoStructurePath = join(analysisPath, ARTIFACT_REPO_STRUCTURE);
     if (!(await fileExists(repoStructurePath))) {
       return null;
     }
@@ -137,34 +127,20 @@ async function loadAnalysis(analysisPath: string): Promise<{
   age: number;
 } | null> {
   try {
-    const repoStructurePath = join(analysisPath, 'repo-structure.json');
-    const llmContextPath = join(analysisPath, 'llm-context.json');
-    const depGraphPath = join(analysisPath, 'dependency-graph.json');
+    const repoStructurePath = join(analysisPath, ARTIFACT_REPO_STRUCTURE);
+    const llmContextPath = join(analysisPath, ARTIFACT_LLM_CONTEXT);
+    const depGraphPath = join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH);
 
-    if (!(await fileExists(repoStructurePath))) {
-      return null;
-    }
+    const repoStructure = await readJsonFile<RepoStructure>(repoStructurePath, ARTIFACT_REPO_STRUCTURE);
+    if (!repoStructure) return null;
 
-    const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-    const repoStructure = JSON.parse(repoStructureContent) as RepoStructure;
+    const llmContext = await readJsonFile<LLMContext>(llmContextPath, ARTIFACT_LLM_CONTEXT) ?? {
+      phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
+      phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
+      phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
+    };
 
-    let llmContext: LLMContext;
-    if (await fileExists(llmContextPath)) {
-      const llmContextContent = await readFile(llmContextPath, 'utf-8');
-      llmContext = JSON.parse(llmContextContent) as LLMContext;
-    } else {
-      llmContext = {
-        phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
-        phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
-        phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
-      };
-    }
-
-    let depGraph: DependencyGraphResult | undefined;
-    if (await fileExists(depGraphPath)) {
-      const depGraphContent = await readFile(depGraphPath, 'utf-8');
-      depGraph = JSON.parse(depGraphContent) as DependencyGraphResult;
-    }
+    const depGraph = await readJsonFile<DependencyGraphResult>(depGraphPath, ARTIFACT_DEPENDENCY_GRAPH) ?? undefined;
 
     const stats = await stat(repoStructurePath);
     const age = Date.now() - stats.mtime.getTime();
@@ -180,23 +156,20 @@ async function loadAnalysis(analysisPath: string): Promise<{
  */
 function estimateCost(llmContext: LLMContext, model: string): { tokens: number; cost: number } {
   let totalTokens = 0;
-  totalTokens += llmContext.phase1_survey.estimatedTokens ?? 2000;
+  totalTokens += llmContext.phase1_survey.estimatedTokens ?? DEFAULT_SURVEY_ESTIMATED_TOKENS;
   for (const file of llmContext.phase2_deep.files) {
     totalTokens += file.tokens;
   }
   const outputTokens = Math.ceil(totalTokens * 0.3);
   totalTokens += outputTokens;
 
-  const pricing: Record<string, { input: number; output: number }> = {
-    'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
-    'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0 },
-    'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
-    'gpt-4o': { input: 5.0, output: 15.0 },
-    'gpt-4o-mini': { input: 0.15, output: 0.6 },
-    default: { input: 3.0, output: 15.0 },
-  };
-
-  const modelPricing = pricing[model] ?? pricing.default;
+  // Infer provider from model ID prefix for cost estimation
+  const provider = model.startsWith('gpt-') || model.startsWith('o1') || model.startsWith('o3') || model.startsWith('o4')
+    ? 'openai'
+    : model.startsWith('gemini')
+    ? 'gemini'
+    : 'anthropic';
+  const modelPricing = lookupPricing(provider, model);
   const inputCost = (totalTokens * 0.7 / 1_000_000) * modelPricing.input;
   const outputCost = (outputTokens / 1_000_000) * modelPricing.output;
   const cost = inputCost + outputCost;
@@ -208,7 +181,7 @@ function estimateCost(llmContext: LLMContext, model: string): { tokens: number; 
  * Save run metadata
  */
 async function saveRunMetadata(rootPath: string, metadata: RunMetadata): Promise<void> {
-  const runsDir = join(rootPath, '.spec-gen', 'runs');
+  const runsDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_RUNS_SUBDIR);
   await mkdir(runsDir, { recursive: true });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -224,10 +197,14 @@ async function saveRunMetadata(rootPath: string, metadata: RunMetadata): Promise
  * Display the pipeline banner
  */
 function displayBanner(projectName: string, projectType: string, rootPath: string): void {
+  const versionLabel = `spec-gen v${PKG_VERSION}`;
+  const title = `${versionLabel} — OpenSpec Reverse Engineering Tool`;
+  const width = Math.max(53, title.length + 4);
+  const pad = (s: string) => s + ' '.repeat(width - s.length - 2);
   console.log('');
-  console.log('╭─────────────────────────────────────────────────────╮');
-  console.log('│  spec-gen v1.0.0 — OpenSpec Reverse Engineering Tool │');
-  console.log('╰─────────────────────────────────────────────────────╯');
+  console.log(`╭${'─'.repeat(width - 2)}╮`);
+  console.log(`│  ${pad(title)}│`);
+  console.log(`╰${'─'.repeat(width - 2)}╯`);
   console.log('');
   console.log(`  Project: ${projectName}`);
   console.log(`  Type: ${projectType}`);
@@ -270,7 +247,7 @@ export const runCommand = new Command('run')
   .option(
     '--model <name>',
     'LLM model to use for generation',
-    'claude-sonnet-4-20250514'
+    DEFAULT_ANTHROPIC_MODEL
   )
   .option(
     '--dry-run',
@@ -323,17 +300,23 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
     const opts: RunOptions = {
       force: options.force ?? false,
       reanalyze: options.reanalyze ?? false,
-      model: options.model ?? 'claude-sonnet-4-20250514',
+      model: options.model ?? DEFAULT_ANTHROPIC_MODEL,
       dryRun: options.dryRun ?? false,
       yes: options.yes ?? false,
       maxFiles: typeof options.maxFiles === 'string'
         ? parseInt(options.maxFiles, 10)
-        : options.maxFiles ?? 500,
+        : options.maxFiles ?? DEFAULT_MAX_FILES,
       adr: options.adr ?? false,
     };
 
+    if (isNaN(opts.maxFiles) || opts.maxFiles < 1) {
+      logger.error('--max-files must be a positive integer');
+      process.exitCode = 1;
+      return;
+    }
+
     const metadata: RunMetadata = {
-      version: '1.0.0',
+      version: PKG_VERSION,
       timestamp: new Date().toISOString(),
       duration: 0,
       steps: {
@@ -368,18 +351,18 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       let specGenConfig = configExists ? await readSpecGenConfig(rootPath) : null;
 
       if (configExists && !opts.force) {
-        console.log('   ✓ Configuration exists (.spec-gen/config.json)');
+        console.log(`   ✓ Configuration exists (${SPEC_GEN_CONFIG_REL_PATH})`);
         metadata.steps.init = { status: 'skipped', reason: 'Config exists' };
       } else {
         if (opts.dryRun) {
-          console.log('   → Would create .spec-gen/config.json');
+          console.log(`   → Would create ${SPEC_GEN_CONFIG_REL_PATH}`);
           console.log(`   → Would detect project type: ${projectTypeName}`);
         } else {
           // Create config
-          const openspecPath = './openspec';
+          const openspecPath = DEFAULT_OPENSPEC_PATH;
           specGenConfig = getDefaultConfig(detection.projectType, openspecPath);
           await writeSpecGenConfig(rootPath, specGenConfig);
-          console.log('   ✓ Created .spec-gen/config.json');
+          console.log(`   ✓ Created ${SPEC_GEN_CONFIG_REL_PATH}`);
 
           // Create openspec directory if needed
           const fullOpenspecPath = join(rootPath, openspecPath);
@@ -387,16 +370,16 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
             await createOpenSpecStructure(fullOpenspecPath);
             console.log('   ✓ Created openspec/ directory');
           } else {
-            console.log('   ✓ OpenSpec directory exists (./openspec)');
+            console.log(`   ✓ OpenSpec directory exists (${DEFAULT_OPENSPEC_PATH})`);
           }
 
           // Update gitignore
           const hasGitignore = await gitignoreExists(rootPath);
           if (hasGitignore) {
-            const alreadyIgnored = await isInGitignore(rootPath, '.spec-gen/');
+            const alreadyIgnored = await isInGitignore(rootPath, `${SPEC_GEN_DIR}/`);
             if (!alreadyIgnored) {
-              await addToGitignore(rootPath, '.spec-gen/', 'spec-gen analysis artifacts');
-              console.log('   ✓ Added .spec-gen/ to .gitignore');
+              await addToGitignore(rootPath, `${SPEC_GEN_DIR}/`, 'spec-gen analysis artifacts');
+              console.log(`   ✓ Added ${SPEC_GEN_DIR}/ to .gitignore`);
             }
           }
 
@@ -413,7 +396,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       }
 
       // Check openspec directory
-      const openspecPath = specGenConfig?.openspecPath ?? './openspec';
+      const openspecPath = specGenConfig?.openspecPath ?? DEFAULT_OPENSPEC_PATH;
       const fullOpenspecPath = join(rootPath, openspecPath);
       if (await openspecDirExists(fullOpenspecPath)) {
         console.log(`   ✓ OpenSpec directory exists (${openspecPath})`);
@@ -426,9 +409,8 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       // ========================================================================
       console.log('[Step 2/3] Analysis');
 
-      const analysisPath = join(rootPath, '.spec-gen', 'analysis');
+      const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
       const analysisAge = await getAnalysisAge(analysisPath);
-      const oneHour = 60 * 60 * 1000;
 
       let analysisData: {
         repoStructure: RepoStructure;
@@ -437,7 +419,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
         age: number;
       } | null = null;
 
-      if (analysisAge !== null && analysisAge < oneHour && !opts.reanalyze && !opts.force) {
+      if (analysisAge !== null && analysisAge < ANALYSIS_REUSE_THRESHOLD_MS && !opts.reanalyze && !opts.force) {
         // Use existing analysis
         console.log(`   ✓ Recent analysis found (${formatAge(analysisAge)})`);
 
@@ -571,7 +553,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
           apiBase: globalOpts.apiBase ?? specGenConfig?.llm?.apiBase,
           sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig?.llm?.sslVerify ?? true,
           enableLogging: true,
-          logDir: join(rootPath, '.spec-gen', 'logs'),
+          logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
         });
       } catch (error) {
         throw new Error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -582,7 +564,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
 
       // Run generation pipeline
       const pipeline = new SpecGenerationPipeline(llm, {
-        outputDir: join(rootPath, '.spec-gen', 'generation'),
+        outputDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_GENERATION_SUBDIR),
         saveIntermediate: true,
         generateADRs: opts.adr,
       });
@@ -595,7 +577,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
           analysisData!.depGraph
         );
       } catch (error) {
-        await llm.saveLogs().catch(() => {});
+        await llm.saveLogs().catch((e) => logger.debug(`Failed to save LLM logs: ${(e as Error).message}`));
         throw new Error(`Pipeline failed: ${(error as Error).message}`);
       }
 
@@ -658,7 +640,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       }
 
       // Save LLM logs
-      await llm.saveLogs().catch(() => {});
+      await llm.saveLogs().catch((e) => logger.debug(`Failed to save LLM logs: ${(e as Error).message}`));
 
       metadata.steps.generate = {
         status: 'completed',
@@ -673,7 +655,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       const duration = Date.now() - startTime;
       metadata.duration = duration;
 
-      console.log(`   Full report: .spec-gen/outputs/generation-report.json`);
+      console.log(`   Full report: ${SPEC_GEN_DIR}/outputs/${ARTIFACT_GENERATION_REPORT}`);
       console.log(`   Total time: ${formatDuration(duration)}`);
       console.log('');
 
@@ -686,7 +668,7 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       metadata.result = 'failure';
       metadata.error = (error as Error).message;
 
-      await saveRunMetadata(rootPath, metadata).catch(() => {});
+      await saveRunMetadata(rootPath, metadata).catch((e) => logger.debug(`Failed to save run metadata: ${(e as Error).message}`));
 
       logger.error(`Pipeline failed: ${(error as Error).message}`);
       if (process.env.DEBUG) {
@@ -695,17 +677,3 @@ The pipeline saves run metadata to .spec-gen/runs/ for tracking.
       process.exitCode = 1;
     }
   });
-
-/**
- * Create the default action for spec-gen (no subcommand)
- * This wraps runCommand to be used as the default action
- */
-export async function runDefaultPipeline(path: string, options: Partial<RunOptions>): Promise<void> {
-  // Change to the specified path if provided and different from cwd
-  if (path && path !== '.') {
-    process.chdir(path);
-  }
-
-  // Invoke the run command action
-  await runCommand.parseAsync(['node', 'spec-gen', 'run', ...(options.yes ? ['-y'] : [])], { from: 'user' });
-}

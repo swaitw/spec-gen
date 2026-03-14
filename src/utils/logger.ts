@@ -30,9 +30,10 @@ const defaultOptions: LoggerOptions = {
 };
 
 /**
- * Semantic prefixes for each log level
+ * Semantic prefixes for each log level.
+ * Emoji variants are used in interactive TTY sessions; plain ASCII in CI/pipes.
  */
-const PREFIXES = {
+const PREFIXES_EMOJI = {
   discovery: '🔍',
   analysis: '🔬',
   inference: '🧠',
@@ -41,6 +42,18 @@ const PREFIXES = {
   error: '✗',
   debug: '→',
 } as const;
+
+const PREFIXES_ASCII = {
+  discovery: '[scan]',
+  analysis: '[analyze]',
+  inference: '[infer]',
+  success: '[ok]',
+  warning: '[warn]',
+  error: '[error]',
+  debug: '[debug]',
+} as const;
+
+const isTTY = process.stdout.isTTY === true;
 
 /**
  * Color functions for each log level
@@ -84,7 +97,7 @@ export class Logger {
    * Format a message with optional timestamp
    */
   private formatMessage(level: LogLevel, message: string): string {
-    const prefix = PREFIXES[level];
+    const prefix = isTTY && !this.options.noColor ? PREFIXES_EMOJI[level] : PREFIXES_ASCII[level];
     const colorFn = this.options.noColor ? (s: string) => s : COLORS[level];
 
     let formattedMessage = `${prefix} ${message}`;

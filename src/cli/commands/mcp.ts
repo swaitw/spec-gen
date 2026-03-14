@@ -26,6 +26,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { sanitizeMcpError, validateDirectory } from '../../core/services/mcp-handlers/utils.js';
+import { DEFAULT_DRIFT_MAX_FILES } from '../../constants.js';
 import {
   handleGetCallGraph,
   handleGetSubgraph,
@@ -655,7 +656,7 @@ async function startMcpServer(): Promise<void> {
           args as { directory: string; filePath?: string; fanOutThreshold?: number };
         result = await handleGetGodFunctions(directory, filePath, fanOutThreshold);
       } else if (name === 'check_spec_drift') {
-        const { directory, base = 'auto', files = [], domains = [], failOn = 'warning', maxFiles = 100 } =
+        const { directory, base = 'auto', files = [], domains = [], failOn = 'warning', maxFiles = DEFAULT_DRIFT_MAX_FILES } =
           args as { directory: string; base?: string; files?: string[]; domains?: string[]; failOn?: 'error' | 'warning' | 'info'; maxFiles?: number };
         result = await handleCheckSpecDrift(directory, base, files, domains, failOn, maxFiles);
       } else if (name === 'search_code') {

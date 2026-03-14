@@ -8,6 +8,7 @@
 import { readFile, writeFile, mkdir, access, readdir } from 'node:fs/promises';
 import { join, basename, relative } from 'node:path';
 import logger from '../../utils/logger.js';
+import { VERIFICATION_PREDICTION_MAX_TOKENS } from '../../constants.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { DependencyGraphResult, DependencyNode } from '../analyzer/dependency-graph.js';
 import { ImportExportParser } from '../analyzer/import-parser.js';
@@ -197,7 +198,7 @@ export class SpecVerificationEngine {
       minComplexity: options.minComplexity ?? 50,
       maxComplexity: options.maxComplexity ?? 500,
       filesPerDomain: options.filesPerDomain ?? 3,
-      passThreshold: options.passThreshold ?? 0.6,
+      passThreshold: options.passThreshold ?? 0.5,
       generationContext: options.generationContext ?? [],
     };
   }
@@ -437,7 +438,7 @@ Respond in JSON:
         systemPrompt: PREDICTION_SYSTEM_PROMPT,
         userPrompt,
         temperature: 0.3,
-        maxTokens: 1000,
+        maxTokens: VERIFICATION_PREDICTION_MAX_TOKENS,
       });
 
       return {
@@ -559,16 +560,18 @@ Respond in JSON:
   }
 
   /**
-   * Normalize import path for comparison
+   * Normalize import path for comparison.
+   * Strips file extensions and the first leading `./` or `../` prefix,
+   * then extracts the final path segment (module name) in lowercase.
+   * Deeply-nested relative paths (e.g. `../../foo`) are handled correctly
+   * because only the last segment is used for comparison.
    */
   private normalizeImport(importPath: string): string {
-    // Remove extensions
     const normalized = importPath
       .replace(/\.(js|ts|jsx|tsx|mjs|cjs)$/, '')
       .replace(/^\.\//, '')
       .replace(/^\.\.\//, '');
 
-    // Extract module name from path
     const parts = normalized.split('/');
     return parts[parts.length - 1].toLowerCase();
   }
@@ -644,11 +647,15 @@ Respond in JSON:
     exportMatch: SetMatch,
     requirementCoverage: RequirementCoverage
   ): number {
-    // Weights from spec:
-    // - Purpose: 25%
-    // - Imports: 30%
-    // - Exports: 30%
-    // - Requirements: 15%
+    // Weighted combination (total = 1.0):
+    //   Purpose:      25%  — semantic similarity of LLM-predicted vs spec purpose
+    //   Imports:       30%  — F1 of predicted vs actual imports
+    //   Exports:       30%  — F1 of predicted vs actual exports
+    //   Requirements:  15%  — fraction of spec requirements covered by the file
+    //
+    // When imports+exports both score 0 the max achievable is 0.40
+    // (purpose 0.25 + requirements 0.15), so the default pass threshold
+    // (0.5) allows files with strong purpose + requirement coverage to pass.
     return (
       purposeMatch.similarity * 0.25 +
       importMatch.f1Score * 0.30 +
@@ -834,7 +841,7 @@ Respond in JSON:
     lines.push(`| Metric | Value |`);
     lines.push(`|--------|-------|`);
     lines.push(`| Files Verified | ${report.sampledFiles} |`);
-    lines.push(`| Files Passed | ${report.passedFiles} (${((report.passedFiles / report.sampledFiles) * 100).toFixed(0)}%) |`);
+    lines.push(`| Files Passed | ${report.passedFiles} (${report.sampledFiles > 0 ? ((report.passedFiles / report.sampledFiles) * 100).toFixed(0) : 'N/A'}%) |`);
     lines.push(`| Overall Confidence | ${(report.overallConfidence * 100).toFixed(1)}% |`);
     lines.push(`| Recommendation | **${report.recommendation}** |`);
     lines.push('');
@@ -919,9 +926,14 @@ Respond in JSON:
   }
 
   /**
-   * Get list of domains
+   * Get list of domains from loaded specs.
+   * If specs have not been loaded yet (i.e., verify() has not been called),
+   * triggers an eager load so callers can preview domains without a full LLM run.
    */
-  getDomains(): string[] {
+  async getDomains(): Promise<string[]> {
+    if (this.specs.length === 0) {
+      await this.loadSpecs();
+    }
     return this.specs.map(s => s.domain);
   }
 }

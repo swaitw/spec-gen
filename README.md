@@ -22,6 +22,9 @@ spec-gen init       # Detect project type, create config
 spec-gen analyze    # Static analysis (no API key needed)
 spec-gen generate   # Generate specs (requires API key)
 spec-gen drift      # Check for spec drift
+
+# Troubleshoot setup issues
+spec-gen doctor     # Check environment and configuration
 ```
 
 <details>
@@ -86,7 +89,7 @@ npm run dev
 
 Scans your codebase using pure static analysis:
 - Walks the directory tree, respects .gitignore, scores files by significance
-- Parses imports and exports to build a dependency graph (TypeScript, JavaScript, Python, Go, Rust, Ruby, Java)
+- Parses imports and exports to build a dependency graph (TypeScript, JavaScript, Python, Go, Rust, Ruby, Java, C++)
 - Detects HTTP cross-language edges: matches `fetch`/`axios`/`ky`/`got` calls in JS/TS files to FastAPI/Flask/Django route definitions in Python files, creating cross-language dependency edges with `exact`, `path`, or `fuzzy` confidence
 - Resolves Python absolute imports (`from services.retriever import X`) to local files
 - Clusters related files into structural business domains automatically
@@ -416,6 +419,7 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
 | `spec-gen view` | Launch interactive graph & spec viewer in the browser | No |
 | `spec-gen mcp` | Start MCP server (stdio, for Cline / Claude Code) | No |
+| `spec-gen doctor` | Check environment and configuration for common issues | No |
 
 ### Global Options
 
@@ -461,8 +465,22 @@ spec-gen generate [options]
   --adr                  # Also generate ADRs
   --adr-only             # Generate only ADRs
   --reanalyze            # Force fresh analysis even if recent exists
+  --analysis <path>      # Path to existing analysis directory
   --output-dir <path>    # Override openspec output location
   -y, --yes              # Skip confirmation prompts
+```
+
+### Run Options
+
+```bash
+spec-gen run [options]
+  --force                # Reinitialize even if config exists
+  --reanalyze            # Force fresh analysis even if recent exists
+  --model <name>         # LLM model to use for generation
+  --dry-run              # Show what would be done without making changes
+  -y, --yes              # Skip all confirmation prompts
+  --max-files <n>        # Maximum files to analyze (default: 500)
+  --adr                  # Also generate Architecture Decision Records
 ```
 
 ### Analyze Options
@@ -489,6 +507,29 @@ spec-gen verify [options]
   --verbose              # Show detailed prediction vs actual comparison
   --json                 # JSON output
 ```
+
+### Doctor
+
+`spec-gen doctor` runs a self-diagnostic and surfaces actionable fixes when something is misconfigured or missing:
+
+```bash
+spec-gen doctor          # Run all checks
+spec-gen doctor --json   # JSON output for scripting
+```
+
+Checks performed:
+
+| Check | What it looks for |
+|-------|------------------|
+| Node.js version | ≥ 20 required |
+| Git repository | `.git` directory and `git` binary on PATH |
+| spec-gen config | `.spec-gen/config.json` exists and is parseable |
+| Analysis artifacts | `repo-structure.json` freshness (warns if >24h old) |
+| OpenSpec directory | `openspec/specs/` exists |
+| LLM provider | API key or `claude` CLI detected |
+| Disk space | Warns < 500 MB, fails < 200 MB |
+
+Run `spec-gen doctor` whenever setup instructions aren't working — it tells you exactly what to fix and how.
 
 ## MCP Server
 
@@ -580,7 +621,7 @@ All tools run on **pure static analysis** -- no LLM quota consumed.
 | Tool | Description | Requires prior analysis |
 |------|-------------|:---:|
 | `analyze_codebase` | Run full static analysis: repo structure, dependency graph, call graph (hub functions, entry points, layer violations), and top refactoring priorities. Results cached for 1 hour (`force: true` to bypass). | No |
-| `get_call_graph` | Hub functions (high fan-in), entry points (no internal callers), and architectural layer violations. Supports TypeScript, JavaScript, Python, Go, Rust, Ruby, Java. | Yes |
+| `get_call_graph` | Hub functions (high fan-in), entry points (no internal callers), and architectural layer violations. Supports TypeScript, JavaScript, Python, Go, Rust, Ruby, Java, C++. | Yes |
 | `get_signatures` | Compact function/class signatures per file. Filter by path substring with `filePattern`. Useful for understanding a module's public API without reading full source. | Yes |
 | `get_duplicate_report` | Detect duplicate code: Type 1 (exact clones), Type 2 (structural -- renamed variables), Type 3 (near-clones with Jaccard similarity >= 0.7). Groups sorted by impact. | Yes |
 
@@ -1053,10 +1094,43 @@ console.log(`Analyzed ${analysis.repoMap.summary.analyzedFiles} files`);
 | `specGenVerify(options?)` | Verify spec accuracy | Yes |
 | `specGenDrift(options?)` | Detect spec-to-code drift | No* |
 | `specGenRun(options?)` | Full pipeline: init + analyze + generate | Yes |
+| `specGenGetSpecRequirements(options?)` | Read requirement blocks from generated specs | No |
 
 \* `specGenDrift` requires an API key only when `llmEnhanced: true`.
 
 All functions accept an optional `onProgress` callback for status updates and throw errors instead of calling `process.exit`. See [src/api/types.ts](src/api/types.ts) for full option and result type definitions.
+
+### Error handling
+
+All API functions throw `Error` on failure. Wrap calls in try-catch for production use:
+
+```typescript
+import { specGenRun } from 'spec-gen-cli';
+
+try {
+  const result = await specGenRun({ rootPath: '/path/to/project' });
+  console.log(`Done — ${result.generation.report.filesWritten.length} specs written`);
+} catch (err) {
+  if ((err as Error).message.includes('API key')) {
+    console.error('Set ANTHROPIC_API_KEY or OPENAI_API_KEY');
+  } else {
+    console.error('spec-gen failed:', (err as Error).message);
+  }
+}
+```
+
+### Reading generated spec requirements
+
+After running `specGenGenerate`, you can programmatically query the requirement-to-function mapping:
+
+```typescript
+import { specGenGetSpecRequirements } from 'spec-gen-cli';
+
+const { requirements } = await specGenGetSpecRequirements({ rootPath: '/path/to/project' });
+for (const [key, req] of Object.entries(requirements)) {
+  console.log(`${key}: ${req.title} (${req.specFile})`);
+}
+```
 
 ## Examples
 

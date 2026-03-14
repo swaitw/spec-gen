@@ -9,6 +9,16 @@
 
 import { writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import {
+  SIMILARITY_CONTAINMENT_SCORE,
+  SIMILARITY_TOKEN_OVERLAP_WEIGHT,
+  HEURISTIC_MATCH_MIN_SCORE,
+  MAX_HEURISTIC_MATCHES_PER_OP,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENSPEC_DIR,
+  ARTIFACT_MAPPING,
+} from '../../constants.js';
 import type { PipelineResult } from './spec-pipeline.js';
 import type { DependencyGraphResult } from '../analyzer/dependency-graph.js';
 import type { SearchResult } from '../analyzer/vector-index.js';
@@ -72,7 +82,7 @@ function similarityScore(operationName: string, functionName: string): number {
   if (opNorm === fnNorm) return 1.0;
 
   // Containment
-  if (fnNorm.includes(opNorm) || opNorm.includes(fnNorm)) return 0.8;
+  if (fnNorm.includes(opNorm) || opNorm.includes(fnNorm)) return SIMILARITY_CONTAINMENT_SCORE;
 
   // Token overlap
   const opTokens = new Set(tokenize(operationName));
@@ -80,7 +90,7 @@ function similarityScore(operationName: string, functionName: string): number {
   const intersection = [...opTokens].filter(t => fnTokens.has(t)).length;
   const union = new Set([...opTokens, ...fnTokens]).size;
   if (union === 0) return 0;
-  return (intersection / union) * 0.7;
+  return (intersection / union) * SIMILARITY_TOKEN_OVERLAP_WEIGHT;
 }
 
 // ============================================================================
@@ -106,7 +116,7 @@ export class MappingGenerator {
 
   constructor(
     rootPath: string,
-    openspecPath = 'openspec',
+    openspecPath = OPENSPEC_DIR,
     semanticSearch?: SemanticSearchFn
   ) {
     this.rootPath = rootPath;
@@ -137,7 +147,7 @@ export class MappingGenerator {
         }
       }
     }
-    return matched.slice(0, 2);
+    return matched.slice(0, MAX_HEURISTIC_MATCHES_PER_OP);
   }
 
   async generate(
@@ -202,14 +212,14 @@ export class MappingGenerator {
           const scored: Array<{ ref: FunctionRef; score: number }> = [];
           for (const [name, refs] of exportIndex) {
             const score = similarityScore(op.name, name);
-            if (score >= 0.7) {
+            if (score >= HEURISTIC_MATCH_MIN_SCORE) {
               for (const ref of refs) {
                 scored.push({ ref, score });
               }
             }
           }
           scored.sort((a, b) => b.score - a.score);
-          const top = scored.slice(0, 2); // at most 2 heuristic matches
+          const top = scored.slice(0, MAX_HEURISTIC_MATCHES_PER_OP);
           for (const { ref } of top) {
             functions.push({ ...ref, confidence: 'heuristic' });
             mappedFunctionNames.add(`${ref.name}::${ref.file}`);
@@ -256,12 +266,12 @@ export class MappingGenerator {
             const scored: Array<{ ref: FunctionRef; score: number }> = [];
             for (const [name, refs] of exportIndex) {
               const score = similarityScore(op.name, name);
-              if (score >= 0.7) {
+              if (score >= HEURISTIC_MATCH_MIN_SCORE) {
                 for (const ref of refs) scored.push({ ref, score });
               }
             }
             scored.sort((a, b) => b.score - a.score);
-            for (const { ref } of scored.slice(0, 2)) {
+            for (const { ref } of scored.slice(0, MAX_HEURISTIC_MATCHES_PER_OP)) {
               functions.push({ ...ref, confidence: 'heuristic' });
               mappedFunctionNames.add(`${ref.name}::${ref.file}`);
             }
@@ -305,7 +315,7 @@ export class MappingGenerator {
   }
 
   private async write(artifact: MappingArtifact): Promise<void> {
-    const outPath = join(this.rootPath, '.spec-gen', 'analysis', 'mapping.json');
+    const outPath = join(this.rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MAPPING);
     await writeFile(outPath, JSON.stringify(artifact, null, 2), 'utf-8');
   }
 
@@ -313,7 +323,7 @@ export class MappingGenerator {
   static async load(rootPath: string): Promise<MappingArtifact | null> {
     try {
       const content = await readFile(
-        join(rootPath, '.spec-gen', 'analysis', 'mapping.json'),
+        join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MAPPING),
         'utf-8'
       );
       return JSON.parse(content) as MappingArtifact;

@@ -2,6 +2,13 @@
  * Custom error classes for spec-gen with helpful user-facing messages
  */
 
+import {
+  SPEC_GEN_DIR,
+  SPEC_GEN_BACKUPS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+} from '../constants.js';
+
 export type ErrorCode =
   | 'NO_API_KEY'
   | 'NOT_A_REPOSITORY'
@@ -84,7 +91,7 @@ Run 'git init' or use --force to continue anyway.`
       `openspec/specs/ already contains specifications at ${path}`,
       'OPENSPEC_EXISTS',
       `Use --merge to add to existing specs, or --force to overwrite.
-Existing specs will be backed up to .spec-gen/backups/`
+Existing specs will be backed up to ${SPEC_GEN_DIR}/${SPEC_GEN_BACKUPS_SUBDIR}/`
     );
   },
 
@@ -101,7 +108,7 @@ Existing specs will be backed up to .spec-gen/backups/`
       'Could not identify any high-value files to analyze',
       'NO_HIGH_VALUE_FILES',
       `This might happen with unusual project structures.
-Try adjusting scoring in .spec-gen/config.json or use --include patterns.`
+Try adjusting scoring in ${SPEC_GEN_CONFIG_REL_PATH} or use --include patterns.`
     );
   },
 
@@ -118,7 +125,7 @@ If this persists, try a different model or wait a few minutes.`
     return new SpecGenError(
       `Generated specs failed OpenSpec validation${details ? `: ${details}` : ''}`,
       'OPENSPEC_VALIDATION_FAILED',
-      `Check .spec-gen/logs/ for details.
+      `Check ${SPEC_GEN_DIR}/${SPEC_GEN_LOGS_SUBDIR}/ for details.
 This may indicate a generation bug - please report it at https://github.com/clay-good/spec-gen/issues`
     );
   },

@@ -256,8 +256,11 @@ export class DependencyGraphBuilder {
       try {
         const analysis = await this.parser.parseFile(file.absolutePath);
         analyses.set(file.absolutePath, analysis);
-      } catch {
-        // File couldn't be parsed, skip it
+      } catch (error) {
+        // File couldn't be parsed (binary, syntax error, etc.) — skip it
+        if (process.env.DEBUG) {
+          console.debug(`[dep-graph] Failed to parse ${file.absolutePath}: ${(error as Error).message}`);
+        }
       }
     }
 
@@ -439,7 +442,7 @@ export class DependencyGraphBuilder {
     }
 
     // Normalize and update nodes
-    const maxBetweenness = Math.max(...Array.from(betweenness.values()), 1);
+    const maxBetweenness = Array.from(betweenness.values()).reduce((a, b) => Math.max(a, b), 1);
     for (const [nodeId, node] of this.nodes) {
       node.metrics.betweenness = betweenness.get(nodeId)! / maxBetweenness;
     }
@@ -488,7 +491,7 @@ export class DependencyGraphBuilder {
     }
 
     // Normalize and update nodes
-    const maxPageRank = Math.max(...Array.from(pageRank.values()), 0.001);
+    const maxPageRank = Array.from(pageRank.values()).reduce((a, b) => Math.max(a, b), 0.001);
     for (const [nodeId, node] of this.nodes) {
       node.metrics.pageRank = pageRank.get(nodeId)! / maxPageRank;
     }
@@ -547,7 +550,7 @@ export class DependencyGraphBuilder {
       const suggestedDomain = this.suggestDomainName(dir, files);
 
       clusters.push({
-        id: `cluster-${clusterId++}`,
+        id: `cluster-${clusterId}`,
         name: dir,
         files,
         internalEdges,
@@ -555,7 +558,7 @@ export class DependencyGraphBuilder {
         cohesion,
         coupling,
         suggestedDomain,
-        color: CLUSTER_PALETTE[clusterId % CLUSTER_PALETTE.length],
+        color: CLUSTER_PALETTE[clusterId++ % CLUSTER_PALETTE.length],
         isStructural: internalEdges > 0,
       });
     }
@@ -696,13 +699,15 @@ export class DependencyGraphBuilder {
   private generateRankings(clusters: FileCluster[]): DependencyGraphResult['rankings'] {
     const nodes = Array.from(this.nodes.values());
 
-    // By PageRank importance
+    // By PageRank importance — use .slice() to avoid mutating the shared array
     const byImportance = nodes
+      .slice()
       .sort((a, b) => b.metrics.pageRank - a.metrics.pageRank)
       .map(n => n.id);
 
     // By total connectivity (in + out degree)
     const byConnectivity = nodes
+      .slice()
       .sort((a, b) =>
         (b.metrics.inDegree + b.metrics.outDegree) -
         (a.metrics.inDegree + a.metrics.outDegree)
