@@ -358,4 +358,4 @@ réponses (types corrects, pas de champs `undefined`, scores dans les bornes att
 | 16 | Tests sémantiques avec noms ambigus | 5 | **Critique** | ✅ |
 | 17 | Pipeline e2e sur vrai dépôt open source | 5 | **Élevé** | ✅ |
 | 18 | Tests de régression formalisés | 5 | **Élevé** | ✅ |
-| 19 | Tests MCP bout en bout sur données réelles | 5 | **Moyen** | — |
+| 19 | Tests MCP bout en bout sur données réelles | 5 | **Moyen** | ✅ |

@@ -356,13 +356,14 @@ describe('VectorIndex + EmbeddingService (integration)', () => {
     expect(hasCache).toBe(true);
   });
 
-  it('results are sorted by score ascending (closest first)', async () => {
+  it('results are sorted by relevance descending (best match first)', async () => {
     if (skipIfDown()) return;
 
+    // Hybrid RRF search returns higher score = more relevant, sorted descending.
     const results = await VectorIndex.search(tmpDir, 'JWT token authentication', embedSvc, { limit: 12 });
 
     for (let i = 1; i < results.length; i++) {
-      expect(results[i].score).toBeGreaterThanOrEqual(results[i - 1].score);
+      expect(results[i].score).toBeLessThanOrEqual(results[i - 1].score);
     }
   });
 
