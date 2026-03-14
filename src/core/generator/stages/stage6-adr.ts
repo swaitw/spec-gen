@@ -4,6 +4,7 @@
  * Expands architectural decisions into full ADRs.
  */
 
+import { STAGE6_MAX_TOKENS } from '../../../constants.js';
 import { PROMPTS } from '../prompts.js';
 import type { ArchitectureSynthesis, EnrichedADR, PipelineContext, StageResult } from '../../../types/pipeline.js';
 
@@ -22,13 +23,18 @@ ${architecture.keyDecisions.map((d, i) => `${i + 1}. ${d}`).join('\n')}`;
       systemPrompt: PROMPTS.stage6_adr(architecture),
       userPrompt,
       temperature: 0.3,
-      maxTokens: 5000,
+      maxTokens: STAGE6_MAX_TOKENS,
     });
+
+    // Normalize: completeJSON may return a single object if the LLM ignores the
+    // array instruction (observed with GPT-5.2-chat — see issue #26). Wrap it
+    // so downstream consumers always receive an array.
+    const adrs = Array.isArray(result) ? result : [result];
 
     const stageResult: StageResult<EnrichedADR[]> = {
       stage: 'adr',
       success: true,
-      data: result,
+      data: adrs,
       tokens: pipeline.llm.getTokenUsage().totalTokens,
       duration: Date.now() - startTime,
     };

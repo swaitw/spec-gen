@@ -6,7 +6,7 @@
  */
 
 import { join } from 'node:path';
-import { access, readFile } from 'node:fs/promises';
+import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import {
   readSpecGenConfig,
   readOpenSpecConfig,
@@ -21,19 +21,26 @@ import { MappingGenerator } from '../core/generator/mapping-generator.js';
 import type { RepoStructure, LLMContext } from '../core/analyzer/artifact-generator.js';
 import type { DependencyGraphResult } from '../core/analyzer/dependency-graph.js';
 import type { GenerateApiOptions, GenerateResult, ProgressCallback } from './types.js';
+import {
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_OPENAI_MODEL,
+  DEFAULT_OPENAI_COMPAT_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_ANALYSIS_REL_PATH,
+  SPEC_GEN_GENERATION_SUBDIR,
+  OPENSPEC_DIR,
+  ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_DEPENDENCY_GRAPH,
+} from '../constants.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'generate', step, status, detail });
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 interface AnalysisData {
   repoStructure: RepoStructure;
@@ -42,33 +49,25 @@ interface AnalysisData {
 }
 
 async function loadAnalysisData(analysisPath: string): Promise<AnalysisData | null> {
-  const repoStructurePath = join(analysisPath, 'repo-structure.json');
-  if (!(await fileExists(repoStructurePath))) {
-    return null;
-  }
+  const repoStructure = await readJsonFile<RepoStructure>(
+    join(analysisPath, ARTIFACT_REPO_STRUCTURE),
+    ARTIFACT_REPO_STRUCTURE,
+  );
+  if (!repoStructure) return null;
 
-  const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-  const repoStructure = JSON.parse(repoStructureContent) as RepoStructure;
+  const llmContext = await readJsonFile<LLMContext>(
+    join(analysisPath, ARTIFACT_LLM_CONTEXT),
+    ARTIFACT_LLM_CONTEXT,
+  ) ?? {
+    phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
+    phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
+    phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
+  };
 
-  let llmContext: LLMContext;
-  const llmContextPath = join(analysisPath, 'llm-context.json');
-  if (await fileExists(llmContextPath)) {
-    const content = await readFile(llmContextPath, 'utf-8');
-    llmContext = JSON.parse(content) as LLMContext;
-  } else {
-    llmContext = {
-      phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
-      phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
-      phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
-    };
-  }
-
-  let depGraph: DependencyGraphResult | undefined;
-  const depGraphPath = join(analysisPath, 'dependency-graph.json');
-  if (await fileExists(depGraphPath)) {
-    const content = await readFile(depGraphPath, 'utf-8');
-    depGraph = JSON.parse(content) as DependencyGraphResult;
-  }
+  const depGraph = await readJsonFile<DependencyGraphResult>(
+    join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+    ARTIFACT_DEPENDENCY_GRAPH,
+  ) ?? undefined;
 
   return { repoStructure, llmContext, depGraph };
 }
@@ -85,7 +84,7 @@ async function loadAnalysisData(analysisPath: string): Promise<AnalysisData | nu
 export async function specGenGenerate(options: GenerateApiOptions = {}): Promise<GenerateResult> {
   const startTime = Date.now();
   const rootPath = options.rootPath ?? process.cwd();
-  const analysisRelPath = options.analysisPath ?? '.spec-gen/analysis/';
+  const analysisRelPath = options.analysisPath ?? `${SPEC_GEN_ANALYSIS_REL_PATH}/`;
   const analysisPath = join(rootPath, analysisRelPath);
   const { onProgress } = options;
 
@@ -96,7 +95,7 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
     throw new Error('No spec-gen configuration found. Run specGenInit() first.');
   }
 
-  const openspecRelPath = specGenConfig.openspecPath ?? 'openspec';
+  const openspecRelPath = specGenConfig.openspecPath ?? OPENSPEC_DIR;
   const fullOpenspecPath = join(rootPath, openspecRelPath);
   await readOpenSpecConfig(fullOpenspecPath); // Ensure it's readable
   progress(onProgress, 'Loading configuration', 'complete');
@@ -130,10 +129,10 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
   const effectiveProvider = options.provider ?? specGenConfig.generation.provider ?? envDetectedProvider;
 
   const defaultModels: Record<string, string> = {
-    anthropic: 'claude-sonnet-4-20250514',
-    gemini: 'gemini-2.0-flash',
-    'openai-compat': 'mistral-large-latest',
-    openai: 'gpt-4o',
+    anthropic: DEFAULT_ANTHROPIC_MODEL,
+    gemini: DEFAULT_GEMINI_MODEL,
+    'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
+    openai: DEFAULT_OPENAI_MODEL,
   };
   const effectiveModel = options.model || specGenConfig.generation.model || defaultModels[effectiveProvider];
 
@@ -160,7 +159,7 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
       apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
       sslVerify,
       enableLogging: true,
-      logDir: join(rootPath, '.spec-gen', 'logs'),
+      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
     });
   } catch (error) {
     throw new Error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -194,7 +193,7 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
   const adr = options.adr ?? false;
   const adrOnly = options.adrOnly ?? false;
   const pipeline = new SpecGenerationPipeline(llm, {
-    outputDir: join(rootPath, '.spec-gen', 'generation'),
+    outputDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_GENERATION_SUBDIR),
     saveIntermediate: true,
     generateADRs: adr || adrOnly,
   });
@@ -257,7 +256,7 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
   if ((options.mapping ?? true) && depGraph) {
     try {
       let semanticSearch: import('../core/generator/mapping-generator.js').SemanticSearchFn | undefined;
-      const analysisDir = join(rootPath, '.spec-gen', 'analysis');
+      const analysisDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
       const { VectorIndex } = await import('../core/analyzer/vector-index.js');
       if (VectorIndex.exists(analysisDir)) {
         const { EmbeddingService } = await import('../core/analyzer/embedding-service.js');

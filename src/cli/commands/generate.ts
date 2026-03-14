@@ -6,9 +6,34 @@
  */
 
 import { Command } from 'commander';
-import { access, readFile, stat } from 'node:fs/promises';
+import { confirm } from '@inquirer/prompts';
+import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { fileExists, formatDuration, formatAge, parseList, readJsonFile } from '../../utils/command-helpers.js';
+import {
+  LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS,
+  GENERATION_OUTPUT_RATIO,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_OPENAI_MODEL,
+  DEFAULT_OPENAI_COMPAT_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_SURVEY_ESTIMATED_TOKENS,
+  COST_CONFIRMATION_THRESHOLD,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_ANALYSIS_REL_PATH,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_OUTPUTS_SUBDIR,
+  SPEC_GEN_GENERATION_SUBDIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+  OPENSPEC_DIR,
+  ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_GENERATION_REPORT,
+  ARTIFACT_MAPPING,
+} from '../../constants.js';
 import type { GenerateOptions } from '../../types/index.js';
 import {
   readSpecGenConfig,
@@ -62,86 +87,32 @@ interface AnalysisData {
 // ============================================================================
 
 /**
- * Parse comma-separated domain list
- */
-function parseDomains(value: string): string[] {
-  return value.split(',').map((d) => d.trim()).filter(Boolean);
-}
-
-/**
- * Check if a file exists
- */
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Format time duration for display
- */
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-/**
- * Format age in human-readable form
- */
-function formatAge(ms: number): string {
-  if (ms < 60000) return 'just now';
-  if (ms < 3600000) return `${Math.floor(ms / 60000)} minutes ago`;
-  if (ms < 86400000) return `${Math.floor(ms / 3600000)} hours ago`;
-  return `${Math.floor(ms / 86400000)} days ago`;
-}
-
-/**
  * Load analysis data from disk
  */
 async function loadAnalysis(analysisPath: string): Promise<AnalysisData | null> {
   try {
-    const repoStructurePath = join(analysisPath, 'repo-structure.json');
-    const llmContextPath = join(analysisPath, 'llm-context.json');
+    const repoStructure = await readJsonFile<RepoStructure>(
+      join(analysisPath, ARTIFACT_REPO_STRUCTURE),
+      ARTIFACT_REPO_STRUCTURE,
+    );
+    if (!repoStructure) return null;
 
-    // Check if analysis exists
-    if (!(await fileExists(repoStructurePath))) {
-      return null;
-    }
+    const llmContext = await readJsonFile<LLMContext>(
+      join(analysisPath, ARTIFACT_LLM_CONTEXT),
+      ARTIFACT_LLM_CONTEXT,
+    ) ?? {
+      phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
+      phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
+      phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
+    };
 
-    // Load repo structure
-    const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-    const repoStructure = JSON.parse(repoStructureContent) as RepoStructure;
-
-    // Load LLM context
-    let llmContext: LLMContext;
-    if (await fileExists(llmContextPath)) {
-      const llmContextContent = await readFile(llmContextPath, 'utf-8');
-      llmContext = JSON.parse(llmContextContent) as LLMContext;
-    } else {
-      // Create minimal context if not available
-      llmContext = {
-        phase1_survey: { purpose: 'Initial survey', files: [], estimatedTokens: 0 },
-        phase2_deep: { purpose: 'Deep analysis', files: [], totalTokens: 0 },
-        phase3_validation: { purpose: 'Validation', files: [], totalTokens: 0 },
-      };
-    }
-
-    // Try to load dependency graph
-    let depGraph: DependencyGraphResult | undefined;
-    const depGraphPath = join(analysisPath, 'dependency-graph.json');
-    if (await fileExists(depGraphPath)) {
-      const depGraphContent = await readFile(depGraphPath, 'utf-8');
-      depGraph = JSON.parse(depGraphContent) as DependencyGraphResult;
-    }
+    const depGraph = await readJsonFile<DependencyGraphResult>(
+      join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+      ARTIFACT_DEPENDENCY_GRAPH,
+    ) ?? undefined;
 
     // Get analysis age
-    const stats = await stat(repoStructurePath);
+    const stats = await stat(join(analysisPath, ARTIFACT_REPO_STRUCTURE));
     const age = Date.now() - stats.mtime.getTime();
     const timestamp = stats.mtime.toISOString();
 
@@ -168,14 +139,14 @@ function estimateCost(
   provider: string,
   model: string
 ): { tokens: number; cost: number } {
-  const OVERHEAD = 500;      // system prompt per call (tokens)
-  const OUTPUT_RATIO = 0.4;  // output ≈ 40% of input for spec tasks
+  const OVERHEAD = LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS;
+  const OUTPUT_RATIO = GENERATION_OUTPUT_RATIO;
 
   const phase2Files = llmContext.phase2_deep.files;
   const phase2Total = phase2Files.reduce((s, f) => s + f.tokens, 0);
   const fileOverhead = OVERHEAD * phase2Files.length;
 
-  const stage1Input = (llmContext.phase1_survey.estimatedTokens ?? 2000) + OVERHEAD;
+  const stage1Input = (llmContext.phase1_survey.estimatedTokens ?? DEFAULT_SURVEY_ESTIMATED_TOKENS) + OVERHEAD;
   const stage2Input = phase2Total + fileOverhead;                        // entity extraction
   const stage3Input = phase2Total + fileOverhead;                        // service analysis (same files)
   const stage4Input = Math.ceil(phase2Total * 0.5) + OVERHEAD;           // API extraction
@@ -192,18 +163,17 @@ function estimateCost(
 }
 
 /**
- * Prompt user for confirmation
+ * Prompt user for confirmation. Uses @inquirer/prompts in TTY, auto-yes otherwise.
  */
 async function promptConfirmation(message: string, autoYes: boolean): Promise<boolean> {
-  if (autoYes) {
-    return true;
+  if (autoYes) return true;
+
+  if (!process.stdin.isTTY) {
+    logger.warning(`${message} — use --yes to confirm in non-interactive mode`);
+    return false;
   }
 
-  // In a real CLI, we'd use readline here
-  // For now, we assume yes in non-interactive mode
-  logger.discovery(message);
-  logger.discovery('Use --yes or -y to skip confirmation prompts');
-  return true;
+  return confirm({ message, default: true });
 }
 
 /**
@@ -234,7 +204,7 @@ export const generateCommand = new Command('generate')
   .option(
     '--analysis <path>',
     'Path to existing analysis (skips re-analysis)',
-    '.spec-gen/analysis/'
+    `${SPEC_GEN_ANALYSIS_REL_PATH}/`
   )
   .option(
     '--model <name>',
@@ -248,7 +218,7 @@ export const generateCommand = new Command('generate')
   .option(
     '--domains <list>',
     'Only generate specific domains (comma-separated)',
-    parseDomains
+    parseList
   )
   .option(
     '--reanalyze',
@@ -328,7 +298,7 @@ Each spec.md follows OpenSpec conventions:
     const globalOpts = this.optsWithGlobals?.() ?? {};
 
     const opts: ExtendedGenerateOptions = {
-      analysis: options.analysis ?? '.spec-gen/analysis/',
+      analysis: options.analysis ?? `${SPEC_GEN_ANALYSIS_REL_PATH}/`,
       model: options.model ?? '',
       dryRun: options.dryRun ?? false,
       domains: options.domains ?? [],
@@ -342,7 +312,7 @@ Each spec.md follows OpenSpec conventions:
       quiet: false,
       verbose: false,
       noColor: false,
-      config: '.spec-gen/config.json',
+      config: SPEC_GEN_CONFIG_REL_PATH,
     };
 
     try {
@@ -360,7 +330,7 @@ Each spec.md follows OpenSpec conventions:
       }
 
       // Determine openspec path
-      const openspecPath = opts.outputDir ?? specGenConfig.openspecPath ?? 'openspec';
+      const openspecPath = opts.outputDir ?? specGenConfig.openspecPath ?? OPENSPEC_DIR;
       const fullOpenspecPath = join(rootPath, openspecPath);
 
       // Load existing OpenSpec config if present
@@ -439,10 +409,10 @@ Each spec.md follows OpenSpec conventions:
 
       // Resolve model with priority: CLI flag > config > provider default
       const defaultModels: Record<string, string> = {
-        anthropic: 'claude-sonnet-4-20250514',
-        gemini: 'gemini-2.0-flash',
-        'openai-compat': 'mistral-large-latest',
-        openai: 'gpt-4o',
+        anthropic: DEFAULT_ANTHROPIC_MODEL,
+        gemini: DEFAULT_GEMINI_MODEL,
+        'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
+        openai: DEFAULT_OPENAI_MODEL,
         'claude-code': 'claude-code',
         'mistral-vibe': 'mistral-vibe',
       };
@@ -484,7 +454,7 @@ Each spec.md follows OpenSpec conventions:
       }
 
       // Confirmation prompt
-      if (!opts.dryRun && estimate.cost > 0.5) {
+      if (!opts.dryRun && estimate.cost > COST_CONFIRMATION_THRESHOLD) {
         const confirmed = await promptConfirmation(
           `Estimated cost: ~$${estimate.cost.toFixed(2)}. Continue? [Y/n]`,
           opts.yes ?? false
@@ -542,7 +512,7 @@ Each spec.md follows OpenSpec conventions:
           apiBase: globalOpts.apiBase ?? specGenConfig.llm?.apiBase,
           sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig.llm?.sslVerify ?? true,
           enableLogging: true,
-          logDir: join(rootPath, '.spec-gen', 'logs'),
+          logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
         });
       } catch (error) {
         logger.error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -562,7 +532,7 @@ Each spec.md follows OpenSpec conventions:
       progress.start('Generating specifications...');
 
       const pipeline = new SpecGenerationPipeline(llm, {
-        outputDir: join(rootPath, '.spec-gen', 'generation'),
+        outputDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_GENERATION_SUBDIR),
         rootPath,
         saveIntermediate: true,
         generateADRs: opts.adr || opts.adrOnly,
@@ -579,7 +549,7 @@ Each spec.md follows OpenSpec conventions:
         // Save logs on failure
         try {
           await llm.saveLogs();
-          logger.discovery('LLM logs saved to .spec-gen/logs/');
+          logger.discovery(`LLM logs saved to ${SPEC_GEN_DIR}/${SPEC_GEN_LOGS_SUBDIR}/`);
         } catch {
           // Ignore log save errors
         }
@@ -679,7 +649,7 @@ Each spec.md follows OpenSpec conventions:
         try {
           // Wire semantic search if a vector index exists for this project
           let semanticSearch: import('./../../core/generator/mapping-generator.js').SemanticSearchFn | undefined;
-          const analysisDir = join(rootPath, '.spec-gen', 'analysis');
+          const analysisDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
           const { VectorIndex } = await import('../../core/analyzer/vector-index.js');
           if (VectorIndex.exists(analysisDir)) {
             const { EmbeddingService } = await import('../../core/analyzer/embedding-service.js');
@@ -698,7 +668,7 @@ Each spec.md follows OpenSpec conventions:
           const mapper = new MappingGenerator(rootPath, specGenConfig.openspecPath, semanticSearch);
           const mapping = await mapper.generate(pipelineResult, depGraph);
           logger.success(
-            `Requirement mapping: ${mapping.stats.mappedRequirements}/${mapping.stats.totalRequirements} requirements mapped, ${mapping.stats.orphanCount} orphan functions → .spec-gen/analysis/mapping.json`
+            `Requirement mapping: ${mapping.stats.mappedRequirements}/${mapping.stats.totalRequirements} requirements mapped, ${mapping.stats.orphanCount} orphan functions → ${SPEC_GEN_ANALYSIS_REL_PATH}/${ARTIFACT_MAPPING}`
           );
         } catch (error) {
           logger.warning(`Could not generate mapping artifact: ${(error as Error).message}`);
@@ -761,14 +731,14 @@ Each spec.md follows OpenSpec conventions:
 
       console.log('');
       console.log(`  Total time: ${formatDuration(duration)}`);
-      console.log(`  Report saved to: .spec-gen/outputs/generation-report.json`);
+      console.log(`  Report saved to: ${SPEC_GEN_DIR}/${SPEC_GEN_OUTPUTS_SUBDIR}/${ARTIFACT_GENERATION_REPORT}`);
       console.log('');
 
       // Save LLM logs
       try {
         await llm.saveLogs();
-      } catch {
-        // Ignore log save errors
+      } catch (logErr) {
+        logger.debug(`LLM log save skipped: ${(logErr as Error).message}`);
       }
 
       logger.success('Done!');

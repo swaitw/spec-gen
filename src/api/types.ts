@@ -149,11 +149,13 @@ export interface VerifyApiOptions extends BaseOptions {
   model?: string;
   /** Custom LLM API base URL */
   apiBase?: string;
+  /** Base URL for OpenAI-compatible endpoint (Ollama, Mistral, etc.) */
+  openaiCompatBaseUrl?: string;
   /** Enable/disable SSL certificate verification. Default: true */
   sslVerify?: boolean;
   /** Number of files to sample for verification. Default: 5 */
   samples?: number;
-  /** Minimum confidence score to pass. Default: 0.7 */
+  /** Minimum confidence score to pass. Default: 0.5 */
   threshold?: number;
   /** Only verify specific domains */
   domains?: string[];
@@ -179,8 +181,12 @@ export interface DriftApiOptions extends BaseOptions {
   llmEnhanced?: boolean;
   /** LLM provider (required if llmEnhanced is true) */
   provider?: 'anthropic' | 'openai' | 'openai-compat' | 'gemini';
+  /** LLM model name (used when llmEnhanced is true) */
+  model?: string;
   /** Custom LLM API base URL */
   apiBase?: string;
+  /** Base URL for OpenAI-compatible endpoint (Ollama, Mistral, etc.) */
+  openaiCompatBaseUrl?: string;
   /** Enable/disable SSL certificate verification. Default: true */
   sslVerify?: boolean;
   /** Exit threshold severity. Default: 'warning' */

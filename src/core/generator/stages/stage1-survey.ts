@@ -5,6 +5,7 @@
  */
 
 import logger from '../../../utils/logger.js';
+import { STAGE1_MAX_TOKENS } from '../../../constants.js';
 import { formatSignatureMaps, STAGE1_MAX_CHARS } from '../../analyzer/signature-extractor.js';
 import type { LLMService } from '../../services/llm-service.js';
 import type { PipelineOptions, ProjectSurveyResult, StageResult } from '../../../types/pipeline.js';
@@ -77,7 +78,7 @@ ${fileListingSection}`;
       systemPrompt: PROMPTS.stage1_survey,
       userPrompt,
       temperature: 0.3,
-      maxTokens: 3000,
+      maxTokens: STAGE1_MAX_TOKENS,
     });
 
     const stageResult: StageResult<ProjectSurveyResult> = {

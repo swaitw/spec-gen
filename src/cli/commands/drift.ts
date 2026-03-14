@@ -6,9 +6,20 @@
  */
 
 import { Command } from 'commander';
-import { access, mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { fileExists, formatDuration, parseList } from '../../utils/command-helpers.js';
+import {
+  DEFAULT_DRIFT_MAX_FILES,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+  ARTIFACT_REPO_STRUCTURE,
+} from '../../constants.js';
 import type { DriftOptions, DriftIssue, DriftResult, DriftSeverity } from '../../types/index.js';
 import { readSpecGenConfig } from '../../core/services/config-manager.js';
 import {
@@ -30,27 +41,6 @@ import type { LLMService } from '../../core/services/llm-service.js';
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
-
-function parseList(value: string): string[] {
-  return value.split(',').map((s) => s.trim()).filter(Boolean);
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
 
 function severityLabel(severity: DriftSeverity): string {
   switch (severity) {
@@ -295,7 +285,7 @@ export const driftCommand = new Command('drift')
   .option(
     '--max-files <n>',
     'Maximum changed files to analyze',
-    '100'
+    String(DEFAULT_DRIFT_MAX_FILES)
   )
   .option(
     '--verbose',
@@ -346,14 +336,20 @@ Pre-commit hook:
       maxFiles: (() => {
         // Commander routes --max-files to parent when both parent and subcommand define it.
         // Check globalOpts first for the user-provided value, fall back to subcommand default.
-        const raw = globalOpts.maxFiles ?? options.maxFiles ?? '100';
+        const raw = globalOpts.maxFiles ?? options.maxFiles ?? String(DEFAULT_DRIFT_MAX_FILES);
         return typeof raw === 'string' ? parseInt(raw, 10) : raw;
       })(),
       verbose: options.verbose ?? globalOpts.verbose ?? false,
       quiet: globalOpts.quiet ?? false,
       noColor: globalOpts.color === false,
-      config: globalOpts.config ?? '.spec-gen/config.json',
+      config: globalOpts.config ?? SPEC_GEN_CONFIG_REL_PATH,
     };
+
+    if (isNaN(opts.maxFiles) || opts.maxFiles < 1) {
+      logger.error('--max-files must be a positive integer');
+      process.exitCode = 1;
+      return;
+    }
 
     // Validate failOn
     if (!['error', 'warning', 'info'].includes(opts.failOn)) {
@@ -420,7 +416,7 @@ Pre-commit hook:
             apiBase: globalOpts.apiBase ?? specGenConfig.llm?.apiBase,
             sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig.llm?.sslVerify ?? true,
             enableLogging: true,
-            logDir: join(rootPath, '.spec-gen', 'logs'),
+            logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
           });
           if (!opts.json) {
             logger.discovery(`LLM enabled (${provider}) — gap issues will be semantically analyzed`);
@@ -433,8 +429,8 @@ Pre-commit hook:
       }
 
       // Determine openspec path
-      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? 'openspec');
-      const specsPath = join(openspecPath, 'specs');
+      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+      const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
 
       // Check if specs exist
       if (!(await fileExists(specsPath))) {
@@ -501,7 +497,7 @@ Pre-commit hook:
       }
 
       // Check for repo-structure.json for enhanced mapping
-      const repoStructurePath = join(rootPath, '.spec-gen', 'analysis', 'repo-structure.json');
+      const repoStructurePath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
       const hasRepoStructure = await fileExists(repoStructurePath);
 
       if (!hasRepoStructure && !opts.json) {
@@ -543,7 +539,7 @@ Pre-commit hook:
         changedFiles: gitResult.files,
         failOn: opts.failOn,
         domainFilter: opts.domains.length > 0 ? opts.domains : undefined,
-        openspecRelPath: specGenConfig.openspecPath ?? 'openspec',
+        openspecRelPath: specGenConfig.openspecPath ?? OPENSPEC_DIR,
         llm,
         baseRef: gitResult.resolvedBase,
         adrMap: adrMap ?? undefined,
@@ -615,8 +611,8 @@ Pre-commit hook:
         }
         try {
           await llm.saveLogs();
-        } catch {
-          // Non-fatal — log saving is best-effort
+        } catch (logErr) {
+          logger.debug(`LLM log save skipped: ${(logErr as Error).message}`);
         }
       }
 

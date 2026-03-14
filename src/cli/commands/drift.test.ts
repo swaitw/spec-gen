@@ -291,4 +291,35 @@ describe('drift command', () => {
       expect(parsed).toBe(50);
     });
   });
+
+  describe('--max-files input validation', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      process.exitCode = undefined;
+    });
+
+    it('rejects --max-files 0', async () => {
+      const { driftCommand } = await import('./drift.js');
+      const { logger } = await import('../../utils/logger.js');
+      await driftCommand.parseAsync(['--max-files', '0'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects --max-files -10', async () => {
+      const { driftCommand } = await import('./drift.js');
+      const { logger } = await import('../../utils/logger.js');
+      await driftCommand.parseAsync(['--max-files', '-10'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('rejects non-numeric --max-files', async () => {
+      const { driftCommand } = await import('./drift.js');
+      const { logger } = await import('../../utils/logger.js');
+      await driftCommand.parseAsync(['--max-files', 'abc'], { from: 'user' });
+      expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
+      expect(process.exitCode).toBe(1);
+    });
+  });
 });

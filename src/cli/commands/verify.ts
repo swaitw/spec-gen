@@ -6,9 +6,21 @@
  */
 
 import { Command } from 'commander';
-import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { fileExists, formatDuration, parseList, readJsonFile } from '../../utils/command-helpers.js';
+import {
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_LOGS_SUBDIR,
+  SPEC_GEN_VERIFICATION_SUBDIR,
+  SPEC_GEN_OUTPUTS_SUBDIR,
+  SPEC_GEN_CONFIG_REL_PATH,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_GENERATION_REPORT,
+} from '../../constants.js';
 import type { VerifyOptions } from '../../types/index.js';
 import { readSpecGenConfig } from '../../core/services/config-manager.js';
 import { createLLMService, type LLMService } from '../../core/services/llm-service.js';
@@ -35,36 +47,6 @@ interface ExtendedVerifyOptions extends VerifyOptions {
 // ============================================================================
 
 /**
- * Parse comma-separated list
- */
-function parseList(value: string): string[] {
-  return value.split(',').map((s) => s.trim()).filter(Boolean);
-}
-
-/**
- * Check if a file exists
- */
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Format time duration for display
- */
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-/**
  * Format score as bar
  */
 function formatScoreBar(score: number, width: number = 10): string {
@@ -87,12 +69,10 @@ function getStatusEmoji(score: number, threshold: number): string {
  */
 async function loadDependencyGraph(analysisPath: string): Promise<DependencyGraphResult | null> {
   try {
-    const depGraphPath = join(analysisPath, 'dependency-graph.json');
-    if (!(await fileExists(depGraphPath))) {
-      return null;
-    }
-    const content = await readFile(depGraphPath, 'utf-8');
-    return JSON.parse(content) as DependencyGraphResult;
+    return await readJsonFile<DependencyGraphResult>(
+      join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+      ARTIFACT_DEPENDENCY_GRAPH,
+    );
   } catch {
     return null;
   }
@@ -103,12 +83,10 @@ async function loadDependencyGraph(analysisPath: string): Promise<DependencyGrap
  */
 async function loadGenerationReport(rootPath: string): Promise<GenerationReport | null> {
   try {
-    const reportPath = join(rootPath, '.spec-gen', 'outputs', 'generation-report.json');
-    if (!(await fileExists(reportPath))) {
-      return null;
-    }
-    const content = await readFile(reportPath, 'utf-8');
-    return JSON.parse(content) as GenerationReport;
+    return await readJsonFile<GenerationReport>(
+      join(rootPath, SPEC_GEN_DIR, SPEC_GEN_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
+      ARTIFACT_GENERATION_REPORT,
+    );
   } catch {
     return null;
   }
@@ -229,7 +207,7 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
   console.log(`📝 Recommendation: ${recommendationIcon} ${recommendationText}`);
   console.log(`   ${recommendationDetail}`);
   console.log('');
-  console.log(`   Full report: .spec-gen/verification/REPORT.md`);
+  console.log(`   Full report: ${SPEC_GEN_DIR}/${SPEC_GEN_VERIFICATION_SUBDIR}/REPORT.md`);
   console.log('');
 }
 
@@ -317,12 +295,18 @@ A score >= threshold indicates specs are production-ready.
       json: options.json ?? false,
       quiet: false,
       noColor: false,
-      config: '.spec-gen/config.json',
+      config: SPEC_GEN_CONFIG_REL_PATH,
     };
 
+    if (isNaN(opts.samples) || opts.samples < 1) {
+      logger.error('--samples must be a positive integer');
+      process.exitCode = 1;
+      return;
+    }
+
     // Validate threshold range
-    if (opts.threshold < 0 || opts.threshold > 1) {
-      logger.error('Threshold must be between 0 and 1');
+    if (isNaN(opts.threshold) || opts.threshold < 0 || opts.threshold > 1) {
+      logger.error('Threshold must be a number between 0 and 1');
       process.exitCode = 1;
       return;
     }
@@ -344,8 +328,8 @@ A score >= threshold indicates specs are production-ready.
       }
 
       // Determine openspec path
-      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? 'openspec');
-      const specsPath = join(openspecPath, 'specs');
+      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+      const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
 
       // Check if specs exist
       if (!(await fileExists(specsPath))) {
@@ -363,7 +347,7 @@ A score >= threshold indicates specs are production-ready.
       const generationContext = generationReport?.filesWritten ?? [];
 
       // Load dependency graph
-      const analysisPath = join(rootPath, '.spec-gen', 'analysis');
+      const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
       const depGraph = await loadDependencyGraph(analysisPath);
 
       if (!depGraph) {
@@ -399,7 +383,7 @@ A score >= threshold indicates specs are production-ready.
           apiBase: globalOpts.apiBase ?? specGenConfig.llm?.apiBase,
           sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig.llm?.sslVerify ?? true,
           enableLogging: true,
-          logDir: join(rootPath, '.spec-gen', 'logs'),
+          logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
         });
       } catch (error) {
         logger.error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -410,7 +394,7 @@ A score >= threshold indicates specs are production-ready.
       // ========================================================================
       // PHASE 3: RUN VERIFICATION
       // ========================================================================
-      const verificationDir = join(rootPath, '.spec-gen', 'verification');
+      const verificationDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_VERIFICATION_SUBDIR);
 
       const engine = new SpecVerificationEngine(llm, {
         rootPath,

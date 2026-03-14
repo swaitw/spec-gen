@@ -21,6 +21,16 @@
  *   in_clone_group    — appears in a duplicate code clone group
  */
 
+import {
+  MAX_FAN_IN_SCORE_BOOST,
+  MAX_FAN_OUT_SCORE_BOOST,
+  REFACTOR_EXCESS_BASE_SCORE,
+  SRP_BASE_SCORE,
+  SRP_PER_REQUIREMENT_PENALTY,
+  CLONE_GROUP_MEMBERSHIP_SCORE,
+  SHALLOW_FUNCTION_DEPTH_MAX,
+  SHALLOW_FUNCTION_SCORE_BONUS,
+} from '../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from './call-graph.js';
 import type { DuplicateDetectionResult } from './duplicate-detector.js';
 
@@ -64,7 +74,7 @@ export type RefactorIssue =
   | 'high_fan_out'
   | 'multi_requirement'
   | 'in_cycle'
-  | 'in_clone_group';  // FIX: ajout du type manquant
+  | 'in_clone_group';
 
 export interface RefactorEntry {
   function: string;
@@ -431,27 +441,27 @@ function computePriorityScore(
 
   // High fan-in: score proportional to excess
   if (node.fanIn >= HIGH_FAN_IN) {
-    score += 2 + Math.min(3, (node.fanIn - HIGH_FAN_IN) / HIGH_FAN_IN);
+    score += REFACTOR_EXCESS_BASE_SCORE + Math.min(MAX_FAN_IN_SCORE_BOOST, (node.fanIn - HIGH_FAN_IN) / HIGH_FAN_IN);
   }
 
   // High fan-out: score proportional to excess
   if (node.fanOut >= HIGH_FAN_OUT) {
-    score += 2 + Math.min(3, (node.fanOut - HIGH_FAN_OUT) / HIGH_FAN_OUT);
+    score += REFACTOR_EXCESS_BASE_SCORE + Math.min(MAX_FAN_OUT_SCORE_BOOST, (node.fanOut - HIGH_FAN_OUT) / HIGH_FAN_OUT);
   }
 
   // SRP violation: +1 per requirement above threshold
   if (reqCount > SRP_MAX_REQUIREMENTS) {
-    score += 1.5 + (reqCount - SRP_MAX_REQUIREMENTS) * 0.5;
+    score += SRP_BASE_SCORE + (reqCount - SRP_MAX_REQUIREMENTS) * SRP_PER_REQUIREMENT_PENALTY;
   }
 
   // Cycles: +2 per cycle participant
   if (sccSize > 1) score += 2;
 
-  // Clone groups: +1.5 per clone group membership
-  if (issues.includes('in_clone_group')) score += 1.5;
+  // Clone groups: per clone group membership
+  if (issues.includes('in_clone_group')) score += CLONE_GROUP_MEMBERSHIP_SCORE;
 
   // Depth bonus: shallower functions are more impactful to refactor
-  if (depth >= 0 && depth <= 2 && issues.length > 0) score += 0.5;
+  if (depth >= 0 && depth <= SHALLOW_FUNCTION_DEPTH_MAX && issues.length > 0) score += SHALLOW_FUNCTION_SCORE_BONUS;
 
   return Math.round(score * 10) / 10;
 }

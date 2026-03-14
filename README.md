@@ -22,6 +22,9 @@ spec-gen init       # Detect project type, create config
 spec-gen analyze    # Static analysis (no API key needed)
 spec-gen generate   # Generate specs (requires API key)
 spec-gen drift      # Check for spec drift
+
+# Troubleshoot setup issues
+spec-gen doctor     # Check environment and configuration
 ```
 
 <details>
@@ -416,6 +419,7 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
 | `spec-gen view` | Launch interactive graph & spec viewer in the browser | No |
 | `spec-gen mcp` | Start MCP server (stdio, for Cline / Claude Code) | No |
+| `spec-gen doctor` | Check environment and configuration for common issues | No |
 
 ### Global Options
 
@@ -489,6 +493,29 @@ spec-gen verify [options]
   --verbose              # Show detailed prediction vs actual comparison
   --json                 # JSON output
 ```
+
+### Doctor
+
+`spec-gen doctor` runs a self-diagnostic and surfaces actionable fixes when something is misconfigured or missing:
+
+```bash
+spec-gen doctor          # Run all checks
+spec-gen doctor --json   # JSON output for scripting
+```
+
+Checks performed:
+
+| Check | What it looks for |
+|-------|------------------|
+| Node.js version | ≥ 20 required |
+| Git repository | `.git` directory and `git` binary on PATH |
+| spec-gen config | `.spec-gen/config.json` exists and is parseable |
+| Analysis artifacts | `repo-structure.json` freshness (warns if >24h old) |
+| OpenSpec directory | `openspec/specs/` exists |
+| LLM provider | API key or `claude` CLI detected |
+| Disk space | Warns < 500 MB, fails < 200 MB |
+
+Run `spec-gen doctor` whenever setup instructions aren't working — it tells you exactly what to fix and how.
 
 ## MCP Server
 
@@ -1053,10 +1080,43 @@ console.log(`Analyzed ${analysis.repoMap.summary.analyzedFiles} files`);
 | `specGenVerify(options?)` | Verify spec accuracy | Yes |
 | `specGenDrift(options?)` | Detect spec-to-code drift | No* |
 | `specGenRun(options?)` | Full pipeline: init + analyze + generate | Yes |
+| `specGenGetSpecRequirements(options?)` | Read requirement blocks from generated specs | No |
 
 \* `specGenDrift` requires an API key only when `llmEnhanced: true`.
 
 All functions accept an optional `onProgress` callback for status updates and throw errors instead of calling `process.exit`. See [src/api/types.ts](src/api/types.ts) for full option and result type definitions.
+
+### Error handling
+
+All API functions throw `Error` on failure. Wrap calls in try-catch for production use:
+
+```typescript
+import { specGenRun } from 'spec-gen-cli';
+
+try {
+  const result = await specGenRun({ rootPath: '/path/to/project' });
+  console.log(`Done — ${result.generation.report.filesWritten.length} specs written`);
+} catch (err) {
+  if ((err as Error).message.includes('API key')) {
+    console.error('Set ANTHROPIC_API_KEY or OPENAI_API_KEY');
+  } else {
+    console.error('spec-gen failed:', (err as Error).message);
+  }
+}
+```
+
+### Reading generated spec requirements
+
+After running `specGenGenerate`, you can programmatically query the requirement-to-function mapping:
+
+```typescript
+import { specGenGetSpecRequirements } from 'spec-gen-cli';
+
+const { requirements } = await specGenGetSpecRequirements({ rootPath: '/path/to/project' });
+for (const [key, req] of Object.entries(requirements)) {
+  console.log(`${key}: ${req.title} (${req.specFile})`);
+}
+```
 
 ## Examples
 

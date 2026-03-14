@@ -7,6 +7,18 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import {
+  DEFAULT_MAX_FILES,
+  DEFAULT_DRIFT_MAX_FILES,
+  TOP_REFACTOR_ISSUES_LIMIT,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_ANALYSIS_REL_PATH,
+  OPENSPEC_DIR,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_MAPPING,
+  ARTIFACT_REPO_STRUCTURE,
+} from '../../../constants.js';
 import { runAnalysis } from '../../../cli/commands/analyze.js';
 import { analyzeForRefactoring } from '../../analyzer/refactor-analyzer.js';
 import { formatSignatureMaps } from '../../analyzer/signature-extractor.js';
@@ -37,14 +49,14 @@ export async function handleAnalyzeCodebase(
   force: boolean
 ): Promise<Record<string, unknown>> {
   const absDir = await validateDirectory(directory);
-  const outputPath = join(absDir, '.spec-gen', 'analysis');
+  const outputPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
   if (!force && await isCacheFresh(absDir)) {
     const ctx = await readCachedContext(absDir);
     if (ctx) {
       const cg = ctx.callGraph;
       const topRefactorIssues = cg
-        ? analyzeForRefactoring(cg as SerializedCallGraph).priorities.slice(0, 10).map(e => ({
+        ? analyzeForRefactoring(cg as SerializedCallGraph).priorities.slice(0, TOP_REFACTOR_ISSUES_LIMIT).map(e => ({
             function: e.function, file: e.file, issues: e.issues, priorityScore: e.priorityScore,
           }))
         : [];
@@ -56,13 +68,13 @@ export async function handleAnalyzeCodebase(
               layerViolations: cg.layerViolations.length }
           : null,
         topRefactorIssues,
-        analysisPath: join('.spec-gen', 'analysis'),
+        analysisPath: SPEC_GEN_ANALYSIS_REL_PATH,
       };
     }
   }
 
   const result = await runAnalysis(absDir, outputPath, {
-    maxFiles: 500,
+    maxFiles: DEFAULT_MAX_FILES,
     include: [],
     exclude: [],
   });
@@ -74,7 +86,7 @@ export async function handleAnalyzeCodebase(
   let topRefactorIssues: unknown[] = [];
   if (cg) {
     const report = analyzeForRefactoring(cg as SerializedCallGraph);
-    topRefactorIssues = report.priorities.slice(0, 10).map(e => ({
+    topRefactorIssues = report.priorities.slice(0, TOP_REFACTOR_ISSUES_LIMIT).map(e => ({
       function: e.function,
       file: e.file,
       issues: e.issues,
@@ -107,7 +119,7 @@ export async function handleAnalyzeCodebase(
       : null,
     domains: rs.domains.map((d: { name: string }) => d.name),
     topRefactorIssues,
-    analysisPath: join('.spec-gen', 'analysis'),
+    analysisPath: SPEC_GEN_ANALYSIS_REL_PATH,
   };
 }
 
@@ -119,7 +131,7 @@ export async function handleGetArchitectureOverview(directory: string): Promise<
 
   let depGraph: import('../../analyzer/dependency-graph.js').DependencyGraphResult | null = null;
   try {
-    const raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'dependency-graph.json'), 'utf-8');
+    const raw = await readFile(join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH), 'utf-8');
     depGraph = JSON.parse(raw) as import('../../analyzer/dependency-graph.js').DependencyGraphResult;
   } catch { /* ignore */ }
 
@@ -156,7 +168,7 @@ export async function handleGetRefactorReport(directory: string): Promise<unknow
  */
 export async function handleGetDuplicateReport(directory: string): Promise<unknown> {
   const absDir = await validateDirectory(directory);
-  const cachePath = join(absDir, '.spec-gen', 'analysis', 'duplicates.json');
+  const cachePath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, 'duplicates.json');
 
   let raw: string;
   try {
@@ -211,7 +223,7 @@ export async function handleGetMapping(
   const absDir = await validateDirectory(directory);
   let raw: string;
   try {
-    raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'mapping.json'), 'utf-8');
+    raw = await readFile(join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MAPPING), 'utf-8');
   } catch {
     return { error: 'No mapping found. Run spec-gen generate first.' };
   }
@@ -251,7 +263,7 @@ export async function handleCheckSpecDrift(
   files: string[] = [],
   domains: string[] = [],
   failOn: 'error' | 'warning' | 'info' = 'warning',
-  maxFiles = 100
+  maxFiles = DEFAULT_DRIFT_MAX_FILES
 ): Promise<DriftResult | { error: string }> {
   const absDir = await validateDirectory(directory);
 
@@ -264,7 +276,7 @@ export async function handleCheckSpecDrift(
     return { error: 'No spec-gen configuration found. Run "spec-gen init" first.' };
   }
 
-  const openspecPath = join(absDir, specGenConfig.openspecPath ?? 'openspec');
+  const openspecPath = join(absDir, specGenConfig.openspecPath ?? OPENSPEC_DIR);
   const specsPath = join(openspecPath, 'specs');
   try {
     await stat(specsPath);
@@ -300,7 +312,7 @@ export async function handleCheckSpecDrift(
     gitResult.files = gitResult.files.slice(0, maxFiles);
   }
 
-  const repoStructurePath = join(absDir, '.spec-gen', 'analysis', 'repo-structure.json');
+  const repoStructurePath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
   let hasRepoStructure = false;
   try {
     await stat(repoStructurePath);
@@ -325,7 +337,7 @@ export async function handleCheckSpecDrift(
     changedFiles: gitResult.files,
     failOn,
     domainFilter: domains.length > 0 ? domains : undefined,
-    openspecRelPath: specGenConfig.openspecPath ?? 'openspec',
+    openspecRelPath: specGenConfig.openspecPath ?? OPENSPEC_DIR,
     baseRef: gitResult.resolvedBase,
     adrMap: adrMap ?? undefined,
   });

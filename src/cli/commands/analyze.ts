@@ -6,9 +6,27 @@
  */
 
 import { Command } from 'commander';
-import { access, stat, writeFile, mkdir } from 'node:fs/promises';
+import { stat, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { fileExists, formatDuration, formatAge } from '../../utils/command-helpers.js';
+import {
+  ANALYSIS_STALE_THRESHOLD_MS,
+  DEFAULT_MAX_FILES,
+  MAX_DEEP_ANALYSIS_FILES,
+  DEEP_ANALYSIS_FILE_RATIO,
+  MAX_VALIDATION_FILES,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+  SPEC_GEN_ANALYSIS_REL_PATH,
+  SPEC_GEN_CONFIG_REL_PATH,
+  OPENSPEC_DIR,
+  OPENSPEC_SPECS_SUBDIR,
+  ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_DEPENDENCY_GRAPH,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_REFACTOR_PRIORITIES,
+} from '../../constants.js';
 import type { AnalyzeOptions, SpecGenConfig } from '../../types/index.js';
 import { readSpecGenConfig } from '../../core/services/config-manager.js';
 import { RepositoryMapper, type RepositoryMap } from '../../core/analyzer/repository-mapper.js';
@@ -56,44 +74,11 @@ function collect(value: string, previous: string[]): string[] {
 }
 
 /**
- * Check if a file exists
- */
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Format time duration for display
- */
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-/**
- * Format age in human-readable form
- */
-function formatAge(ms: number): string {
-  if (ms < 60000) return 'just now';
-  if (ms < 3600000) return `${Math.floor(ms / 60000)} minutes ago`;
-  if (ms < 86400000) return `${Math.floor(ms / 3600000)} hours ago`;
-  return `${Math.floor(ms / 86400000)} days ago`;
-}
-
-/**
  * Check if analysis exists and return its age
  */
 async function getAnalysisAge(outputPath: string): Promise<number | null> {
   try {
-    const repoStructurePath = join(outputPath, 'repo-structure.json');
+    const repoStructurePath = join(outputPath, ARTIFACT_REPO_STRUCTURE);
     if (!(await fileExists(repoStructurePath))) {
       return null;
     }
@@ -169,15 +154,15 @@ export async function runAnalysis(
   const artifactGenerator = new AnalysisArtifactGenerator({
     rootDir: rootPath,
     outputDir: outputPath,
-    maxDeepAnalysisFiles: Math.min(20, Math.ceil(repoMap.highValueFiles.length * 0.3)),
-    maxValidationFiles: 5,
+    maxDeepAnalysisFiles: Math.min(MAX_DEEP_ANALYSIS_FILES, Math.ceil(repoMap.highValueFiles.length * DEEP_ANALYSIS_FILE_RATIO)),
+    maxValidationFiles: MAX_VALIDATION_FILES,
   });
 
   const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
 
   // Also save the raw dependency graph
   await writeFile(
-    join(outputPath, 'dependency-graph.json'),
+    join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
     JSON.stringify(depGraph, null, 2)
   );
 
@@ -195,7 +180,7 @@ export const analyzeCommand = new Command('analyze')
   .option(
     '--output <path>',
     'Directory to write analysis results',
-    '.spec-gen/analysis/'
+    `${SPEC_GEN_ANALYSIS_REL_PATH}/`
   )
   .option(
     '--max-files <n>',
@@ -262,10 +247,10 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
     const rootPath = process.cwd();
 
     const opts: ExtendedAnalyzeOptions = {
-      output: options.output ?? '.spec-gen/analysis/',
+      output: options.output ?? `${SPEC_GEN_ANALYSIS_REL_PATH}/`,
       maxFiles: typeof options.maxFiles === 'string'
         ? parseInt(options.maxFiles, 10)
-        : options.maxFiles ?? 500,
+        : options.maxFiles ?? DEFAULT_MAX_FILES,
       include: options.include ?? [],
       exclude: options.exclude ?? [],
       force: options.force ?? false,
@@ -274,8 +259,14 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       quiet: false,
       verbose: false,
       noColor: false,
-      config: '.spec-gen/config.json',
+      config: SPEC_GEN_CONFIG_REL_PATH,
     };
+
+    if (isNaN(opts.maxFiles) || opts.maxFiles < 1) {
+      logger.error('--max-files must be a positive integer');
+      process.exitCode = 1;
+      return;
+    }
 
     try {
       // ========================================================================
@@ -327,16 +318,15 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       const analysisAge = await getAnalysisAge(outputPath);
 
       if (analysisAge !== null && !opts.force) {
-        // Analysis exists - check if recent (< 1 hour)
-        const oneHour = 60 * 60 * 1000;
-        if (analysisAge < oneHour) {
+        // Analysis exists - check if recent
+        if (analysisAge < ANALYSIS_STALE_THRESHOLD_MS) {
           logger.discovery(`Recent analysis exists (${formatAge(analysisAge)})`);
           logger.info('Tip', 'Use --force to re-analyze');
           logger.blank();
 
           // Show existing analysis stats
           try {
-            const repoStructurePath = join(outputPath, 'repo-structure.json');
+            const repoStructurePath = join(outputPath, ARTIFACT_REPO_STRUCTURE);
             const content = await import('node:fs/promises').then(fs =>
               fs.readFile(repoStructurePath, 'utf-8')
             );
@@ -349,8 +339,8 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
             logger.blank();
             logger.info('Next step', "Run 'spec-gen generate' to create OpenSpec files");
             return;
-          } catch {
-            // Continue with fresh analysis if we can't read existing
+          } catch (readErr) {
+            logger.debug(`Could not read existing analysis summary: ${(readErr as Error).message}`);
           }
         } else {
           logger.discovery(`Existing analysis is ${formatAge(analysisAge)} old, re-analyzing...`);
@@ -417,7 +407,7 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       // Refactor priorities (read from disk if available)
       try {
         const { readFile: rf } = await import('node:fs/promises');
-        const rp = JSON.parse(await rf(join(opts.output, 'refactor-priorities.json'), 'utf-8'));
+        const rp = JSON.parse(await rf(join(opts.output, ARTIFACT_REFACTOR_PRIORITIES), 'utf-8'));
         if (rp?.stats?.withIssues > 0) {
           const s = rp.stats;
           const badges = [
@@ -476,7 +466,9 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
           console.log(`    → ${opts.output}refactor-priorities.json`);
           console.log('');
         }
-      } catch { /* refactor-priorities.json not yet generated */ }
+      } catch (rpErr) {
+        logger.debug(`Refactor priorities not available: ${(rpErr as Error).message}`);
+      }
 
       // Duplicate code detection
       try {
@@ -525,7 +517,9 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
           console.log(`    → ${opts.output}duplicates.json`);
           console.log('');
         }
-      } catch { /* duplicates.json not yet generated */ }
+      } catch (dupErr) {
+        logger.debug(`Duplicates report not available: ${(dupErr as Error).message}`);
+      }
 
       // Detected domains
       if (artifacts.repoStructure.domains.length > 0) {
@@ -549,8 +543,8 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
         const overview = buildArchitectureOverview(depGraph, ctx, rootPath);
         await writeArchitectureMd(rootPath, overview);
         architectureMdWritten = true;
-      } catch {
-        // non-fatal — analysis still succeeded
+      } catch (archErr) {
+        logger.debug(`ARCHITECTURE.md generation skipped: ${(archErr as Error).message}`);
       }
 
       // Files generated
@@ -641,7 +635,6 @@ async function runSpecIndexing(
   outputPath: string,
   specGenConfig: SpecGenConfig | null
 ): Promise<void> {
-  const { existsSync } = await import('node:fs');
   const { join: pathJoin } = await import('node:path');
   const { SpecVectorIndex } = await import('../../core/analyzer/spec-vector-index.js');
   const { readSpecGenConfig } = await import('../../core/services/config-manager.js');
@@ -659,9 +652,9 @@ async function runSpecIndexing(
   }
 
   // Locate specs directory
-  const specsDir = pathJoin(rootPath, 'openspec', 'specs');
-  if (!existsSync(specsDir)) {
-    console.log('    ℹ No openspec/specs/ directory found — spec index skipped');
+  const specsDir = pathJoin(rootPath, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
+  if (!(await fileExists(specsDir))) {
+    console.log(`    ℹ No ${OPENSPEC_DIR}/${OPENSPEC_SPECS_SUBDIR}/ directory found — spec index skipped`);
     return;
   }
 

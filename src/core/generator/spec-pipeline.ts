@@ -8,6 +8,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import logger from '../../utils/logger.js';
+import { SKELETON_EXCERPT_MAX_CHARS } from '../../constants.js';
 import type { ProgressIndicator } from '../../utils/progress.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { RepoStructure, LLMContext } from '../analyzer/artifact-generator.js';
@@ -353,10 +354,9 @@ export class SpecGenerationPipeline implements PipelineContext {
     const skeleton = getSkeletonContent(content, language);
 
     if (isSkeletonWorthIncluding(content, skeleton)) {
-      // Cap skeleton at 4000 chars to avoid overwhelming the prompt
-      const cap = 4000;
-      const skeletonExcerpt = skeleton.length > cap
-        ? skeleton.slice(0, cap) + '\n... [skeleton truncated]'
+      // Cap skeleton to avoid overwhelming the prompt
+      const skeletonExcerpt = skeleton.length > SKELETON_EXCERPT_MAX_CHARS
+        ? skeleton.slice(0, SKELETON_EXCERPT_MAX_CHARS) + '\n... [skeleton truncated]'
         : skeleton;
       return `${graphSection}\n\nFunction skeleton (logs/comments stripped):\n${skeletonExcerpt}`;
     }

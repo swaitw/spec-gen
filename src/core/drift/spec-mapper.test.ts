@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR } from '../../constants.js';
 import {
   parseSpecHeader,
   parseSpecReferences,
@@ -347,7 +348,7 @@ describe('buildSpecMap', () => {
     const map = await buildSpecMap({ rootPath: tempDir, openspecPath });
 
     const authMapping = map.byDomain.get('auth');
-    expect(authMapping!.specPath).toBe(join('openspec', 'specs', 'auth', 'spec.md'));
+    expect(authMapping!.specPath).toBe(join(OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, 'auth', 'spec.md'));
   });
 
   it('should produce correct relative spec paths for custom openspec directory', async () => {

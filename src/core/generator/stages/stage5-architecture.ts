@@ -4,6 +4,7 @@
  * Synthesizes architecture overview from previous analysis results.
  */
 
+import { STAGE5_MAX_TOKENS, STAGE5_HUB_FUNCTIONS_LIMIT, STAGE5_ENTRY_POINTS_LIMIT, STAGE5_VIOLATIONS_LIMIT } from '../../../constants.js';
 import { PROMPTS } from '../prompts.js';
 import type {
   ArchitectureSynthesis,
@@ -47,18 +48,18 @@ ${depGraph ? `Dependency Graph:
 
 Call Graph (static analysis — ${callGraph.stats.totalNodes} functions, ${callGraph.stats.totalEdges} internal calls):
 ${callGraph.hubFunctions.length > 0 ? `Hub functions (called by many others — likely integration points):
-${callGraph.hubFunctions.slice(0, 8).map(n => `- ${n.name} (${n.filePath}, fanIn=${n.fanIn}, fanOut=${n.fanOut}${n.className ? `, class=${n.className}` : ''})`).join('\n')}` : ''}
+${callGraph.hubFunctions.slice(0, STAGE5_HUB_FUNCTIONS_LIMIT).map(n => `- ${n.name} (${n.filePath}, fanIn=${n.fanIn}, fanOut=${n.fanOut}${n.className ? `, class=${n.className}` : ''})`).join('\n')}` : ''}
 ${callGraph.entryPoints.length > 0 ? `\nEntry points (no internal callers — likely public API or CLI handlers):
-${callGraph.entryPoints.slice(0, 8).map(n => `- ${n.name} (${n.filePath}${n.isAsync ? ', async' : ''})`).join('\n')}` : ''}
+${callGraph.entryPoints.slice(0, STAGE5_ENTRY_POINTS_LIMIT).map(n => `- ${n.name} (${n.filePath}${n.isAsync ? ', async' : ''})`).join('\n')}` : ''}
 ${callGraph.layerViolations.length > 0 ? `\nLayer violations detected:
-${callGraph.layerViolations.slice(0, 5).map(v => `- ${v.reason}`).join('\n')}` : ''}` : ''}`;
+${callGraph.layerViolations.slice(0, STAGE5_VIOLATIONS_LIMIT).map(v => `- ${v.reason}`).join('\n')}` : ''}` : ''}`;
 
   try {
     const result = await pipeline.llm.completeJSON<ArchitectureSynthesis>({
       systemPrompt: PROMPTS.stage5_architecture(survey),
       userPrompt,
       temperature: 0.3,
-      maxTokens: 3000,
+      maxTokens: STAGE5_MAX_TOKENS,
     });
 
     const stageResult: StageResult<ArchitectureSynthesis> = {

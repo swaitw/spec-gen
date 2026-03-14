@@ -9,6 +9,7 @@ import { readFile, writeFile, mkdir, access, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import logger from '../../utils/logger.js';
+import { OPENSPEC_DIR, OPENSPEC_CONFIG_FILENAME } from '../../constants.js';
 import type { ProjectSurveyResult } from './spec-pipeline.js';
 
 // ============================================================================
@@ -336,8 +337,8 @@ export class OpenSpecConfigManager {
   private openspecRoot: string;
 
   constructor(projectRoot: string) {
-    this.openspecRoot = join(projectRoot, 'openspec');
-    this.configPath = join(this.openspecRoot, 'config.yaml');
+    this.openspecRoot = join(projectRoot, OPENSPEC_DIR);
+    this.configPath = join(this.openspecRoot, OPENSPEC_CONFIG_FILENAME);
   }
 
   /**

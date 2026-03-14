@@ -8,6 +8,7 @@
  */
 
 import { Command } from 'commander';
+import { createRequire } from 'node:module';
 import { initCommand } from './commands/init.js';
 import { analyzeCommand } from './commands/analyze.js';
 import { generateCommand } from './commands/generate.js';
@@ -16,19 +17,37 @@ import { driftCommand } from './commands/drift.js';
 import { runCommand } from './commands/run.js';
 import { mcpCommand } from './commands/mcp.js';
 import { viewCommand } from './commands/view.js';
+import { doctorCommand } from './commands/doctor.js';
 import { configureLogger } from '../utils/logger.js';
+
+// Read version from package.json at runtime so it never drifts from the published version
+const require = createRequire(import.meta.url);
+const { version } = require('../../package.json') as { version: string };
 
 const program = new Command();
 
 // Hook to configure logger before any command runs
 program.hook('preAction', (thisCommand) => {
   const opts = thisCommand.opts();
+
   configureLogger({
     quiet: opts.quiet ?? false,
     verbose: opts.verbose ?? false,
     noColor: opts.color === false,
     timestamps: process.env.CI === 'true' || opts.color === false,
   });
+
+  // Warn when SSL verification is disabled — it's a security trade-off
+  if (opts.insecure) {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    // Only print if we're not in quiet mode
+    if (!opts.quiet) {
+      process.stderr.write(
+        '\x1b[33m[warn]\x1b[0m --insecure: SSL certificate verification is disabled. ' +
+        'Only use this on trusted networks.\n'
+      );
+    }
+  }
 });
 
 program
@@ -38,7 +57,7 @@ program
       'Philosophy: "Archaeology over Creativity" — We extract the truth of what\n' +
       'code does, grounded in static analysis, not LLM hallucinations.'
   )
-  .version('1.1.0')
+  .version(version)
   .option('-q, --quiet', 'Minimal output (errors only)', false)
   .option('-v, --verbose', 'Show debug information', false)
   .option('--no-color', 'Disable colored output (also enables timestamps)')
@@ -55,9 +74,9 @@ Workflow:
   1. spec-gen init      Detect project type, create config
   2. spec-gen analyze   Scan codebase, build dependency graph
   3. spec-gen view      Review visually the dependency graph
-  3. spec-gen generate  Create OpenSpec files using LLM
-  4. spec-gen verify    Validate specs against source code
-  5. spec-gen drift     Detect when code outpaces specs
+  4. spec-gen generate  Create OpenSpec files using LLM
+  5. spec-gen verify    Validate specs against source code
+  6. spec-gen drift     Detect when code outpaces specs
 
 Quick start:
   $ cd your-project
@@ -68,6 +87,9 @@ Quick start:
 
 Or run the full pipeline at once:
   $ spec-gen run
+
+Troubleshoot your setup:
+  $ spec-gen doctor
 
 Output integrates with OpenSpec ecosystem:
   openspec/
@@ -93,5 +115,6 @@ program.addCommand(driftCommand);
 program.addCommand(runCommand);
 program.addCommand(mcpCommand);
 program.addCommand(viewCommand);
+program.addCommand(doctorCommand);
 
 program.parse();

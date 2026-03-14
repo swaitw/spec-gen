@@ -4,10 +4,20 @@
  * Handles reading/writing .spec-gen/config.json and openspec/config.yaml
  */
 
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import YAML from 'yaml';
 import type { ProjectType, SpecGenConfig } from '../../types/index.js';
+import { logger } from '../../utils/logger.js';
+import {
+  DEFAULT_MAX_FILES,
+  DEFAULT_ANTHROPIC_MODEL,
+  SPEC_GEN_DIR,
+  SPEC_GEN_CONFIG_FILENAME,
+  SPEC_GEN_CONFIG_REL_PATH,
+  OPENSPEC_CONFIG_FILENAME,
+} from '../../constants.js';
+import { fileExists } from '../../utils/command-helpers.js';
 
 /**
  * OpenSpec config.yaml structure
@@ -22,18 +32,6 @@ export interface OpenSpecConfig {
     sourceProject?: string;
   };
   [key: string]: unknown;
-}
-
-/**
- * Check if a file exists
- */
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -59,12 +57,12 @@ export function getDefaultConfig(projectType: ProjectType, openspecPath: string)
     projectType,
     openspecPath,
     analysis: {
-      maxFiles: 500,
+      maxFiles: DEFAULT_MAX_FILES,
       includePatterns: [],
       excludePatterns: [],
     },
     generation: {
-      model: 'claude-sonnet-4-20250514',
+      model: DEFAULT_ANTHROPIC_MODEL,
       domains: 'auto',
     },
     createdAt: new Date().toISOString(),
@@ -76,11 +74,18 @@ export function getDefaultConfig(projectType: ProjectType, openspecPath: string)
  * Read spec-gen configuration from .spec-gen/config.json
  */
 export async function readSpecGenConfig(rootPath: string): Promise<SpecGenConfig | null> {
-  const configPath = join(rootPath, '.spec-gen', 'config.json');
+  const configPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_CONFIG_FILENAME);
+  let content: string;
   try {
-    const content = await readFile(configPath, 'utf-8');
-    return JSON.parse(content) as SpecGenConfig;
+    content = await readFile(configPath, 'utf-8');
   } catch {
+    return null; // File doesn't exist — normal case before init
+  }
+  try {
+    return JSON.parse(content) as SpecGenConfig;
+  } catch (err) {
+    logger.warning(`Failed to parse ${configPath}: ${(err as Error).message}`);
+    logger.warning(`Delete ${SPEC_GEN_CONFIG_REL_PATH} and run 'spec-gen init' to recreate it.`);
     return null;
   }
 }
@@ -92,8 +97,8 @@ export async function writeSpecGenConfig(
   rootPath: string,
   config: SpecGenConfig
 ): Promise<void> {
-  const configDir = join(rootPath, '.spec-gen');
-  const configPath = join(configDir, 'config.json');
+  const configDir = join(rootPath, SPEC_GEN_DIR);
+  const configPath = join(configDir, SPEC_GEN_CONFIG_FILENAME);
 
   await ensureDir(configDir);
   await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
@@ -103,18 +108,24 @@ export async function writeSpecGenConfig(
  * Check if spec-gen config already exists
  */
 export async function specGenConfigExists(rootPath: string): Promise<boolean> {
-  return fileExists(join(rootPath, '.spec-gen', 'config.json'));
+  return fileExists(join(rootPath, SPEC_GEN_DIR, SPEC_GEN_CONFIG_FILENAME));
 }
 
 /**
  * Read OpenSpec config.yaml if it exists
  */
 export async function readOpenSpecConfig(openspecPath: string): Promise<OpenSpecConfig | null> {
-  const configPath = join(openspecPath, 'config.yaml');
+  const configPath = join(openspecPath, OPENSPEC_CONFIG_FILENAME);
+  let content: string;
   try {
-    const content = await readFile(configPath, 'utf-8');
-    return YAML.parse(content) as OpenSpecConfig;
+    content = await readFile(configPath, 'utf-8');
   } catch {
+    return null; // File doesn't exist — normal case before generate
+  }
+  try {
+    return YAML.parse(content) as OpenSpecConfig;
+  } catch (err) {
+    logger.warning(`Failed to parse ${configPath}: ${(err as Error).message}`);
     return null;
   }
 }
@@ -126,7 +137,7 @@ export async function writeOpenSpecConfig(
   openspecPath: string,
   config: OpenSpecConfig
 ): Promise<void> {
-  const configPath = join(openspecPath, 'config.yaml');
+  const configPath = join(openspecPath, OPENSPEC_CONFIG_FILENAME);
 
   await ensureDir(openspecPath);
   await writeFile(configPath, YAML.stringify(config), 'utf-8');
@@ -143,7 +154,7 @@ export async function openspecDirExists(openspecPath: string): Promise<boolean> 
  * Check if openspec/config.yaml exists
  */
 export async function openspecConfigExists(openspecPath: string): Promise<boolean> {
-  return fileExists(join(openspecPath, 'config.yaml'));
+  return fileExists(join(openspecPath, OPENSPEC_CONFIG_FILENAME));
 }
 
 /**

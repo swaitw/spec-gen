@@ -8,6 +8,26 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import logger from '../../utils/logger.js';
+import {
+  CLAUDE_MAX_CONTEXT_TOKENS,
+  CLAUDE_MAX_OUTPUT_TOKENS,
+  MISTRAL_VIBE_MAX_CONTEXT_TOKENS,
+  MISTRAL_VIBE_MAX_OUTPUT_TOKENS,
+  LLM_CLI_MAX_BUFFER_BYTES,
+  LLM_CLI_TIMEOUT_MS,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_OPENAI_MODEL,
+  DEFAULT_OPENAI_COMPAT_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_LLM_MAX_RETRIES,
+  DEFAULT_LLM_INITIAL_DELAY_MS,
+  DEFAULT_LLM_MAX_DELAY_MS,
+  DEFAULT_LLM_TIMEOUT_MS,
+  DEFAULT_LLM_COST_WARNING_THRESHOLD,
+  CONTEXT_LIMIT_WARNING_RATIO,
+  SPEC_GEN_DIR,
+  SPEC_GEN_LOGS_SUBDIR,
+} from '../../constants.js';
 
 // ============================================================================
 // CLAUDE CODE PROVIDER (uses local `claude` CLI, no API key required)
@@ -22,8 +42,8 @@ import logger from '../../utils/logger.js';
  */
 export class ClaudeCodeProvider implements LLMProvider {
   name = 'claude-code';
-  maxContextTokens = 200_000;
-  maxOutputTokens = 16_000;
+  maxContextTokens = CLAUDE_MAX_CONTEXT_TOKENS;
+  maxOutputTokens = CLAUDE_MAX_OUTPUT_TOKENS;
   private model: string | undefined;
 
   constructor(model?: string) {
@@ -55,8 +75,8 @@ export class ClaudeCodeProvider implements LLMProvider {
     try {
       raw = execFileSync('claude', args, {
         encoding: 'utf8',
-        maxBuffer: 50 * 1024 * 1024, // 50 MB
-        timeout: 300_000,             // 5 minutes
+        maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+        timeout: LLM_CLI_TIMEOUT_MS,
         env,
       });
     } catch (err: unknown) {
@@ -106,8 +126,8 @@ export class ClaudeCodeProvider implements LLMProvider {
  */
 export class MistralVibeProvider implements LLMProvider {
   name = 'mistral-vibe';
-  maxContextTokens = 128_000;
-  maxOutputTokens = 4_096;
+  maxContextTokens = MISTRAL_VIBE_MAX_CONTEXT_TOKENS;
+  maxOutputTokens = MISTRAL_VIBE_MAX_OUTPUT_TOKENS;
   private model: string | undefined;
 
   constructor(model?: string) {
@@ -134,8 +154,8 @@ export class MistralVibeProvider implements LLMProvider {
     try {
       raw = execFileSync(mistralVibeBin, args, {
         encoding: 'utf8',
-        maxBuffer: 50 * 1024 * 1024, // 50 MB
-        timeout: 300_000,             // 5 minutes
+        maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+        timeout: LLM_CLI_TIMEOUT_MS,
       });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
@@ -518,7 +538,7 @@ export class AnthropicProvider implements LLMProvider {
   private model: string;
   private baseUrl: string;
 
-  constructor(apiKey: string, model = 'claude-sonnet-4-20250514', baseUrl?: string, sslVerify = true) {
+  constructor(apiKey: string, model = DEFAULT_ANTHROPIC_MODEL, baseUrl?: string, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl ? normalizeApiBase(baseUrl) : 'https://api.anthropic.com/v1';
@@ -606,7 +626,7 @@ export class OpenAIProvider implements LLMProvider {
   private model: string;
   private baseUrl: string;
 
-  constructor(apiKey: string, model = 'gpt-4o', baseUrl?: string, sslVerify = true) {
+  constructor(apiKey: string, model = DEFAULT_OPENAI_MODEL, baseUrl?: string, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl ? normalizeApiBase(baseUrl) : 'https://api.openai.com/v1';
@@ -701,9 +721,9 @@ export class OpenAICompatibleProvider implements LLMProvider {
   private model: string;
   private baseUrl: string;
 
-  constructor(apiKey: string, baseUrl: string, model = 'mistral-large-latest') {
+  constructor(apiKey: string, baseUrl: string, model = DEFAULT_OPENAI_COMPAT_MODEL) {
     this.apiKey = apiKey;
-    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.baseUrl = normalizeApiBase(baseUrl);
     this.model = model;
   }
 
@@ -874,7 +894,7 @@ export class GeminiProvider implements LLMProvider {
   private model: string;
   private baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-  constructor(apiKey: string, model = 'gemini-2.0-flash') {
+  constructor(apiKey: string, model = DEFAULT_GEMINI_MODEL) {
     this.apiKey = apiKey;
     this.model = model;
   }
@@ -1043,12 +1063,12 @@ export class LLMService {
       apiBase: options.apiBase ?? '',
       sslVerify: options.sslVerify ?? true,
       openaiCompatBaseUrl: options.openaiCompatBaseUrl ?? '',
-      maxRetries: options.maxRetries ?? 3,
-      initialDelay: options.initialDelay ?? 1000,
-      maxDelay: options.maxDelay ?? 30000,
-      timeout: options.timeout ?? 120000,
-      costWarningThreshold: options.costWarningThreshold ?? 10.0,
-      logDir: options.logDir ?? '.spec-gen/logs',
+      maxRetries: options.maxRetries ?? DEFAULT_LLM_MAX_RETRIES,
+      initialDelay: options.initialDelay ?? DEFAULT_LLM_INITIAL_DELAY_MS,
+      maxDelay: options.maxDelay ?? DEFAULT_LLM_MAX_DELAY_MS,
+      timeout: options.timeout ?? DEFAULT_LLM_TIMEOUT_MS,
+      costWarningThreshold: options.costWarningThreshold ?? DEFAULT_LLM_COST_WARNING_THRESHOLD,
+      logDir: options.logDir ?? `${SPEC_GEN_DIR}/${SPEC_GEN_LOGS_SUBDIR}`,
       enableLogging: options.enableLogging ?? false,
     };
     this.retryConfig = {
@@ -1112,7 +1132,7 @@ export class LLMService {
     const maxTokens = request.maxTokens ?? this.provider.maxOutputTokens;
     const totalExpected = inputTokens + maxTokens;
 
-    if (totalExpected > this.provider.maxContextTokens * 0.9) {
+    if (totalExpected > this.provider.maxContextTokens * CONTEXT_LIMIT_WARNING_RATIO) {
       logger.warning(`Approaching context limit: ${totalExpected} tokens (max: ${this.provider.maxContextTokens})`);
     }
 
@@ -1250,17 +1270,16 @@ export class LLMService {
    * Execute request with timeout
    */
   private async executeWithTimeout(request: CompletionRequest): Promise<CompletionResponse> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.retryConfig.timeout);
+    const timeoutMs = this.retryConfig.timeout;
 
-    try {
-      // Note: fetch doesn't use AbortController in this simple implementation
-      // In production, you'd pass the signal to the provider
-      const response = await this.provider.generateCompletion(request);
-      return response;
-    } finally {
-      clearTimeout(timeoutId);
-    }
+    const result = await Promise.race([
+      this.provider.generateCompletion(request),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`LLM request timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+
+    return result;
   }
 
   /**
@@ -1386,14 +1405,14 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
       throw new Error('ANTHROPIC_API_KEY environment variable is not set');
     }
     const apiBase = options.apiBase ?? process.env.ANTHROPIC_API_BASE ?? undefined;
-    provider = new AnthropicProvider(apiKey, options.model ?? 'claude-sonnet-4-20250514', apiBase, sslVerify);
+    provider = new AnthropicProvider(apiKey, options.model ?? DEFAULT_ANTHROPIC_MODEL, apiBase, sslVerify);
   } else if (providerName === 'openai') {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       throw new Error('OPENAI_API_KEY environment variable is not set');
     }
     const apiBase = options.apiBase ?? process.env.OPENAI_API_BASE ?? undefined;
-    provider = new OpenAIProvider(apiKey, options.model ?? 'gpt-4o', apiBase, sslVerify);
+    provider = new OpenAIProvider(apiKey, options.model ?? DEFAULT_OPENAI_MODEL, apiBase, sslVerify);
   } else if (providerName === 'openai-compat') {
     const apiKey = process.env.OPENAI_COMPAT_API_KEY;
     const baseUrl = options.openaiCompatBaseUrl ?? options.apiBase ?? process.env.OPENAI_COMPAT_BASE_URL;
@@ -1403,13 +1422,13 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
     if (!baseUrl) {
       throw new Error('openaiCompatBaseUrl must be set in config or OPENAI_COMPAT_BASE_URL env var (e.g. https://api.mistral.ai/v1)');
     }
-    provider = new OpenAICompatibleProvider(apiKey, baseUrl, options.model ?? 'mistral-large-latest');
+    provider = new OpenAICompatibleProvider(apiKey, baseUrl, options.model ?? DEFAULT_OPENAI_COMPAT_MODEL);
   } else if (providerName === 'gemini') {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error('GEMINI_API_KEY environment variable is not set');
     }
-    provider = new GeminiProvider(apiKey, options.model ?? 'gemini-2.0-flash');
+    provider = new GeminiProvider(apiKey, options.model ?? DEFAULT_GEMINI_MODEL);
   } else if (providerName === 'claude-code') {
     provider = new ClaudeCodeProvider(options.model);
   } else if (providerName === 'mistral-vibe') {

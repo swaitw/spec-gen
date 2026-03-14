@@ -453,9 +453,39 @@ describe('specGenGetSpecRequirements — malformed inputs', () => {
 // TESTS: barrel export
 // ============================================================================
 
-describe('specGenGetSpecRequirements — barrel export', () => {
-  it('is exported from index.js', async () => {
+describe('barrel exports from index.js', () => {
+  it('exports specGenGetSpecRequirements', async () => {
     const api = await import('./index.js');
     expect(typeof api.specGenGetSpecRequirements).toBe('function');
+  });
+
+  it('exports specGenInit', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenInit).toBe('function');
+  });
+
+  it('exports specGenAnalyze', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenAnalyze).toBe('function');
+  });
+
+  it('exports specGenGenerate', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenGenerate).toBe('function');
+  });
+
+  it('exports specGenRun', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenRun).toBe('function');
+  });
+
+  it('exports specGenVerify', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenVerify).toBe('function');
+  });
+
+  it('exports specGenDrift', async () => {
+    const api = await import('./index.js');
+    expect(typeof api.specGenDrift).toBe('function');
   });
 });

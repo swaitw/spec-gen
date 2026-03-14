@@ -8,6 +8,7 @@
 import { opendir, readFile, stat } from 'node:fs/promises';
 import { join, relative, basename, extname, dirname } from 'node:path';
 import ignoreModule from 'ignore';
+import { DEFAULT_MAX_FILES, SPEC_GEN_DIR, OPENSPEC_DIR } from '../../constants.js';
 const ignore = ignoreModule.default ?? ignoreModule;
 type Ignore = ReturnType<typeof ignore>;
 import type { FileMetadata, FileWalkerResult } from '../../types/index.js';
@@ -64,8 +65,8 @@ const SKIP_DIRECTORIES = new Set([
   '.idea',
   '.vscode',
   '.vs',
-  'openspec',
-  '.spec-gen',
+  OPENSPEC_DIR,
+  SPEC_GEN_DIR,
 ]);
 
 /**
@@ -374,7 +375,7 @@ export class FileWalker {
   constructor(rootPath: string, options: FileWalkerOptions = {}) {
     this.rootPath = rootPath;
     this.options = {
-      maxFiles: options.maxFiles ?? 500,
+      maxFiles: options.maxFiles ?? DEFAULT_MAX_FILES,
       includePatterns: options.includePatterns ?? [],
       excludePatterns: options.excludePatterns ?? [],
       onProgress: options.onProgress ?? (() => {}),

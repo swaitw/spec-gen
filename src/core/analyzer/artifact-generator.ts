@@ -7,6 +7,16 @@
 
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import {
+  TOKENS_PER_CHAR_DEFAULT,
+  PHASE2_FILE_CONTENT_MAX_CHARS,
+  PHASE3_FILE_CONTENT_MAX_CHARS,
+  DEPENDENCY_DIAGRAM_MAX_FILES,
+  ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_MAPPING,
+  ARTIFACT_REFACTOR_PRIORITIES,
+} from '../../constants.js';
 import type { ScoredFile, ProjectType } from '../../types/index.js';
 import type { RepositoryMap } from './repository-mapper.js';
 import type { DependencyGraphResult } from './dependency-graph.js';
@@ -172,6 +182,48 @@ export interface ArtifactGeneratorOptions {
   tokensPerChar?: number;
 }
 
+/**
+ * Convert a serialised RepoStructure (from repo-structure.json on disk) back
+ * to a minimal RepositoryMap-compatible object.  Only the fields that
+ * consumers of the cached-analysis path actually use are populated; the
+ * file-level arrays (`allFiles`, `highValueFiles`, etc.) are left empty
+ * because the original per-file data is not persisted to disk.
+ */
+export function repoStructureToRepoMap(rs: RepoStructure): RepositoryMap {
+  return {
+    metadata: {
+      projectName: rs.projectName,
+      projectType: (rs.projectType === 'node-typescript' ? 'nodejs' : rs.projectType) as import('../../types/index.js').ProjectType,
+      rootPath: '',
+      analyzedAt: '',
+      version: '',
+    },
+    summary: {
+      totalFiles: rs.statistics.totalFiles,
+      analyzedFiles: rs.statistics.analyzedFiles,
+      skippedFiles: rs.statistics.skippedFiles,
+      languages: [],
+      frameworks: rs.frameworks.map(name => ({
+        name,
+        category: 'other' as const,
+        confidence: 'medium' as const,
+        evidence: [],
+      })),
+      directories: [],
+    },
+    highValueFiles: [],
+    entryPoints: [],
+    schemaFiles: [],
+    configFiles: [],
+    clusters: {
+      byDirectory: {},
+      byDomain: {},
+      byLayer: { presentation: [], business: [], data: [], infrastructure: [] },
+    },
+    allFiles: [],
+  };
+}
+
 // ============================================================================
 // ARTIFACT GENERATOR
 // ============================================================================
@@ -188,7 +240,7 @@ export class AnalysisArtifactGenerator {
       outputDir: options.outputDir,
       maxDeepAnalysisFiles: options.maxDeepAnalysisFiles ?? 20,
       maxValidationFiles: options.maxValidationFiles ?? 5,
-      tokensPerChar: options.tokensPerChar ?? 0.25, // ~4 chars per token
+      tokensPerChar: options.tokensPerChar ?? TOKENS_PER_CHAR_DEFAULT,
     };
   }
 
@@ -228,7 +280,7 @@ export class AnalysisArtifactGenerator {
     // Save each artifact
     await Promise.all([
       writeFile(
-        join(this.options.outputDir, 'repo-structure.json'),
+        join(this.options.outputDir, ARTIFACT_REPO_STRUCTURE),
         JSON.stringify(artifacts.repoStructure, null, 2)
       ),
       writeFile(
@@ -240,7 +292,7 @@ export class AnalysisArtifactGenerator {
         artifacts.dependencyDiagram
       ),
       writeFile(
-        join(this.options.outputDir, 'llm-context.json'),
+        join(this.options.outputDir, ARTIFACT_LLM_CONTEXT),
         JSON.stringify(artifacts.llmContext, null, 2)
       ),
     ]);
@@ -816,8 +868,8 @@ export class AnalysisArtifactGenerator {
     // Use the built-in Mermaid converter with clustering
     const lines: string[] = ['```mermaid'];
 
-    // Generate diagram with top 30 files
-    const mermaid = toMermaidFormat(depGraph, 30);
+    // Generate diagram with top files
+    const mermaid = toMermaidFormat(depGraph, DEPENDENCY_DIAGRAM_MAX_FILES);
     lines.push(mermaid);
 
     lines.push('```');
@@ -837,7 +889,7 @@ export class AnalysisArtifactGenerator {
       purpose: 'Initial project categorization',
       files: [
         {
-          path: 'repo-structure.json',
+          path: ARTIFACT_REPO_STRUCTURE,
           tokens: 2000, // Estimate
         },
       ],
@@ -857,7 +909,7 @@ export class AnalysisArtifactGenerator {
         const tokens = Math.ceil(content.length * this.options.tokensPerChar);
         phase2Files.push({
           path: file.path,
-          content: content.slice(0, 10000), // Limit content size
+          content: content.slice(0, PHASE2_FILE_CONTENT_MAX_CHARS),
           tokens,
         });
       } catch {
@@ -895,7 +947,7 @@ export class AnalysisArtifactGenerator {
         const tokens = Math.ceil(content.length * this.options.tokensPerChar);
         phase3Files.push({
           path: file.path,
-          content: content.slice(0, 5000),
+          content: content.slice(0, PHASE3_FILE_CONTENT_MAX_CHARS),
           tokens,
         });
       } catch {
@@ -965,7 +1017,7 @@ export class AnalysisArtifactGenerator {
     // Refactoring priorities (structural — enriched after generate)
     let mappings: import('./refactor-analyzer.js').MappingEntry[] | undefined;
     try {
-      const mappingRaw = await readFile(join(this.options.outputDir, 'mapping.json'), 'utf-8');
+      const mappingRaw = await readFile(join(this.options.outputDir, ARTIFACT_MAPPING), 'utf-8');
       const mappingJson = JSON.parse(mappingRaw);
       mappings = mappingJson.mappings as import('./refactor-analyzer.js').MappingEntry[];
     } catch {
@@ -976,7 +1028,7 @@ export class AnalysisArtifactGenerator {
     // Save refactor priorities
     try {
       await writeFile(
-        join(this.options.outputDir, 'refactor-priorities.json'),
+        join(this.options.outputDir, ARTIFACT_REFACTOR_PRIORITIES),
         JSON.stringify(refactorReport, null, 2)
       );
     } catch {

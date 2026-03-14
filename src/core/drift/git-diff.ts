@@ -10,6 +10,8 @@ import { access } from 'node:fs/promises';
 import { join, extname, basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { ChangedFile } from '../../types/index.js';
+import { logger } from '../../utils/logger.js';
+import { DIFF_MAX_CHARS } from '../../constants.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -142,7 +144,8 @@ export async function getCurrentBranch(rootPath: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: rootPath });
     return stdout.trim();
-  } catch {
+  } catch (err) {
+    logger.debug(`Could not get current branch: ${(err as Error).message}`);
     return 'unknown';
   }
 }
@@ -169,8 +172,8 @@ export async function resolveBaseRef(rootPath: string, preferredRef: string): Pr
     try {
       await execFileAsync('git', ['rev-parse', '--verify', preferredRef], { cwd: rootPath });
       return preferredRef;
-    } catch {
-      // Fall through to defaults
+    } catch (err) {
+      logger.debug(`Preferred ref "${preferredRef}" not found: ${(err as Error).message}`);
     }
   }
 
@@ -188,9 +191,10 @@ export async function resolveBaseRef(rootPath: string, preferredRef: string): Pr
   try {
     await execFileAsync('git', ['rev-parse', '--verify', 'HEAD~1'], { cwd: rootPath });
     return 'HEAD~1';
-  } catch {
+  } catch (err) {
     // Single-commit repo or detached HEAD with no parent — use the empty tree SHA
     // so git diff shows all files as "added"
+    logger.debug(`HEAD~1 not available (single-commit repo?): ${(err as Error).message}`);
     return GIT_EMPTY_TREE_SHA;
   }
 }
@@ -278,7 +282,7 @@ export async function getFileDiff(
   rootPath: string,
   filePath: string,
   baseRef: string,
-  maxChars: number = 4000,
+  maxChars: number = DIFF_MAX_CHARS,
 ): Promise<string> {
   // Try three-dot diff first (merge-base), fall back to two-dot
   for (const separator of ['...', '..']) {
@@ -293,8 +297,8 @@ export async function getFileDiff(
           ? stdout.slice(0, maxChars) + '\n... (truncated)'
           : stdout;
       }
-    } catch {
-      // Try next separator
+    } catch (err) {
+      logger.debug(`git diff ${separator} failed for ${filePath}: ${(err as Error).message}`);
     }
   }
 
@@ -310,8 +314,8 @@ export async function getFileDiff(
         ? stdout.slice(0, maxChars) + '\n... (truncated)'
         : stdout;
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    logger.debug(`git diff HEAD failed for ${filePath}: ${(err as Error).message}`);
   }
 
   return '';
@@ -338,8 +342,9 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
     for (const entry of parseNameStatus(stdout)) {
       fileMap.set(entry.path, { status: entry.status, oldPath: entry.oldPath });
     }
-  } catch {
+  } catch (err) {
     // If three-dot diff fails (e.g., no common ancestor), try two-dot
+    logger.debug(`Three-dot diff failed, falling back to two-dot: ${(err as Error).message}`);
     try {
       const { stdout } = await execFileAsync(
         'git', ['diff', '--name-status', '--diff-filter=ACDMR', `${resolvedBase}..HEAD`],
@@ -348,8 +353,8 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
       for (const entry of parseNameStatus(stdout)) {
         fileMap.set(entry.path, { status: entry.status, oldPath: entry.oldPath });
       }
-    } catch {
-      // If that also fails, fall through with empty committed changes
+    } catch (err2) {
+      logger.debug(`Two-dot diff also failed, using empty file list: ${(err2 as Error).message}`);
     }
   }
 
@@ -367,7 +372,9 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
           fileMap.set(entry.path, { status: entry.status, oldPath: entry.oldPath });
         }
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      logger.debug(`Could not get staged changes: ${(err as Error).message}`);
+    }
 
     // Unstaged working tree changes
     try {
@@ -384,7 +391,9 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
           }
         }
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      logger.debug(`Could not get unstaged changes: ${(err as Error).message}`);
+    }
   }
 
   // Get line-level stats
@@ -395,14 +404,17 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
       { cwd: rootPath }
     );
     numstatMap = parseNumstat(stdout);
-  } catch {
+  } catch (err) {
+    logger.debug(`Three-dot numstat failed, falling back to two-dot: ${(err as Error).message}`);
     try {
       const { stdout } = await execFileAsync(
         'git', ['diff', '--numstat', `${resolvedBase}..HEAD`],
         { cwd: rootPath }
       );
       numstatMap = parseNumstat(stdout);
-    } catch { /* ignore */ }
+    } catch (err2) {
+      logger.debug(`Two-dot numstat also failed: ${(err2 as Error).message}`);
+    }
   }
 
   // Build ChangedFile list

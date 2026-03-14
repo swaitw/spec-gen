@@ -225,7 +225,7 @@ export class ProgressIndicator {
   /**
    * Log a verbose message (only shown in verbose mode)
    */
-  verbose_log(message: string): void {
+  verboseLog(message: string): void {
     if (this.verbose) {
       this.logs.push(message);
       if (this.spinner && this.enabled) {
@@ -304,13 +304,14 @@ export function showGenerationSuccess(options: {
   outputPath: string;
   tokensUsed?: number;
 }): void {
+  const isTTY = process.stdout.isTTY === true;
   console.log('');
-  console.log('✅ Generation complete!');
+  console.log(isTTY ? '✅ Generation complete!' : '[ok] Generation complete!');
   console.log('');
-  console.log(`   📁 ${options.specsCount} spec files written to ${options.outputPath}`);
+  console.log(`   ${isTTY ? '📁' : '-'} ${options.specsCount} spec files written to ${options.outputPath}`);
 
   if (options.tokensUsed) {
-    console.log(`   🔤 ${options.tokensUsed.toLocaleString()} tokens used`);
+    console.log(`   ${isTTY ? '🔤' : '-'} ${options.tokensUsed.toLocaleString()} tokens used`);
   }
 
   showNextSteps({ generated: true });
@@ -324,14 +325,15 @@ export function showAnalysisSuccess(options: {
   outputPath: string;
   domains?: number;
 }): void {
+  const isTTY = process.stdout.isTTY === true;
   console.log('');
-  console.log('✅ Analysis complete!');
+  console.log(isTTY ? '✅ Analysis complete!' : '[ok] Analysis complete!');
   console.log('');
-  console.log(`   📁 ${options.filesAnalyzed} files analyzed`);
-  console.log(`   📊 Results saved to ${options.outputPath}`);
+  console.log(`   ${isTTY ? '📁' : '-'} ${options.filesAnalyzed} files analyzed`);
+  console.log(`   ${isTTY ? '📊' : '-'} Results saved to ${options.outputPath}`);
 
   if (options.domains) {
-    console.log(`   🏷️  ${options.domains} domain clusters detected`);
+    console.log(`   ${isTTY ? '🏷️ ' : '-'} ${options.domains} domain clusters detected`);
   }
 
   showNextSteps({ analyzed: true });
@@ -345,17 +347,18 @@ export function showVerificationSuccess(options: {
   filesVerified: number;
   passed: boolean;
 }): void {
+  const isTTY = process.stdout.isTTY === true;
   console.log('');
 
   if (options.passed) {
-    console.log('✅ Verification passed!');
+    console.log(isTTY ? '✅ Verification passed!' : '[ok] Verification passed!');
   } else {
-    console.log('⚠️  Verification completed with warnings');
+    console.log(isTTY ? '⚠️  Verification completed with warnings' : '[warn] Verification completed with warnings');
   }
 
   console.log('');
-  console.log(`   📊 Accuracy score: ${(options.score * 100).toFixed(1)}%`);
-  console.log(`   📁 ${options.filesVerified} files verified`);
+  console.log(`   ${isTTY ? '📊' : '-'} Accuracy score: ${(options.score * 100).toFixed(1)}%`);
+  console.log(`   ${isTTY ? '📁' : '-'} ${options.filesVerified} files verified`);
 
   showNextSteps({ verified: true });
 }

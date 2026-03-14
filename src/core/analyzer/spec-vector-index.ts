@@ -19,6 +19,7 @@
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
+import { fileExists } from '../../utils/command-helpers.js';
 import type { EmbeddingService } from './embedding-service.js';
 
 // ============================================================================
@@ -216,7 +217,7 @@ export class SpecVectorIndex {
 
     // Load mapping index (optional)
     let mappingIndex = new Map<string, string[]>();
-    if (mappingJsonPath && existsSync(mappingJsonPath)) {
+    if (mappingJsonPath && await fileExists(mappingJsonPath)) {
       try {
         const raw = JSON.parse(await readFile(mappingJsonPath, 'utf-8'));
         mappingIndex = buildMappingIndex((raw.mappings ?? []) as MappingEntry[]);
@@ -365,7 +366,7 @@ export class SpecVectorIndex {
 // ============================================================================
 
 async function findSpecFiles(specsDir: string): Promise<string[]> {
-  if (!existsSync(specsDir)) return [];
+  if (!await fileExists(specsDir)) return [];
   const results: string[] = [];
 
   let entries: string[];
@@ -378,7 +379,7 @@ async function findSpecFiles(specsDir: string): Promise<string[]> {
   for (const entry of entries) {
     const domainDir = join(specsDir, entry);
     const specFile = join(domainDir, 'spec.md');
-    if (existsSync(specFile)) {
+    if (await fileExists(specFile)) {
       results.push(specFile);
     }
   }

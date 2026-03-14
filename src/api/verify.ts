@@ -6,7 +6,8 @@
  */
 
 import { join } from 'node:path';
-import { access, readFile } from 'node:fs/promises';
+import { SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_LOGS_SUBDIR, SPEC_GEN_OUTPUTS_SUBDIR, SPEC_GEN_VERIFICATION_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_GENERATION_REPORT, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL } from '../constants.js';
+import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import { readSpecGenConfig } from '../core/services/config-manager.js';
 import { createLLMService } from '../core/services/llm-service.js';
 import type { LLMService } from '../core/services/llm-service.js';
@@ -17,15 +18,6 @@ import type { VerifyApiOptions, VerifyResult, ProgressCallback } from './types.j
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'verify', step, status, detail });
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -43,7 +35,7 @@ export async function specGenVerify(options: VerifyApiOptions = {}): Promise<Ver
   const startTime = Date.now();
   const rootPath = options.rootPath ?? process.cwd();
   const samples = options.samples ?? 5;
-  const threshold = options.threshold ?? 0.7;
+  const threshold = options.threshold ?? 0.5;
   const { onProgress } = options;
 
   // Load config
@@ -53,49 +45,62 @@ export async function specGenVerify(options: VerifyApiOptions = {}): Promise<Ver
   }
 
   // Check specs exist
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? 'openspec');
-  const specsPath = join(openspecPath, 'specs');
+  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
   if (!(await fileExists(specsPath))) {
     throw new Error('No specs found. Run specGenGenerate() first.');
   }
 
   // Load dependency graph
   progress(onProgress, 'Loading analysis', 'start');
-  const analysisPath = join(rootPath, '.spec-gen', 'analysis');
-  const depGraphPath = join(analysisPath, 'dependency-graph.json');
-  if (!(await fileExists(depGraphPath))) {
+  const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const depGraph = await readJsonFile<DependencyGraphResult>(
+    join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+    ARTIFACT_DEPENDENCY_GRAPH,
+  );
+  if (!depGraph) {
     throw new Error('No analysis found. Run specGenAnalyze() first.');
   }
-  const depGraphContent = await readFile(depGraphPath, 'utf-8');
-  const depGraph = JSON.parse(depGraphContent) as DependencyGraphResult;
 
   // Load generation report
-  let generationContext: string[] = [];
-  const reportPath = join(rootPath, '.spec-gen', 'outputs', 'generation-report.json');
-  if (await fileExists(reportPath)) {
-    const reportContent = await readFile(reportPath, 'utf-8');
-    const genReport = JSON.parse(reportContent) as GenerationReport;
-    generationContext = genReport.filesWritten ?? [];
-  }
+  const genReport = await readJsonFile<GenerationReport>(
+    join(rootPath, SPEC_GEN_DIR, SPEC_GEN_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
+    ARTIFACT_GENERATION_REPORT,
+  );
+  const generationContext: string[] = genReport?.filesWritten ?? [];
   progress(onProgress, 'Loading analysis', 'complete');
 
-  // Create LLM service
+  // Create LLM service — support all four providers
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
-  if (!anthropicKey && !openaiKey) {
-    throw new Error('No LLM API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.');
+  const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
+    throw new Error('No LLM API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY.');
   }
 
-  const provider = options.provider ?? (anthropicKey ? 'anthropic' : 'openai');
+  const envDetectedProvider = anthropicKey ? 'anthropic'
+    : geminiKey ? 'gemini'
+    : openaiCompatKey ? 'openai-compat'
+    : 'openai';
+  const provider = options.provider ?? envDetectedProvider;
+  const defaultModels: Record<string, string> = {
+    anthropic: DEFAULT_ANTHROPIC_MODEL,
+    gemini: DEFAULT_GEMINI_MODEL,
+    'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
+    openai: DEFAULT_OPENAI_MODEL,
+  };
+  const effectiveModel = options.model ?? defaultModels[provider] ?? DEFAULT_ANTHROPIC_MODEL;
   let llm: LLMService;
   try {
     llm = createLLMService({
       provider,
-      model: options.model,
+      model: effectiveModel,
       apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
       sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
+      openaiCompatBaseUrl: options.openaiCompatBaseUrl,
       enableLogging: true,
-      logDir: join(rootPath, '.spec-gen', 'logs'),
+      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
     });
   } catch (error) {
     throw new Error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -103,7 +108,7 @@ export async function specGenVerify(options: VerifyApiOptions = {}): Promise<Ver
 
   // Run verification
   progress(onProgress, 'Selecting verification files', 'start');
-  const verificationDir = join(rootPath, '.spec-gen', 'verification');
+  const verificationDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_VERIFICATION_SUBDIR);
   const engine = new SpecVerificationEngine(llm, {
     rootPath,
     openspecPath,

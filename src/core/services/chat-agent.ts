@@ -20,6 +20,13 @@
 
 import { CHAT_TOOLS, toChatToolDefinitions } from './chat-tools.js';
 import { readSpecGenConfig } from './config-manager.js';
+import {
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_CHAT_OPENAI_MODEL,
+  CHAT_AGENT_MAX_TOKENS,
+  API_ERROR_PREVIEW_LENGTH,
+} from '../../constants.js';
 
 // ============================================================================
 // TYPES -- OpenAI
@@ -124,7 +131,7 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
       kind:    'gemini',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
       apiKey:  geminiKey,
-      model:   envModel || cfgModel || 'gemini-2.0-flash',
+      model:   envModel || cfgModel || DEFAULT_GEMINI_MODEL,
     };
   }
 
@@ -133,7 +140,7 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
       kind:    'anthropic',
       baseUrl: 'https://api.anthropic.com/v1',
       apiKey:  anthropicKey,
-      model:   envModel || cfgModel || 'claude-sonnet-4-20250514',
+      model:   envModel || cfgModel || DEFAULT_ANTHROPIC_MODEL,
     };
   }
 
@@ -143,7 +150,7 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
     kind:    'openai-compat',
     baseUrl: base.replace(/\/$/, ''),
     apiKey:  key,
-    model:   envModel || cfgModel || 'gpt-4o-mini',
+    model:   envModel || cfgModel || DEFAULT_CHAT_OPENAI_MODEL,
   };
 }
 
@@ -293,7 +300,7 @@ async function runOpenAILoop(
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
-      throw new Error(`Chat API error ${response.status}: ${errText.slice(0, 300)}`);
+      throw new Error(`Chat API error ${response.status}: ${errText.slice(0, API_ERROR_PREVIEW_LENGTH)}`);
     }
 
     const data = (await response.json()) as OAIResponse;
@@ -371,7 +378,7 @@ async function runGeminiLoop(
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
-      throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, 300)}`);
+      throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, API_ERROR_PREVIEW_LENGTH)}`);
     }
 
     const data = (await response.json()) as GeminiResponse;
@@ -456,7 +463,7 @@ async function runAnthropicLoop(
         headers,
         body: JSON.stringify({
           model: cfg.model,
-          max_tokens: 4096,
+          max_tokens: CHAT_AGENT_MAX_TOKENS,
           system: buildSystemPrompt(directory),
           tools,
           messages: history,
@@ -467,7 +474,7 @@ async function runAnthropicLoop(
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
-      throw new Error(`Anthropic API error ${response.status}: ${errText.slice(0, 300)}`);
+      throw new Error(`Anthropic API error ${response.status}: ${errText.slice(0, API_ERROR_PREVIEW_LENGTH)}`);
     }
 
     const data = (await response.json()) as AnthropicResponse;

@@ -6,6 +6,32 @@
 
 import { validateDirectory, readCachedContext } from './utils.js';
 import { join } from 'node:path';
+import {
+  RISK_SCORE_FAN_IN_WEIGHT,
+  RISK_SCORE_FAN_OUT_WEIGHT,
+  RISK_SCORE_HUB_BONUS,
+  RISK_SCORE_BLAST_RADIUS_WEIGHT,
+  RISK_SCORE_LOW_THRESHOLD,
+  RISK_SCORE_MEDIUM_THRESHOLD,
+  GOD_FUNCTION_FAN_OUT_THRESHOLD,
+  REFACTOR_SRP_FAN_OUT_THRESHOLD,
+  LOW_RISK_MAX_FAN_IN,
+  LOW_RISK_MAX_FAN_OUT,
+  CRITICAL_HUBS_DEFAULT_MIN_FAN_IN,
+  SUBGRAPH_DEFAULT_MAX_DEPTH,
+  SUBGRAPH_MAX_DEPTH_LIMIT,
+  CRITICALITY_FAN_IN_WEIGHT,
+  CRITICALITY_FAN_OUT_WEIGHT,
+  CRITICALITY_VIOLATION_BONUS,
+  STABILITY_SCORE_CAN_REFACTOR,
+  STABILITY_SCORE_STABILISE_FIRST,
+  LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT,
+  LEAF_FUNCTIONS_DEFAULT_LIMIT,
+  HUB_HIGH_FAN_IN_THRESHOLD,
+  HUB_HIGH_FAN_OUT_THRESHOLD,
+  SPEC_GEN_DIR,
+  SPEC_GEN_ANALYSIS_SUBDIR,
+} from '../../../constants.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
 import { getFileGodFunctions, extractSubgraph } from '../../analyzer/subgraph-extractor.js';
 import { readSpecGenConfig } from '../config-manager.js';
@@ -65,10 +91,10 @@ export function bfs(
  */
 export function computeRiskScore(node: FunctionNode, blastRadius: number, isHub: boolean): number {
   const raw =
-    (node.fanIn  ?? 0) * 4 +
-    (node.fanOut ?? 0) * 2 +
-    (isHub ? 20 : 0) +
-    blastRadius * 1.5;
+    (node.fanIn  ?? 0) * RISK_SCORE_FAN_IN_WEIGHT +
+    (node.fanOut ?? 0) * RISK_SCORE_FAN_OUT_WEIGHT +
+    (isHub ? RISK_SCORE_HUB_BONUS : 0) +
+    blastRadius * RISK_SCORE_BLAST_RADIUS_WEIGHT;
   return Math.min(100, Math.round(raw));
 }
 
@@ -79,7 +105,7 @@ export function recommendStrategy(
   fanOut: number,
   isHub: boolean
 ): { approach: string; rationale: string } {
-  if (riskScore <= 20) {
+  if (riskScore <= RISK_SCORE_LOW_THRESHOLD) {
     return {
       approach: 'refactor freely',
       rationale:
@@ -87,7 +113,7 @@ export function recommendStrategy(
         'A single PR with unit tests is sufficient.',
     };
   }
-  if (riskScore <= 45) {
+  if (riskScore <= RISK_SCORE_MEDIUM_THRESHOLD) {
     return {
       approach: 'refactor with tests',
       rationale:
@@ -95,7 +121,7 @@ export function recommendStrategy(
         'Prefer additive changes (new overload / wrapper) then migrate callers.',
     };
   }
-  if (isHub && fanOut > 5) {
+  if (isHub && fanOut > REFACTOR_SRP_FAN_OUT_THRESHOLD) {
     return {
       approach: 'split responsibility (SRP)',
       rationale:
@@ -112,7 +138,7 @@ export function recommendStrategy(
         'then update callers in waves.',
     };
   }
-  if (fanOut > 8) {
+  if (fanOut > GOD_FUNCTION_FAN_OUT_THRESHOLD) {
     return {
       approach: 'decompose fan-out',
       rationale:
@@ -169,10 +195,10 @@ export async function handleGetSubgraph(
   directory: string,
   functionName: string,
   direction: 'downstream' | 'upstream' | 'both' = 'downstream',
-  maxDepth = 3,
+  maxDepth = SUBGRAPH_DEFAULT_MAX_DEPTH,
   format: 'json' | 'mermaid' = 'json'
 ): Promise<unknown> {
-  maxDepth = Math.max(1, Math.min(maxDepth, 20));
+  maxDepth = Math.max(1, Math.min(maxDepth, SUBGRAPH_MAX_DEPTH_LIMIT));
   const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);
 
@@ -188,7 +214,7 @@ export async function handleGetSubgraph(
     try {
       const { VectorIndex } = await import('../../analyzer/vector-index.js');
       const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-      const outputDir = join(absDir, '.spec-gen', 'analysis');
+      const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
       if (VectorIndex.exists(outputDir)) {
         let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
@@ -312,7 +338,7 @@ export async function handleAnalyzeImpact(
     try {
       const { VectorIndex } = await import('../../analyzer/vector-index.js');
       const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
-      const outputDir = join(absDir, '.spec-gen', 'analysis');
+      const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
 
       if (VectorIndex.exists(outputDir)) {
         let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
@@ -380,7 +406,7 @@ export async function handleAnalyzeImpact(
  */
 export async function handleGetLowRiskRefactorCandidates(
   directory: string,
-  limit = 5,
+  limit = LOW_RISK_REFACTOR_CANDIDATES_DEFAULT_LIMIT,
   filePattern?: string
 ): Promise<unknown> {
   limit = Math.max(1, Math.min(limit, 500));
@@ -397,7 +423,7 @@ export async function handleGetLowRiskRefactorCandidates(
   let candidates = cg.nodes.filter(n => {
     const fanIn  = n.fanIn  ?? 0;
     const fanOut = n.fanOut ?? 0;
-    return fanIn <= 2 && fanOut <= 3 && !hubIds.has(n.id) && !entryIds.has(n.id);
+    return fanIn <= LOW_RISK_MAX_FAN_IN && fanOut <= LOW_RISK_MAX_FAN_OUT && !hubIds.has(n.id) && !entryIds.has(n.id);
   });
 
   if (filePattern) candidates = candidates.filter(n => n.filePath.includes(filePattern));
@@ -426,7 +452,7 @@ export async function handleGetLowRiskRefactorCandidates(
  */
 export async function handleGetLeafFunctions(
   directory: string,
-  limit = 20,
+  limit = LEAF_FUNCTIONS_DEFAULT_LIMIT,
   filePattern?: string,
   sortBy: 'fanIn' | 'name' | 'file' = 'fanIn'
 ): Promise<unknown> {
@@ -470,7 +496,7 @@ export async function handleGetLeafFunctions(
 export async function handleGetCriticalHubs(
   directory: string,
   limit = 10,
-  minFanIn = 3
+  minFanIn = CRITICAL_HUBS_DEFAULT_MIN_FAN_IN
 ): Promise<unknown> {
   limit = Math.max(1, Math.min(limit, 500));
   minFanIn = Math.max(1, Math.min(minFanIn, 100));
@@ -494,18 +520,18 @@ export async function handleGetCriticalHubs(
       const fanIn        = n.fanIn  ?? 0;
       const fanOut       = n.fanOut ?? 0;
       const hasViolation = violatorFiles.has(n.filePath);
-      const criticality  = fanIn * 3 + fanOut * 1.5 + (hasViolation ? 10 : 0);
+      const criticality  = fanIn * CRITICALITY_FAN_IN_WEIGHT + fanOut * CRITICALITY_FAN_OUT_WEIGHT + (hasViolation ? CRITICALITY_VIOLATION_BONUS : 0);
       const stabilityScore = Math.max(0, Math.round(100 - Math.min(100, criticality)));
 
       let approach: string;
       let approachRationale: string;
-      if (fanIn >= 8 && fanOut >= 5) {
+      if (fanIn >= HUB_HIGH_FAN_IN_THRESHOLD && fanOut >= HUB_HIGH_FAN_OUT_THRESHOLD) {
         approach = 'split responsibility';
         approachRationale = 'God-function: extract cohesive groups of callees into dedicated modules and expose a minimal coordinator interface.';
-      } else if (fanIn >= 8) {
+      } else if (fanIn >= HUB_HIGH_FAN_IN_THRESHOLD) {
         approach = 'introduce façade';
         approachRationale = 'Heavily depended-upon: keep the signature stable, move implementation behind a façade, then migrate callers to the new interface over time.';
-      } else if (fanOut >= 5) {
+      } else if (fanOut >= HUB_HIGH_FAN_OUT_THRESHOLD) {
         approach = 'delegate';
         approachRationale = "Too many outgoing calls: extract groups of related calls into helper services and delegate to them, reducing this function's orchestration burden.";
       } else {
@@ -521,8 +547,8 @@ export async function handleGetCriticalHubs(
         riskScore: computeRiskScore(n, fanIn + fanOut, true),
         recommendedApproach: { approach, rationale: approachRationale },
         refactoringOrder:
-          stabilityScore >= 60 ? 'can refactor now with good test coverage'
-          : stabilityScore >= 30 ? 'refactor after stabilising its leaf dependencies'
+          stabilityScore >= STABILITY_SCORE_CAN_REFACTOR ? 'can refactor now with good test coverage'
+          : stabilityScore >= STABILITY_SCORE_STABILISE_FIRST ? 'refactor after stabilising its leaf dependencies'
           : 'defer — stabilise surrounding code first, then tackle incrementally',
       };
     })
@@ -542,7 +568,7 @@ export async function handleGetCriticalHubs(
 export async function handleGetGodFunctions(
   directory: string,
   filePath?: string,
-  fanOutThreshold = 8,
+  fanOutThreshold = GOD_FUNCTION_FAN_OUT_THRESHOLD,
 ): Promise<unknown> {
   const absDir = await validateDirectory(directory);
   const ctx = await readCachedContext(absDir);

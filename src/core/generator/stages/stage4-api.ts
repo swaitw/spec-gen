@@ -5,6 +5,7 @@
  */
 
 import logger from '../../../utils/logger.js';
+import { STAGE4_MAX_TOKENS, STAGE_CHUNK_MAX_CHARS } from '../../../constants.js';
 import { PROMPTS } from '../prompts.js';
 import type { ExtractedEndpoint, StageResult, PipelineContext } from '../../../types/pipeline.js';
 
@@ -19,7 +20,7 @@ export async function runStage4(
 
   for (const [idx, file] of apiFiles.entries()) {
     onFile?.(idx + 1, apiFiles.length, file.path);
-    const chunks = pipeline.chunkContent(file.content, 8000);
+    const chunks = pipeline.chunkContent(file.content, STAGE_CHUNK_MAX_CHARS);
     const isLargeFile = chunks.length > 1;
     const graphSection = pipeline.graphPromptFor(file.path, file.content);
 
@@ -37,15 +38,15 @@ export async function runStage4(
           systemPrompt: PROMPTS.stage4_api,
           userPrompt,
           temperature: 0.3,
-          maxTokens: 4000,
+          maxTokens: STAGE4_MAX_TOKENS,
         });
-        if (Array.isArray(result)) {
-          for (const endpoint of result) {
-            const key = `${endpoint.method}:${endpoint.path}`;
-            if (!seenPaths.has(key)) {
-              seenPaths.add(key);
-              endpointsFromFile.push(endpoint);
-            }
+        // Normalize: LLM may return a single object instead of an array
+        const endpoints = Array.isArray(result) ? result : [result];
+        for (const endpoint of endpoints) {
+          const key = `${endpoint.method}:${endpoint.path}`;
+          if (!seenPaths.has(key)) {
+            seenPaths.add(key);
+            endpointsFromFile.push(endpoint);
           }
         }
       } catch (error) {

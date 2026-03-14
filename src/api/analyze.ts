@@ -6,15 +6,17 @@
  */
 
 import { join } from 'node:path';
-import { access, stat, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, stat, mkdir, writeFile } from 'node:fs/promises';
+import { ANALYSIS_STALE_THRESHOLD_MS, DEFAULT_MAX_FILES, SPEC_GEN_ANALYSIS_REL_PATH, ARTIFACT_REPO_STRUCTURE, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_LLM_CONTEXT } from '../constants.js';
+import { fileExists, readJsonFile } from '../utils/command-helpers.js';
 import { readSpecGenConfig } from '../core/services/config-manager.js';
 import { RepositoryMapper } from '../core/analyzer/repository-mapper.js';
 import {
   DependencyGraphBuilder,
   type DependencyGraphResult,
 } from '../core/analyzer/dependency-graph.js';
-import { AnalysisArtifactGenerator } from '../core/analyzer/artifact-generator.js';
-import type { AnalyzeApiOptions, AnalyzeResult, ProgressCallback, RepositoryMap } from './types.js';
+import { AnalysisArtifactGenerator, repoStructureToRepoMap, type RepoStructure, type LLMContext } from '../core/analyzer/artifact-generator.js';
+import type { AnalyzeApiOptions, AnalyzeResult, ProgressCallback } from './types.js';
 
 function progress(
   onProgress: ProgressCallback | undefined,
@@ -25,13 +27,26 @@ function progress(
   onProgress?.({ phase: 'analyze', step, status, detail });
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
+
+/**
+ * Load cached analysis artifacts from disk.
+ * All four artifact files are saved by AnalysisArtifactGenerator.generateAndSave().
+ */
+async function loadCachedArtifacts(
+  outputPath: string,
+  repoStructure: RepoStructure,
+): Promise<AnalyzeResult['artifacts']> {
+  const llmContext = await readJsonFile<LLMContext>(
+    join(outputPath, ARTIFACT_LLM_CONTEXT),
+    ARTIFACT_LLM_CONTEXT,
+  ) ?? { phase1_survey: { purpose: '', files: [] }, phase2_deep: { purpose: '', files: [] }, phase3_validation: { purpose: '', files: [] } };
+
+  let summaryMarkdown = '';
+  let dependencyDiagram = '';
+  try { summaryMarkdown = await readFile(join(outputPath, 'SUMMARY.md'), 'utf-8'); } catch { /* optional */ }
+  try { dependencyDiagram = await readFile(join(outputPath, 'dependencies.mermaid'), 'utf-8'); } catch { /* optional */ }
+
+  return { repoStructure, summaryMarkdown, dependencyDiagram, llmContext };
 }
 
 /**
@@ -45,10 +60,11 @@ async function fileExists(path: string): Promise<boolean> {
 export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<AnalyzeResult> {
   const startTime = Date.now();
   const rootPath = options.rootPath ?? process.cwd();
-  const maxFiles = options.maxFiles ?? 500;
+  const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
   const excludePatterns = options.excludePatterns ?? [];
+  const includePatterns = options.includePatterns ?? [];
   const force = options.force ?? false;
-  const outputRelPath = options.outputPath ?? '.spec-gen/analysis/';
+  const outputRelPath = options.outputPath ?? `${SPEC_GEN_ANALYSIS_REL_PATH}/`;
   const outputPath = join(rootPath, outputRelPath);
   const { onProgress } = options;
 
@@ -60,12 +76,11 @@ export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<A
 
   // Check for existing recent analysis
   if (!force) {
-    const repoStructurePath = join(outputPath, 'repo-structure.json');
+    const repoStructurePath = join(outputPath, ARTIFACT_REPO_STRUCTURE);
     if (await fileExists(repoStructurePath)) {
       const stats = await stat(repoStructurePath);
       const age = Date.now() - stats.mtime.getTime();
-      const oneHour = 60 * 60 * 1000;
-      if (age < oneHour) {
+      if (age < ANALYSIS_STALE_THRESHOLD_MS) {
         progress(
           onProgress,
           'Recent analysis exists',
@@ -73,19 +88,21 @@ export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<A
           `${Math.floor(age / 60000)} minutes old`
         );
         // Load and return existing analysis
-        const { readFile } = await import('node:fs/promises');
-        const repoStructureContent = await readFile(repoStructurePath, 'utf-8');
-        const repoStructure = JSON.parse(repoStructureContent) as RepositoryMap;
-
-        const depGraphPath = join(outputPath, 'dependency-graph.json');
-        let depGraph: DependencyGraphResult | undefined;
-        if (await fileExists(depGraphPath)) {
-          const depGraphContent = await readFile(depGraphPath, 'utf-8');
-          depGraph = JSON.parse(depGraphContent) as DependencyGraphResult;
+        const repoStructure = await readJsonFile<RepoStructure>(
+          repoStructurePath,
+          ARTIFACT_REPO_STRUCTURE,
+        );
+        if (!repoStructure) {
+          throw new Error(`Failed to load ${ARTIFACT_REPO_STRUCTURE} — run spec-gen analyze --force to regenerate`);
         }
 
+        const depGraph = await readJsonFile<DependencyGraphResult>(
+          join(outputPath, ARTIFACT_DEPENDENCY_GRAPH),
+          ARTIFACT_DEPENDENCY_GRAPH,
+        ) ?? undefined;
+
         return {
-          repoMap: repoStructure,
+          repoMap: repoStructureToRepoMap(repoStructure),
           depGraph: depGraph ?? {
             nodes: [],
             edges: [],
@@ -112,7 +129,7 @@ export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<A
               structuralClusterCount: 0,
             },
           },
-          artifacts: { repoStructure } as unknown as AnalyzeResult['artifacts'],
+          artifacts: await loadCachedArtifacts(outputPath, repoStructure),
           duration: Date.now() - startTime,
         };
       }
@@ -127,6 +144,7 @@ export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<A
   const mapper = new RepositoryMapper(rootPath, {
     maxFiles,
     excludePatterns: excludePatterns.length > 0 ? excludePatterns : undefined,
+    includePatterns: includePatterns.length > 0 ? includePatterns : undefined,
   });
   const repoMap = await mapper.map();
   progress(
@@ -158,7 +176,7 @@ export async function specGenAnalyze(options: AnalyzeApiOptions = {}): Promise<A
   const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
 
   // Save dependency graph
-  await writeFile(join(outputPath, 'dependency-graph.json'), JSON.stringify(depGraph, null, 2));
+  await writeFile(join(outputPath, ARTIFACT_DEPENDENCY_GRAPH), JSON.stringify(depGraph, null, 2));
   progress(onProgress, 'Generating analysis artifacts', 'complete');
 
   const duration = Date.now() - startTime;

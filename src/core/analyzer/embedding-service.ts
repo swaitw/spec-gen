@@ -86,7 +86,7 @@ export class EmbeddingService {
       model: cfg.embedding.model,
       apiKey: cfg.embedding.apiKey,
       skipSslVerify: cfg.embedding.skipSslVerify,
-      batchSize: cfg.embedding.batchSize, // FIX: was missing, causing batchSize config to be ignored
+      batchSize: cfg.embedding.batchSize,
     });
   }
 
@@ -111,7 +111,7 @@ export class EmbeddingService {
   private async callEmbeddingsApi(texts: string[]): Promise<number[][]> {
     const url = `${this.baseUrl}/embeddings`;
 
-    // FIX: truncate each text to stay within the model's token limit.
+    // Truncate each text to stay within the model's token limit.
     // Most embedding models (nomic-embed-text, text-embedding-3-small…) cap at
     // 8 192 tokens. Slicing at MAX_CHARS_PER_TEXT characters is a safe
     // approximation (1 token ≈ 4 chars on average).

@@ -6,6 +6,7 @@
  */
 
 import { resolve, relative } from 'node:path';
+import { SPEC_GEN_DIR, SPEC_GEN_CONFIG_REL_PATH, DEFAULT_OPENSPEC_PATH } from '../constants.js';
 import {
   detectProjectType,
   getProjectTypeName,
@@ -39,7 +40,7 @@ function progress(onProgress: ProgressCallback | undefined, step: string, status
  */
 export async function specGenInit(options: InitApiOptions = {}): Promise<InitResult> {
   const rootPath = options.rootPath ?? process.cwd();
-  const openspecRelPath = options.openspecPath ?? './openspec';
+  const openspecRelPath = options.openspecPath ?? DEFAULT_OPENSPEC_PATH;
   const openspecFullPath = resolve(rootPath, openspecRelPath);
   const force = options.force ?? false;
   const { onProgress } = options;
@@ -61,7 +62,7 @@ export async function specGenInit(options: InitApiOptions = {}): Promise<InitRes
   if (configExists && !force) {
     progress(onProgress, 'Configuration exists', 'skip');
     return {
-      configPath: '.spec-gen/config.json',
+      configPath: SPEC_GEN_CONFIG_REL_PATH,
       openspecPath: openspecRelPath,
       projectType,
       created: false,
@@ -87,16 +88,16 @@ export async function specGenInit(options: InitApiOptions = {}): Promise<InitRes
   // Update .gitignore
   const hasGitignore = await gitignoreExists(rootPath);
   if (hasGitignore) {
-    const alreadyIgnored = await isInGitignore(rootPath, '.spec-gen/');
+    const alreadyIgnored = await isInGitignore(rootPath, `${SPEC_GEN_DIR}/`);
     if (!alreadyIgnored) {
       progress(onProgress, 'Updating .gitignore', 'start');
-      await addToGitignore(rootPath, '.spec-gen/', 'spec-gen analysis artifacts');
+      await addToGitignore(rootPath, `${SPEC_GEN_DIR}/`, 'spec-gen analysis artifacts');
       progress(onProgress, 'Updating .gitignore', 'complete');
     }
   }
 
   return {
-    configPath: '.spec-gen/config.json',
+    configPath: SPEC_GEN_CONFIG_REL_PATH,
     openspecPath: openspecRelPath,
     projectType,
     created: true,

@@ -192,23 +192,23 @@ describe('ProgressIndicator', () => {
     });
   });
 
-  describe('verbose_log', () => {
+  describe('verboseLog', () => {
     it('should not log when verbose is false', () => {
       const progress = new ProgressIndicator({ enabled: false, verbose: false });
-      progress.verbose_log('Debug message');
+      progress.verboseLog('Debug message');
       expect(consoleSpy).not.toHaveBeenCalled();
     });
 
     it('should log when verbose is true', () => {
       const progress = new ProgressIndicator({ enabled: false, verbose: true });
-      progress.verbose_log('Debug message');
+      progress.verboseLog('Debug message');
       expect(consoleSpy).toHaveBeenCalledWith('  [verbose] Debug message');
     });
 
     it('should collect logs', () => {
       const progress = new ProgressIndicator({ verbose: true, enabled: false });
-      progress.verbose_log('Log 1');
-      progress.verbose_log('Log 2');
+      progress.verboseLog('Log 1');
+      progress.verboseLog('Log 2');
       expect(progress.getLogs()).toEqual(['Log 1', 'Log 2']);
     });
   });

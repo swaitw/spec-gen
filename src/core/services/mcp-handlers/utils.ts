@@ -5,6 +5,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
+import { ANALYSIS_STALE_THRESHOLD_MS, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT } from '../../../constants.js';
 
 /**
  * Resolve and validate a user-supplied directory path.
@@ -47,7 +48,7 @@ export function sanitizeMcpError(err: unknown): string {
 export async function readCachedContext(directory: string): Promise<LLMContext | null> {
   try {
     const raw = await readFile(
-      join(directory, '.spec-gen', 'analysis', 'llm-context.json'),
+      join(directory, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT),
       'utf-8'
     );
     return JSON.parse(raw) as LLMContext;
@@ -59,8 +60,8 @@ export async function readCachedContext(directory: string): Promise<LLMContext |
 /** Returns true if the cached analysis is present and less than 1 hour old. */
 export async function isCacheFresh(directory: string): Promise<boolean> {
   try {
-    const s = await stat(join(directory, '.spec-gen', 'analysis', 'llm-context.json'));
-    return Date.now() - s.mtimeMs < 60 * 60 * 1000;
+    const s = await stat(join(directory, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
+    return Date.now() - s.mtimeMs < ANALYSIS_STALE_THRESHOLD_MS;
   } catch {
     return false;
   }
