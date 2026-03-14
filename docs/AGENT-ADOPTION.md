@@ -208,7 +208,7 @@ fichiers ne donne pas] — [limitation à connaître]`.
 
 ---
 
-### #F — Documenter le workflow d'adoption dans README et CLAUDE.md (moyen)
+### ~~#F — Documenter le workflow d'adoption dans README et CLAUDE.md (moyen)~~ ✅
 
 Le vrai problème est que les utilisateurs ne savent pas quoi mettre dans leur
 `CLAUDE.md` pour que les agents utilisent spec-gen correctement.
@@ -246,4 +246,4 @@ switcher vers les outils actifs. Les deux ensemble créent le workflow complet.
 | C | Outil `orient` composite | **Élevé** | Élevé | ✅ |
 | D | Élaguer les outils redondants | **Moyen** | Faible | ✅ |
 | E | Réécrire descriptions comme triggers | **Moyen** | Faible | ✅ |
-| F | Documentation workflow agent setup | **Moyen** | Faible | — |
+| F | Documentation workflow agent setup | **Moyen** | Faible | ✅ |

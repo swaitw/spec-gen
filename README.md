@@ -531,6 +531,33 @@ Checks performed:
 
 Run `spec-gen doctor` whenever setup instructions aren't working — it tells you exactly what to fix and how.
 
+## Agent Setup
+
+After running `spec-gen analyze`, add this to your project's `CLAUDE.md` or `.clinerules`:
+
+```markdown
+@.spec-gen/analysis/CODEBASE.md
+
+## spec-gen MCP tools — when to use them
+
+| Situation | Tool |
+|-----------|------|
+| Don't know which file/function handles a concept | `search_code` |
+| Need call topology across many files | `get_subgraph` / `analyze_impact` |
+| Starting a new task on an unfamiliar codebase | `orient` |
+| Planning where to add a feature | `suggest_insertion_points` |
+| Checking if code still matches spec | `check_spec_drift` |
+| Finding spec requirements by meaning | `search_specs` |
+
+For all other cases (reading a file, grepping, listing files) use native tools directly.
+```
+
+The `CODEBASE.md` reference gives the agent passive architectural context (entry points, hubs, spec domains) without any tool call. The table tells it when to switch to active MCP tools.
+
+> **Tip:** `spec-gen analyze` prints this snippet after every run as a reminder.
+
+---
+
 ## MCP Server
 
 `spec-gen mcp` starts spec-gen as a [Model Context Protocol](https://modelcontextprotocol.io/) server over stdio, exposing static analysis as tools that any MCP-compatible AI agent (Cline, Roo Code, Kilocode, Claude Code, Cursor...) can call directly -- no API key required.

@@ -291,7 +291,9 @@ export class VectorIndex {
         for (const row of existing) {
           const id = row.id as string;
           const text = row.text as string;
-          const vector = row.vector as number[];
+          // Convert Arrow typed arrays (Float32Array etc.) to plain number[]
+          // so LanceDB can re-infer the schema when writing back
+          const vector = Array.from(row.vector as ArrayLike<number>);
           // Cache the vector keyed by "id::text" so a text change invalidates it
           cachedVectors.set(`${id}::${text}`, vector);
         }

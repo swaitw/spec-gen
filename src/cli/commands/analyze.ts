@@ -6,7 +6,7 @@
  */
 
 import { Command } from 'commander';
-import { access, stat, writeFile, mkdir, readFile } from 'node:fs/promises';
+import { stat, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
 import { fileExists, formatDuration, formatAge } from '../../utils/command-helpers.js';
@@ -340,13 +340,9 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
             logger.info('Architecture', repoStructure.architecture.pattern);
             logger.blank();
 
-            // If embed is requested but index is missing, build it from cached llm-context.json
+            // If embed is requested, run the embed step (incremental: only re-embeds changed functions)
             if (opts.embed) {
-              const { VectorIndex } = await import('../../core/analyzer/vector-index.js');
-              if (!VectorIndex.exists(outputPath)) {
-                logger.info('Vector index missing', 'Building from cached analysis...');
-                await runEmbedStep(rootPath, outputPath, specGenConfig, opts.force ?? false, null);
-              }
+              await runEmbedStep(rootPath, outputPath, specGenConfig, opts.force ?? false, null);
             }
 
             logger.info('Next step', "Run 'spec-gen generate' to create OpenSpec files");
@@ -583,7 +579,18 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
         console.log('');
         console.log('  Agent setup (one-time):');
         console.log(`    Add to your CLAUDE.md or .clinerules:`);
+        console.log('');
         console.log(`    @.spec-gen/analysis/CODEBASE.md`);
+        console.log('');
+        console.log('    ## spec-gen MCP tools — when to use them');
+        console.log('    | Situation                                       | Tool                              |');
+        console.log('    |-------------------------------------------------|-----------------------------------|');
+        console.log("    | Don't know which file/function handles a concept | search_code                      |");
+        console.log('    | Need call topology across many files            | get_subgraph / analyze_impact     |');
+        console.log('    | Starting a new task on an unfamiliar codebase   | orient                            |');
+        console.log('    | Planning where to add a feature                 | suggest_insertion_points          |');
+        console.log('    | Checking if code still matches spec             | check_spec_drift                  |');
+        console.log('    | Finding spec requirements by meaning            | search_specs                      |');
       }
       console.log('');
 
@@ -677,8 +684,9 @@ async function runEmbedStep(
         outputPath, cg.nodes, sigs, hubIds, entryIds, embedSvc, fileContents,
         /* incremental */ !force
       );
+      const total = embedded + reused;
       const cacheNote = reused > 0 ? ` (${embedded} embedded, ${reused} cached)` : '';
-      console.log(`    ✓ Function index built (${cg.nodes.length} functions${cacheNote}, ${fileContents.size} files with skeleton bodies)`);
+      console.log(`    ✓ Function index built (${total} functions${cacheNote}, ${fileContents.size} files with skeleton bodies)`);
       console.log(`    → ${outputPath.replace(rootPath + '/', '')}vector-index/`);
     }
 
