@@ -293,7 +293,7 @@ function process(input: unknown): Result
 
 ---
 
-### #17 — Pipeline end-to-end sur un vrai dépôt open source (élevé)
+### ~~#17 — Pipeline end-to-end sur un vrai dépôt open source (élevé)~~ ✅
 
 Il n'existe aucun test qui exécute la chaîne complète `analyze → embed → search`
 sur un vrai codebase. Les bugs de production (champs manquants dans l'index,
@@ -356,6 +356,6 @@ réponses (types corrects, pas de champs `undefined`, scores dans les bornes att
 | 14 | Pas de requête dépendances fichier | 4 | **Moyen** | ✅ |
 | 15 | Pas d'accès aux ADRs via MCP | 4 | **Moyen** | ✅ |
 | 16 | Tests sémantiques avec noms ambigus | 5 | **Critique** | ✅ |
-| 17 | Pipeline e2e sur vrai dépôt open source | 5 | **Élevé** | — |
+| 17 | Pipeline e2e sur vrai dépôt open source | 5 | **Élevé** | ✅ |
 | 18 | Tests de régression formalisés | 5 | **Élevé** | ✅ |
 | 19 | Tests MCP bout en bout sur données réelles | 5 | **Moyen** | — |
