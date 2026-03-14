@@ -167,6 +167,41 @@ export interface ChatAgentResult {
 
 const MAX_ITERATIONS = 8;
 
+/** Cap tool result size to avoid exceeding provider context limits (400 errors). */
+const MAX_TOOL_RESULT_CHARS = 12_000;
+
+/** Max retries for transient provider errors (429 / 5xx). */
+const MAX_RETRIES = 3;
+
+/** Base delay in ms for exponential backoff. */
+const RETRY_BASE_MS = 1_000;
+
+/** Returns true for errors worth retrying (rate-limit or server-side). */
+function isRetryable(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  signal?: AbortSignal
+): Promise<Response> {
+  let lastError: Error = new Error('fetch failed');
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) throw new Error('Aborted');
+    if (attempt > 0) {
+      const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
+      await new Promise(r => setTimeout(r, delay));
+      if (signal?.aborted) throw new Error('Aborted');
+    }
+    const response = await fetch(url, { ...init, signal });
+    if (response.ok || !isRetryable(response.status)) return response;
+    const errText = await response.text().catch(() => '');
+    lastError = new Error(`${response.status}: ${errText.slice(0, 200)}`);
+  }
+  throw lastError;
+}
+
 function buildSystemPrompt(directory: string): string {
   return `You are a code analysis assistant embedded in a dependency diagram viewer.
 The project directory is: ${directory}
@@ -205,7 +240,10 @@ async function executeTool(
   }
   try {
     const { result, filePaths } = await tool.execute(directory, args);
-    const content = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    let content = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    if (content.length > MAX_TOOL_RESULT_CHARS) {
+      content = content.slice(0, MAX_TOOL_RESULT_CHARS) + '\n... [truncated]';
+    }
     callbacks?.onToolEnd?.(name);
     return { content, filePaths };
   } catch (err) {
@@ -243,12 +281,15 @@ async function runOpenAILoop(
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     if (signal?.aborted) break;
 
-    const response = await fetch(`${cfg.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ model: cfg.model, messages: history, tools: toolDefs, tool_choice: 'auto' }),
+    const response = await fetchWithRetry(
+      `${cfg.baseUrl}/chat/completions`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: cfg.model, messages: history, tools: toolDefs, tool_choice: 'auto' }),
+      },
       signal,
-    });
+    );
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
@@ -326,7 +367,7 @@ async function runGeminiLoop(
       tool_config: { function_calling_config: { mode: 'AUTO' } },
     };
 
-    const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    const response = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify(body) }, signal);
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
@@ -408,18 +449,21 @@ async function runAnthropicLoop(
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     if (signal?.aborted) break;
 
-    const response = await fetch(`${cfg.baseUrl}/messages`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: cfg.model,
-        max_tokens: 4096,
-        system: buildSystemPrompt(directory),
-        tools,
-        messages: history,
-      }),
+    const response = await fetchWithRetry(
+      `${cfg.baseUrl}/messages`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: cfg.model,
+          max_tokens: 4096,
+          system: buildSystemPrompt(directory),
+          tools,
+          messages: history,
+        }),
+      },
       signal,
-    });
+    );
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');

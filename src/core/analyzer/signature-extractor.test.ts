@@ -550,3 +550,106 @@ describe('formatSignatureMaps', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// C++ extractor
+// ---------------------------------------------------------------------------
+
+describe('extractSignatures — C++', () => {
+  it('detects .hpp extension as C++', () => {
+    expect(detectLanguage('utils.hpp')).toBe('C++');
+  });
+
+  it('extracts free functions', () => {
+    const { entries } = extractSignatures('main.cpp', `
+void greet(const std::string& name) {
+  printf("hello");
+}
+
+int add(int a, int b) {
+  return a + b;
+}
+`);
+    const names = entries.map(e => e.name);
+    expect(names).toContain('greet');
+    expect(names).toContain('add');
+    expect(entries.find(e => e.name === 'add')?.kind).toBe('function');
+  });
+
+  it('extracts class declarations', () => {
+    const { entries } = extractSignatures('service.hpp', `
+// User service
+class UserService {
+public:
+  void getUser(int id);
+  void save(const User& u);
+};
+`);
+    const classEntry = entries.find(e => e.kind === 'class');
+    expect(classEntry?.name).toBe('UserService');
+    expect(classEntry?.signature).toBe('class UserService');
+  });
+
+  it('extracts struct declarations', () => {
+    const { entries } = extractSignatures('types.hpp', `
+struct Point {
+  float x;
+  float y;
+};
+`);
+    const structEntry = entries.find(e => e.kind === 'class');
+    expect(structEntry?.name).toBe('Point');
+    expect(structEntry?.signature).toBe('struct Point');
+  });
+
+  it('extracts inline class methods as method kind', () => {
+    const { entries } = extractSignatures('service.cpp', `
+class Foo {
+  void process(int x) {
+    validate(x);
+  }
+};
+`);
+    const method = entries.find(e => e.name === 'process');
+    expect(method?.kind).toBe('method');
+  });
+
+  it('extracts docstring comment above function', () => {
+    const { entries } = extractSignatures('math.cpp', `
+// Computes the factorial of n
+int factorial(int n) {
+  return n <= 1 ? 1 : n * factorial(n - 1);
+}
+`);
+    const fn = entries.find(e => e.name === 'factorial');
+    expect(fn?.docstring).toBe('Computes the factorial of n');
+  });
+
+  it('skips preprocessor directives and comments', () => {
+    const { entries } = extractSignatures('utils.cpp', `
+#include <iostream>
+#define MAX 100
+// just a comment
+/* block comment */
+void realFunction() {}
+`);
+    const names = entries.map(e => e.name);
+    expect(names).not.toContain('include');
+    expect(names).not.toContain('define');
+    expect(names).toContain('realFunction');
+  });
+
+  it('does not extract control-flow keywords as functions', () => {
+    const { entries } = extractSignatures('logic.cpp', `
+void process() {
+  if (x > 0) { foo(); }
+  for (int i = 0; i < 10; i++) {}
+  while (running) {}
+}
+`);
+    const names = entries.map(e => e.name);
+    expect(names).not.toContain('if');
+    expect(names).not.toContain('for');
+    expect(names).not.toContain('while');
+  });
+});

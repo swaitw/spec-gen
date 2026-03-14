@@ -478,3 +478,68 @@ describe('detectDuplicates — line numbers', () => {
     expect(files).toContain('/routes/b.ts');
   });
 });
+
+// ---------------------------------------------------------------------------
+// C++ support
+// ---------------------------------------------------------------------------
+
+describe('detectDuplicates — C++ functions', () => {
+  it('detects exact clones in C++ files', () => {
+    const body = `void process(int x, int y) {
+  int result = x + y;
+  if (result > 0) {
+    output(result);
+    log(result);
+  }
+}`;
+
+    const file1 = buildFile([body]);
+    const file2 = buildFile([body]);
+
+    const nodes: FunctionNode[] = [
+      makeNode({ id: 'f1', name: 'process', filePath: '/a.cpp', language: 'C++', startIndex: file1.offsets[0].start, endIndex: file1.offsets[0].end }),
+      makeNode({ id: 'f2', name: 'process', filePath: '/b.cpp', language: 'C++', startIndex: file2.offsets[0].start, endIndex: file2.offsets[0].end }),
+    ];
+
+    const result = detectDuplicates(
+      [{ path: '/a.cpp', content: file1.content }, { path: '/b.cpp', content: file2.content }],
+      makeCallGraph(nodes),
+    );
+
+    expect(result.cloneGroups).toHaveLength(1);
+    expect(result.cloneGroups[0].type).toBe('exact');
+  });
+
+  it('detects structural clones in C++ files (renamed variables)', () => {
+    const body1 = `void computeSum(int a, int b) {
+  int total = a + b;
+  if (total > 0) {
+    write(total);
+    flush(total);
+  }
+}`;
+    const body2 = `void calculateTotal(int x, int y) {
+  int sum = x + y;
+  if (sum > 0) {
+    write(sum);
+    flush(sum);
+  }
+}`;
+
+    const file1 = buildFile([body1]);
+    const file2 = buildFile([body2]);
+
+    const nodes: FunctionNode[] = [
+      makeNode({ id: 'f1', name: 'computeSum',    filePath: '/math.cpp', language: 'C++', startIndex: file1.offsets[0].start, endIndex: file1.offsets[0].end }),
+      makeNode({ id: 'f2', name: 'calculateTotal', filePath: '/util.cpp', language: 'C++', startIndex: file2.offsets[0].start, endIndex: file2.offsets[0].end }),
+    ];
+
+    const result = detectDuplicates(
+      [{ path: '/math.cpp', content: file1.content }, { path: '/util.cpp', content: file2.content }],
+      makeCallGraph(nodes),
+    );
+
+    expect(result.cloneGroups).toHaveLength(1);
+    expect(result.cloneGroups[0].type).toBe('structural');
+  });
+});
