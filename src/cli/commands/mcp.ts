@@ -702,7 +702,13 @@ export const TOOL_DEFINITIONS = [
 // MCP SERVER
 // ============================================================================
 
-async function startMcpServer(): Promise<void> {
+interface McpServerOptions {
+  watch?: string;
+  watchEmbed?: boolean;
+  watchDebounce?: string;
+}
+
+async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
   const server = new Server(
     { name: 'spec-gen', version: '1.0.0' },
     { capabilities: { tools: {} } }
@@ -825,6 +831,21 @@ async function startMcpServer(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  if (options.watch) {
+    const { resolve } = await import('node:path');
+    const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
+    const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
+    const watcher = new McpWatcher({
+      rootPath: resolve(options.watch),
+      debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
+      embed: options.watchEmbed ?? false,
+    });
+    await watcher.start();
+    const cleanup = () => watcher.stop().then(() => process.exit(0));
+    process.on('SIGINT',  cleanup);
+    process.on('SIGTERM', cleanup);
+  }
 }
 
 // ============================================================================
@@ -833,4 +854,7 @@ async function startMcpServer(): Promise<void> {
 
 export const mcpCommand = new Command('mcp')
   .description('Start spec-gen as an MCP server (stdio transport, for Cline/Claude Code)')
-  .action(startMcpServer);
+  .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
+  .option('--watch-embed', 'Also re-embed changed functions into the vector index when watching (requires embedding server)', false)
+  .option('--watch-debounce <ms>', 'Debounce delay in ms before re-indexing after a file change (default: 400)', '400')
+  .action((options: McpServerOptions) => startMcpServer(options));
