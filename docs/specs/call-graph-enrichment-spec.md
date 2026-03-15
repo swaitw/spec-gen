@@ -191,6 +191,7 @@ export type EdgeConfidence =
   | 'self_cls'        // self.foo() / cls.foo() — intra-classe, sans ambiguïté
   | 'type_inference'  // svc.foo() + svc: MyClass inféré dans le même corps de fonction
   | 'import'          // nom importé explicitement, fichier source connu
+  | 'http_endpoint'   // appel HTTP résolu vers un handler cross-langage
   | 'same_file'       // seul candidat dans le même fichier
   | 'name_only';      // nom unique dans tout le projet, sans autre contexte
 ```
@@ -887,6 +888,131 @@ for (const raw of allRawEdges) {
 
 ---
 
+## Phase 7 — Edges HTTP cross-langage
+
+`http-route-parser.ts` expose déjà `extractAllHttpEdges()` qui mappe les appels HTTP (fetch/axios/requests/httpx/…) vers les handlers de route (Express, FastAPI, Flask, Go net/http…). Il suffit de brancher sa sortie au call graph.
+
+### 7.1 — Modifier `build()` pour accepter les edges HTTP
+
+```typescript
+// Dans build(), après la boucle de résolution des RawEdges :
+import { extractAllHttpEdges } from './http-route-parser.js';
+
+const allFilePaths = files.map(f => f.path);
+const { edges: httpEdges } = await extractAllHttpEdges(allFilePaths);
+
+for (const httpEdge of httpEdges) {
+  // Trouver la fonction appelante la plus proche dans le caller file
+  const callerCandidates = Array.from(allNodes.values())
+    .filter(n => n.filePath === httpEdge.callerFile);
+  // Trouver le handler dans le handler file
+  const handlerCandidates = Array.from(allNodes.values())
+    .filter(n => n.filePath === httpEdge.handlerFile);
+
+  if (callerCandidates.length === 0 || handlerCandidates.length === 0) continue;
+
+  // Prendre la fonction qui contient la ligne de l'appel HTTP
+  const callerNode = callerCandidates.find(n =>
+    n.startIndex <= httpEdge.call.line && httpEdge.call.line <= n.endIndex
+  ) ?? callerCandidates[0];
+
+  // Prendre le handler dont le nom matche la route (méthode handler de la route)
+  const handlerNode = handlerCandidates.find(n =>
+    n.name === httpEdge.route.handlerName
+  ) ?? handlerCandidates[0];
+
+  edges.push({
+    callerId: callerNode.id,
+    calleeId: handlerNode.id,
+    calleeName: httpEdge.route.handlerName ?? `${httpEdge.method} ${httpEdge.path}`,
+    line: httpEdge.call.line,
+    confidence: 'http_endpoint',
+  });
+}
+```
+
+### 7.2 — Stocker les métadonnées HTTP dans `CallGraphResult`
+
+```typescript
+// Étendre CallGraphResult :
+export interface CallGraphResult {
+  nodes: FunctionNode[];
+  edges: CallEdge[];
+  httpEdges: HttpEdge[];  // ← nouveau : accès brut pour les consommateurs
+}
+```
+
+**Validation :** `npm run test:run` — les tests existants de `http-route-parser` passent sans modification.
+
+---
+
+## Phase 8 — `extractSubgraph` avec budget de tokens
+
+`subgraph-extractor.ts` a `MAX_DEPTH = 2` et `MAX_NODES = 30` en constantes. Remplacer par des paramètres avec des valeurs par défaut qui préservent le comportement actuel.
+
+### 8.1 — Modifier `extractSubgraph`
+
+```typescript
+// AVANT
+const MAX_DEPTH = 2;
+const MAX_NODES = 30;
+
+export function extractSubgraph(
+  callGraph: SerializedCallGraph,
+  root: FunctionNode,
+): SubGraph { ... }
+
+// APRÈS
+export interface SubgraphOptions {
+  maxDepth?: number;   // défaut: 2
+  maxNodes?: number;   // défaut: 30
+}
+
+export function extractSubgraph(
+  callGraph: SerializedCallGraph,
+  root: FunctionNode,
+  options: SubgraphOptions = {},
+): SubGraph {
+  const maxDepth = options.maxDepth ?? 2;
+  const maxNodes = options.maxNodes ?? 30;
+  // remplacer MAX_DEPTH → maxDepth et MAX_NODES → maxNodes dans visit()
+}
+```
+
+### 8.2 — Helper `depthFromBudget`
+
+```typescript
+/** Traduit un budget de tokens estimé en profondeur de traversal. */
+export function depthFromBudget(tokenBudget: number): number {
+  if (tokenBudget >= 12_000) return 4;
+  if (tokenBudget >= 6_000)  return 3;
+  if (tokenBudget >= 2_000)  return 2;
+  return 1;
+}
+```
+
+Seuils calibrés sur ~150 tokens/nœud (signature + fanIn/fanOut), MAX_NODES=30 fixe.
+
+### 8.3 — Brancher dans `buildGraphPromptSection`
+
+```typescript
+// artifact-generator.ts appelle buildGraphPromptSection avec un budget
+export function buildGraphPromptSection(
+  callGraph: SerializedCallGraph,
+  signatures: FileSignatureMap,
+  tokenBudget?: number,          // ← nouveau paramètre optionnel
+): string {
+  const maxDepth = tokenBudget ? depthFromBudget(tokenBudget) : 2;
+  // ...
+  const sub = extractSubgraph(callGraph, godFn, { maxDepth });
+  // ...
+}
+```
+
+**Validation :** `npm run test:run` — zéro régression (les valeurs par défaut sont identiques aux constantes actuelles).
+
+---
+
 ## Ordre d'exécution et validation
 
 ```
@@ -898,6 +1024,8 @@ Phase 4 (TypeInference)     → npm run test:run        ✓
 Phase 5 (CppHeaderResolver) → npm run test:run        ✓
 Phase 6 (Intégration)       → npm run test:run        ✓
                             → npm run test:integration ✓
+Phase 7 (HTTP cross-lang)   → npm run test:run        ✓
+Phase 8 (Budget tokens)     → npm run test:run        ✓
 ```
 
 ---
@@ -974,3 +1102,5 @@ void start() {
 | `CallEdge.calleeId` est `''` pour les appels non résolus | Contrat conservé : ne jamais remplacer la chaîne vide par autre chose |
 | Scope des types inférés : fichier entier → pollution inter-fonctions | Passer `content.slice(node.startIndex, node.endIndex)` — indexer par `functionId`, pas `filePath` |
 | `confidence` ajouté à `CallEdge` — champ nouveau | Vérifier que les consommateurs de `CallGraphResult` (artifact-generator, tests) ne cassent pas si le champ est inconnu ; `name_only` est la valeur par défaut la plus permissive |
+| Phase 7 : `startIndex`/`endIndex` de `FunctionNode` sont des offsets caractères, pas des numéros de ligne | Vérifier que `httpEdge.call.line` est bien en lignes — utiliser `node.startLine`/`node.endLine` si disponible, sinon convertir |
+| Phase 8 : seuils de `depthFromBudget` sont des estimations | Calibrer sur les vrais specs générés une fois les phases 1–7 en place |
