@@ -32,8 +32,6 @@ export interface McpWatcherOptions {
   debounceMs?: number;
   /** Extra glob patterns to ignore in addition to defaults */
   ignore?: string[];
-  /** When true, also re-embed changed functions into the vector index */
-  embed?: boolean;
 }
 
 const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|php|cs|cpp|cc|cxx|h|hpp|c)$/;
@@ -55,7 +53,6 @@ export class McpWatcher {
   private readonly rootPath: string;
   private readonly outputPath: string;
   private readonly debounceMs: number;
-  private readonly embed: boolean;
   private readonly ignore: string[];
 
   private fsWatcher?: FSWatcher;
@@ -67,7 +64,6 @@ export class McpWatcher {
     this.outputPath = options.outputPath
       ?? join(options.rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
     this.debounceMs = options.debounceMs ?? 400;
-    this.embed      = options.embed ?? false;
     this.ignore     = [...DEFAULT_IGNORED, ...(options.ignore ?? [])];
   }
 
@@ -92,9 +88,7 @@ export class McpWatcher {
       this.fsWatcher.on('error', (err) => reject(err));
     });
 
-    process.stderr.write(
-      `[mcp-watcher] watching ${this.rootPath} (embed=${this.embed})\n`
-    );
+    process.stderr.write(`[mcp-watcher] watching ${this.rootPath}\n`);
   }
 
   async stop(): Promise<void> {
@@ -168,8 +162,8 @@ export class McpWatcher {
     await writeFile(contextPath, JSON.stringify(context, null, 2), 'utf-8');
     process.stderr.write(`[mcp-watcher] re-indexed signatures: ${rel}\n`);
 
-    // Optional: incremental vector re-embed
-    if (this.embed && context.callGraph) {
+    // Incremental vector re-embed — silently skipped if no embedding service available
+    if (context.callGraph) {
       await this.reEmbed(context, rel, content);
     }
   }

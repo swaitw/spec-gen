@@ -705,7 +705,6 @@ export const TOOL_DEFINITIONS = [
 interface McpServerOptions {
   watch?: string;
   watchAuto?: boolean;
-  watchEmbed?: boolean;
   watchDebounce?: string;
 }
 
@@ -734,7 +733,6 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
         autoWatcher = new McpWatcher({
           rootPath: resolve(dir),
           debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
-          embed: options.watchEmbed ?? false,
         });
         await autoWatcher.start();
         const cleanup = () => autoWatcher!.stop().then(() => process.exit(0));
@@ -861,7 +859,6 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
     const watcher = new McpWatcher({
       rootPath: resolve(options.watch),
       debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
-      embed: options.watchEmbed ?? false,
     });
     await watcher.start();
     const cleanup = () => watcher.stop().then(() => process.exit(0));
@@ -878,6 +875,5 @@ export const mcpCommand = new Command('mcp')
   .description('Start spec-gen as an MCP server (stdio transport, for Cline/Claude Code)')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
   .option('--watch-auto', 'Auto-detect the project directory from the first tool call and start watching (recommended for Cline/Claude Code)', false)
-  .option('--watch-embed', 'Also re-embed changed functions into the vector index when watching (requires embedding server)', false)
   .option('--watch-debounce <ms>', 'Debounce delay in ms before re-indexing after a file change (default: 400)', '400')
   .action((options: McpServerOptions) => startMcpServer(options));
