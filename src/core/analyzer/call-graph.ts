@@ -76,9 +76,49 @@ export interface LayerViolation {
   reason: string;
 }
 
+/**
+ * A class or interface as a structural unit, grouping its methods.
+ * Derived from FunctionNode.className after the call graph is built.
+ */
+export interface ClassNode {
+  /** Unique ID: first filePath where the class is seen + "::" + className */
+  id: string;
+  name: string;
+  filePath: string;
+  language: string;
+  /** Direct parent class names (from `extends` / Python base / C++ base) */
+  parentClasses: string[];
+  /** Implemented interfaces (TypeScript `implements`, Java `implements`) */
+  interfaces: string[];
+  /** IDs of FunctionNode members that belong to this class */
+  methodIds: string[];
+  /** Sum of method fanIn values */
+  fanIn: number;
+  /** Sum of method fanOut values */
+  fanOut: number;
+  /** True for synthetic file-level module nodes (free functions grouped by file) */
+  isModule?: boolean;
+}
+
+/**
+ * An inheritance or implementation edge between two ClassNodes in the graph.
+ */
+export interface InheritanceEdge {
+  id: string;
+  /** ClassNode id of the parent / base / interface */
+  parentId: string;
+  /** ClassNode id of the child / derived / implementor */
+  childId: string;
+  kind: 'extends' | 'implements' | 'embeds';
+}
+
 export interface CallGraphResult {
   nodes: Map<string, FunctionNode>;
   edges: CallEdge[];
+  /** Class-level structural nodes, derived from FunctionNode.className grouping */
+  classes: ClassNode[];
+  /** Inheritance / implementation edges between ClassNodes */
+  inheritanceEdges: InheritanceEdge[];
   /** Functions with fanIn >= HUB_THRESHOLD */
   hubFunctions: FunctionNode[];
   /** Functions with no internal callers (fanIn === 0) */
@@ -96,6 +136,8 @@ export interface CallGraphResult {
 export interface SerializedCallGraph {
   nodes: FunctionNode[];
   edges: CallEdge[];
+  classes: ClassNode[];
+  inheritanceEdges: InheritanceEdge[];
   hubFunctions: FunctionNode[];
   entryPoints: FunctionNode[];
   layerViolations: LayerViolation[];
@@ -1256,6 +1298,259 @@ async function extractCppGraph(
 }
 
 // ============================================================================
+// CLASS HIERARCHY EXTRACTION
+// ============================================================================
+
+/**
+ * Extract parent class / interface relationships from source files using
+ * tree-sitter.  Returns a map from `filePath::ClassName` → relationship info.
+ * Uses safeQuery so any query that doesn't match a grammar version is silently
+ * skipped rather than crashing.
+ */
+async function extractClassRelationships(
+  files: Array<{ path: string; content: string; language: string }>,
+): Promise<Map<string, { parentClasses: string[]; interfaces: string[] }>> {
+  const out = new Map<string, { parentClasses: string[]; interfaces: string[] }>();
+
+  // Helper to merge into map keyed by `filePath::ClassName`
+  function merge(
+    filePath: string,
+    className: string,
+    parents: string[],
+    ifaces: string[],
+  ) {
+    const key = `${filePath}::${className}`;
+    const existing = out.get(key) ?? { parentClasses: [], interfaces: [] };
+    for (const p of parents) if (!existing.parentClasses.includes(p)) existing.parentClasses.push(p);
+    for (const i of ifaces)  if (!existing.interfaces.includes(i))   existing.interfaces.push(i);
+    out.set(key, existing);
+  }
+
+  for (const file of files) {
+    try {
+      if (file.language === 'TypeScript' || file.language === 'JavaScript') {
+        const { parser, lang } = await getTSParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        // class Foo extends Bar implements Baz, Qux
+        const EXTENDS_Q = `
+          (class_declaration
+            name: (type_identifier) @cls
+            (class_heritage (extends_clause value: (identifier) @parent)))`;
+        const IMPLEMENTS_Q = `
+          (class_declaration
+            name: (type_identifier) @cls
+            (class_heritage (implements_clause (type_identifier) @iface)))`;
+
+        for (const m of safeQuery(lang, EXTENDS_Q, tree.rootNode)) {
+          const cls    = m.captures.find(c => c.name === 'cls')?.node.text;
+          const parent = m.captures.find(c => c.name === 'parent')?.node.text;
+          if (cls && parent) merge(file.path, cls, [parent], []);
+        }
+        for (const m of safeQuery(lang, IMPLEMENTS_Q, tree.rootNode)) {
+          const cls  = m.captures.find(c => c.name === 'cls')?.node.text;
+          const iface = m.captures.find(c => c.name === 'iface')?.node.text;
+          if (cls && iface) merge(file.path, cls, [], [iface]);
+        }
+
+      } else if (file.language === 'Python') {
+        const { parser, lang } = await getPyParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        // class Foo(Bar, Baz):
+        const Q = `
+          (class_definition
+            name: (identifier) @cls
+            superclasses: (argument_list (identifier) @parent))`;
+        for (const m of safeQuery(lang, Q, tree.rootNode)) {
+          const cls    = m.captures.find(c => c.name === 'cls')?.node.text;
+          const parent = m.captures.find(c => c.name === 'parent')?.node.text;
+          if (cls && parent && parent !== 'object') merge(file.path, cls, [parent], []);
+        }
+
+      } else if (file.language === 'Java') {
+        const { parser, lang } = await getJavaParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        const EXTENDS_Q = `
+          (class_declaration
+            name: (identifier) @cls
+            (superclass (type_identifier) @parent))`;
+        const IMPLEMENTS_Q = `
+          (class_declaration
+            name: (identifier) @cls
+            (super_interfaces (type_list (type_identifier) @iface)))`;
+
+        for (const m of safeQuery(lang, EXTENDS_Q, tree.rootNode)) {
+          const cls    = m.captures.find(c => c.name === 'cls')?.node.text;
+          const parent = m.captures.find(c => c.name === 'parent')?.node.text;
+          if (cls && parent) merge(file.path, cls, [parent], []);
+        }
+        for (const m of safeQuery(lang, IMPLEMENTS_Q, tree.rootNode)) {
+          const cls  = m.captures.find(c => c.name === 'cls')?.node.text;
+          const iface = m.captures.find(c => c.name === 'iface')?.node.text;
+          if (cls && iface) merge(file.path, cls, [], [iface]);
+        }
+
+      } else if (file.language === 'C++') {
+        const { parser, lang } = await getCppParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        // class Foo : public Bar
+        const Q = `
+          (class_specifier
+            name: (type_identifier) @cls
+            (base_class_clause (type_identifier) @parent))`;
+        for (const m of safeQuery(lang, Q, tree.rootNode)) {
+          const cls    = m.captures.find(c => c.name === 'cls')?.node.text;
+          const parent = m.captures.find(c => c.name === 'parent')?.node.text;
+          if (cls && parent) merge(file.path, cls, [parent], []);
+        }
+
+      } else if (file.language === 'Ruby') {
+        const { parser, lang } = await getRubyParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        // class Foo < Bar
+        const Q = `
+          (class
+            name: (constant) @cls
+            superclass: (superclass (constant) @parent))`;
+        for (const m of safeQuery(lang, Q, tree.rootNode)) {
+          const cls    = m.captures.find(c => c.name === 'cls')?.node.text;
+          const parent = m.captures.find(c => c.name === 'parent')?.node.text;
+          if (cls && parent) merge(file.path, cls, [parent], []);
+        }
+
+      } else if (file.language === 'Go') {
+        // Go has no inheritance but has struct embedding; treat as 'embeds' edges
+        const { parser, lang } = await getGoParser();
+        const tree = (parser as Parser).parse(file.content);
+
+        // Anonymous (embedded) field in a struct: type Foo struct { Bar }
+        const Q = `
+          (type_declaration
+            (type_spec
+              name: (type_identifier) @cls
+              type: (struct_type
+                (field_declaration_list
+                  (field_declaration
+                    type: (type_identifier) @embedded)))))`;
+        for (const m of safeQuery(lang, Q, tree.rootNode)) {
+          const cls      = m.captures.find(c => c.name === 'cls')?.node.text;
+          const embedded = m.captures.find(c => c.name === 'embedded')?.node.text;
+          if (cls && embedded) {
+            const key = `${file.path}::${cls}`;
+            const existing = out.get(key) ?? { parentClasses: [], interfaces: [] };
+            // Store Go embeds as parentClasses (will be tagged as 'embeds' when building edges)
+            if (!existing.parentClasses.includes(embedded)) existing.parentClasses.push(embedded);
+            out.set(key, existing);
+          }
+        }
+      }
+      // Rust: trait impls are structural but less like OOP inheritance; skip for now
+    } catch {
+      // Best-effort; skip unparseable files
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Build ClassNode[] from the set of extracted FunctionNodes (which carry
+ * `className`), enriched with inheritance data from `extractClassRelationships`.
+ *
+ * Functions without a className are grouped by file into synthetic module nodes
+ * (e.g. `[call-graph]`) so every function appears in the class graph, not just
+ * class methods. This is essential for codebases that use mostly module-level
+ * exports rather than OOP classes.
+ */
+function buildClassNodes(
+  allNodes: Map<string, FunctionNode>,
+  relationships: Map<string, { parentClasses: string[]; interfaces: string[] }>,
+): { classes: ClassNode[]; inheritanceEdges: InheritanceEdge[] } {
+  // Group FunctionNodes by (filePath, className).
+  // Free functions use a synthetic "[basename]" module name keyed by filePath alone.
+  const groups = new Map<string, {
+    name: string; filePath: string; language: string; isModule: boolean; methods: FunctionNode[]
+  }>();
+
+  for (const fn of allNodes.values()) {
+    let key: string;
+    let name: string;
+    let isModule: boolean;
+    if (fn.className) {
+      key = `${fn.filePath}::${fn.className}`;
+      name = fn.className;
+      isModule = false;
+    } else {
+      // Synthetic module node — one per file
+      key = fn.filePath;
+      const base = fn.filePath.split('/').pop() ?? fn.filePath;
+      name = '[' + base.replace(/\.[^.]+$/, '') + ']';
+      isModule = true;
+    }
+    if (!groups.has(key)) {
+      groups.set(key, { name, filePath: fn.filePath, language: fn.language, isModule, methods: [] });
+    }
+    groups.get(key)!.methods.push(fn);
+  }
+
+  // Build ClassNode[]
+  const classMap = new Map<string, ClassNode>();
+  for (const [id, g] of groups) {
+    const rel = relationships.get(id) ?? { parentClasses: [], interfaces: [] };
+    const cls: ClassNode = {
+      id,
+      name: g.name,
+      filePath: g.filePath,
+      language: g.language,
+      parentClasses: rel.parentClasses,
+      interfaces: rel.interfaces,
+      methodIds: g.methods.map(m => m.id),
+      fanIn:  g.methods.reduce((s, m) => s + m.fanIn, 0),
+      fanOut: g.methods.reduce((s, m) => s + m.fanOut, 0),
+      isModule: g.isModule,
+    };
+    classMap.set(id, cls);
+  }
+
+  // Build InheritanceEdge[] — only when both parent and child are in our graph
+  // Parent lookup: match by class name across all ClassNodes (first match wins)
+  const byName = new Map<string, ClassNode>();
+  for (const cls of classMap.values()) {
+    if (!byName.has(cls.name)) byName.set(cls.name, cls);
+  }
+
+  const inheritanceEdges: InheritanceEdge[] = [];
+  const seenEdges = new Set<string>();
+
+  for (const cls of classMap.values()) {
+    for (const parentName of cls.parentClasses) {
+      const parent = byName.get(parentName);
+      if (!parent) continue;
+      const edgeId = `${parent.id}->${cls.id}`;
+      if (seenEdges.has(edgeId)) continue;
+      seenEdges.add(edgeId);
+      // Go embedding vs OOP inheritance
+      const kind = cls.language === 'Go' ? 'embeds' : 'extends';
+      inheritanceEdges.push({ id: edgeId, parentId: parent.id, childId: cls.id, kind });
+    }
+    for (const ifaceName of cls.interfaces) {
+      const parent = byName.get(ifaceName);
+      if (!parent) continue;
+      const edgeId = `${parent.id}->${cls.id}`;
+      if (seenEdges.has(edgeId)) continue;
+      seenEdges.add(edgeId);
+      inheritanceEdges.push({ id: edgeId, parentId: parent.id, childId: cls.id, kind: 'implements' });
+    }
+  }
+
+  return { classes: Array.from(classMap.values()), inheritanceEdges };
+}
+
+// ============================================================================
 // CALL GRAPH BUILDER
 // ============================================================================
 
@@ -1446,9 +1741,15 @@ export class CallGraphBuilder {
     const totalFanIn = nodes.reduce((s, n) => s + n.fanIn, 0);
     const totalFanOut = nodes.reduce((s, n) => s + n.fanOut, 0);
 
+    // Pass 5: Build class hierarchy (inheritance + grouping)
+    const relationships = await extractClassRelationships(files);
+    const { classes, inheritanceEdges } = buildClassNodes(allNodes, relationships);
+
     return {
       nodes: allNodes,
       edges,
+      classes,
+      inheritanceEdges,
       hubFunctions,
       entryPoints,
       layerViolations,
@@ -1512,6 +1813,8 @@ export function serializeCallGraph(result: CallGraphResult): SerializedCallGraph
   return {
     nodes: Array.from(result.nodes.values()),
     edges: result.edges,
+    classes: result.classes,
+    inheritanceEdges: result.inheritanceEdges,
     hubFunctions: result.hubFunctions,
     entryPoints: result.entryPoints,
     layerViolations: result.layerViolations,

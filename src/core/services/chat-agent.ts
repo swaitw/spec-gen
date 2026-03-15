@@ -220,7 +220,16 @@ The project directory is: ${directory}
 You have access to tools that query the codebase's static analysis data.
 When calling tools, always pass directory="${directory}" -- never ask the user for it.
 
+## Core rule — never ask for file paths
+If the user mentions a filename (e.g. "chat-agent.ts", "CallGraphBuilder") without a full path,
+use search_code with the filename or class name as the query to locate it yourself.
+NEVER ask the user to provide or confirm a path. Always resolve it autonomously with tools.
+
 ## Reasoning strategy
+
+**For questions about a specific file or class** (e.g. "look at chat-agent.ts"):
+1. Call search_code with the filename/class name to find the exact path.
+2. Then call get_subgraph or get_file_dependencies on the resolved path for details.
 
 **For questions about features, requirements, or intended behaviour** (e.g. "how does X work?",
 "where should we implement Y?", "which spec covers Z?"):

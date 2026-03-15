@@ -10,6 +10,7 @@ import {
 } from './utils/graph-helpers.js';
 import { FlatGraph } from './components/FlatGraph.jsx';
 import { ClusterGraph } from './components/ClusterGraph.jsx';
+import { ClassGraph } from './components/ClassGraph.jsx';
 import { FilterBar } from './components/FilterBar.jsx';
 import { ArchitectureView } from './components/ArchitectureView.jsx';
 import { Hint, SL, Row, Chip, KindBadge } from './components/MicroComponents.jsx';
@@ -20,6 +21,10 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   const [rawGraph, setRawGraph] = useState(null);
   const [llmCtx, setLlmCtx] = useState(null);
   const [refReport, setRefReport] = useState(null);
+  const [classData, setClassData] = useState(null);
+  const [selectedClass, setSelectedClass] = useState(null); // full class object
+  const selectedClassId = selectedClass?.id ?? null;
+  const [focusedPaths, setFocusedPaths] = useState([]);
   const [mapping, setMapping] = useState(null);
   const [specReqs, setSpecReqs] = useState({});
   const [selectedId, setSelectedId] = useState(null);
@@ -121,6 +126,11 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         try {
           const ctxRes = await fetch('/api/llm-context');
           if (ctxRes.ok) setLlmCtx(await ctxRes.json());
+        } catch { /* ignore */ }
+
+        try {
+          const cgRes = await fetch('/api/class-graph');
+          if (cgRes.ok) setClassData(await cgRes.json());
         } catch { /* ignore */ }
 
         try {
@@ -499,6 +509,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
             ['clusters', '⬡ clusters'],
             ['flat', '⊙ flat'],
             ['architecture', '⬛ architecture'],
+            ['classes', '◈ classes'],
           ].map(([v, lbl]) => (
             <button
               key={v}
@@ -719,23 +730,6 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         >
           {theme.label}
         </button>
-        <button
-          onClick={cycleTheme}
-          title="Cycle theme"
-          style={{
-            background: 'none',
-            border: '1px solid var(--bd-muted)',
-            borderRadius: 4,
-            color: 'var(--ac-primary)',
-            fontSize: 8,
-            padding: '3px 8px',
-            cursor: 'pointer',
-            fontFamily: 'inherit',
-            letterSpacing: '0.06em',
-          }}
-        >
-          {theme.label}
-        </button>
         <input
           ref={mappingRef}
           type="file"
@@ -767,12 +761,14 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
       </div>
 
       {/* Filter bar */}
-      <FilterBar
-        filters={filters}
-        setFilters={setFilters}
-        stats={filterStats}
-        clusterNames={clusterNames}
-      />
+      {viewMode !== 'architecture' && viewMode !== 'classes' && (
+        <FilterBar
+          filters={filters}
+          setFilters={setFilters}
+          stats={filterStats}
+          clusterNames={clusterNames}
+        />
+      )}
 
       {/* Body */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
@@ -780,6 +776,14 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
           {viewMode === 'architecture' ? (
             <ArchitectureView graph={graph} llmCtx={llmCtx} focusedIds={focusedIds} />
+          ) : viewMode === 'classes' ? (
+            <ClassGraph
+              classData={classData}
+              selectedClassId={selectedClassId}
+              onSelectClass={setSelectedClass}
+              focusedPaths={focusedPaths}
+              onClear={() => setFocusedPaths([])}
+            />
           ) : viewMode === 'clusters' ? (
             <ClusterGraph
               clusters={displayClusters.filter(
@@ -830,6 +834,8 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
             >
               {viewMode === 'clusters'
                 ? 'CLICK CLUSTER -> EXPAND  ·  CLICK NODE -> INSPECT'
+                : viewMode === 'classes'
+                ? 'CLICK CLASS -> EXPAND METHODS  ·  DBL-CLICK -> RESET VIEW'
                 : 'CLICK NODE -> INSPECT'}
             </div>
           )}
@@ -839,7 +845,8 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         {chatOpen && (
           <ChatPanel
             onHighlight={(ids) => setFocusedIds(ids)}
-            onClose={() => { setChatOpen(false); setFocusedIds([]); }}
+            onHighlightPaths={(paths) => setFocusedPaths(paths)}
+            onClose={() => { setChatOpen(false); setFocusedIds([]); setFocusedPaths([]); }}
           />
         )}
 
@@ -849,7 +856,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
             width: 282,
             borderLeft: '1px solid var(--bd-faint)',
             background: 'var(--bg-deep)',
-            display: viewMode === 'architecture' ? 'none' : 'flex',
+            display: viewMode === 'architecture' || viewMode === 'classes' ? 'none' : 'flex',
             flexDirection: 'column',
             overflow: 'hidden',
             flexShrink: 0,
