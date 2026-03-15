@@ -41,6 +41,8 @@ function makeGraph(
   return {
     nodes,
     edges,
+    classes: [],
+    inheritanceEdges: [],
     hubFunctions: [],
     entryPoints: [],
     layerViolations: [],

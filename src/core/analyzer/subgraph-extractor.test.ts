@@ -105,6 +105,8 @@ const fixture: SerializedCallGraph = {
     { callerId: 'pipeline.ts::run', calleeId: 'pipeline.ts::runStage3', calleeName: 'runStage3', confidence: 'name_only' as const },
     { callerId: 'utils.ts::fmt', calleeId: 'utils.ts::escape', calleeName: 'escape', confidence: 'name_only' as const },
   ],
+  classes: [],
+  inheritanceEdges: [],
   hubFunctions: [],
   entryPoints: [],
   layerViolations: [],

@@ -120,6 +120,8 @@ function makeCallGraph(): SerializedCallGraph {
       { callerId: 'f2', calleeId: 'f6', calleeName: 'util',    line: 22, confidence: 'name_only' as const },
       { callerId: 'f1', calleeId: 'f6', calleeName: 'util',    line: 11, confidence: 'name_only' as const },
     ],
+    classes:         [],
+    inheritanceEdges: [],
     hubFunctions:    [hub],
     entryPoints:     [entry],
     layerViolations: [],

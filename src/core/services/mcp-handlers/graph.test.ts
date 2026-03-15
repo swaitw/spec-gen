@@ -39,6 +39,8 @@ function makeGraph(nodes: FunctionNode[], edges: CallEdge[]): SerializedCallGrap
   return {
     nodes,
     edges,
+    classes: [],
+    inheritanceEdges: [],
     hubFunctions: [],
     entryPoints: [],
     layerViolations: [],

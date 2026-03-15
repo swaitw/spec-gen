@@ -115,6 +115,8 @@ const MOCK_DEP_GRAPH: DependencyGraphResult = {
 const MOCK_CALL_GRAPH: SerializedCallGraph = {
   nodes: [],
   edges: [],
+  classes: [],
+  inheritanceEdges: [],
   hubFunctions: [
     { 
       id: 'node1', 
