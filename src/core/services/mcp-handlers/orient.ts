@@ -15,8 +15,11 @@
  */
 
 import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { validateDirectory, loadMappingIndex, specsForFile, functionsForDomain, readCachedContext } from './utils.js';
 import { readSpecGenConfig } from '../config-manager.js';
+import type { RagManifest } from '../../generator/rag-manifest-generator.js';
+import { OPENSPEC_DIR, ARTIFACT_RAG_MANIFEST } from '../../../constants.js';
 import {
   classifyRole,
   deriveStrategy,
@@ -70,6 +73,16 @@ interface OrientSpecMatch {
   title: string;
   score: number;
   text: string;
+}
+
+interface InlineSpec {
+  domain: string;
+  specPath: string;
+  sourceFiles: string[];
+  dependsOn: string[];
+  calledBy: string[];
+  /** Condensed spec content: Purpose + Dependencies section + Requirement names with file:line */
+  content: string;
 }
 
 // ============================================================================
@@ -248,6 +261,42 @@ export async function handleOrient(
     }
   }
 
+  // ── Inline spec content from RAG manifest ─────────────────────────────────
+  let inlineSpecs: InlineSpec[] | undefined;
+  if (specDomains.length > 0) {
+    try {
+      const cfg = await readSpecGenConfig(absDir);
+      const openspecRelPath = cfg?.openspecPath ?? OPENSPEC_DIR;
+      const manifestPath = join(absDir, openspecRelPath, ARTIFACT_RAG_MANIFEST);
+      const manifestRaw = await readFile(manifestPath, 'utf-8');
+      const manifest = JSON.parse(manifestRaw) as RagManifest;
+
+      const specs = await Promise.all(
+        specDomains.slice(0, 3).map(async sd => {
+          const entry = manifest.domains.find(d => d.domain.toLowerCase() === sd.domain.toLowerCase());
+          if (!entry) return null;
+          try {
+            const specContent = await readFile(join(absDir, entry.specPath), 'utf-8');
+            return {
+              domain: sd.domain,
+              specPath: entry.specPath,
+              sourceFiles: entry.sourceFiles,
+              dependsOn: entry.dependsOn,
+              calledBy: entry.calledBy,
+              content: condenseSpec(specContent),
+            } satisfies InlineSpec;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const filtered = specs.filter((s): s is InlineSpec => s !== null);
+      if (filtered.length > 0) inlineSpecs = filtered;
+    } catch {
+      // non-fatal — manifest may not exist yet (generate not yet run)
+    }
+  }
+
   // ── Next steps ────────────────────────────────────────────────────────────
   const nextSteps: string[] = [];
   if (insertionPoints.length > 0) {
@@ -256,9 +305,10 @@ export async function handleOrient(
     );
   }
   if (specDomains.length > 0) {
-    nextSteps.push(
-      `Call get_spec("${specDomains[0].domain}") to read the full spec before writing code`,
-    );
+    const hint = inlineSpecs
+      ? `Spec context for "${specDomains[0].domain}" is included in inlineSpecs — call get_spec("${specDomains[0].domain}") only if you need the full body`
+      : `Call get_spec("${specDomains[0].domain}") to read the full spec before writing code`;
+    nextSteps.push(hint);
   }
   nextSteps.push('After implementing, run check_spec_drift to verify the code matches the spec');
 
@@ -272,9 +322,71 @@ export async function handleOrient(
     relevantFunctions,
     ...(specLinkedFunctions.length > 0 ? { specLinkedFunctions } : {}),
     specDomains,
+    ...(inlineSpecs !== undefined ? { inlineSpecs } : {}),
     callPaths,
     insertionPoints,
     ...(matchingSpecs !== undefined ? { matchingSpecs } : {}),
     nextSteps,
   };
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/**
+ * Condense a spec's markdown to ~200-400 tokens:
+ * - ## Purpose — first paragraph only
+ * - ## Dependencies — full section (if present, added by Piste 4)
+ * - ### Requirement: {name} — header + > Implementation: line only, no body
+ */
+function condenseSpec(content: string): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let i = 0;
+
+  // Extract ## Purpose — first non-empty paragraph
+  const purposeStart = lines.findIndex(l => /^## Purpose\s*$/.test(l));
+  if (purposeStart !== -1) {
+    out.push(lines[purposeStart]);
+    i = purposeStart + 1;
+    // Skip blank lines, then collect until next blank
+    while (i < lines.length && lines[i].trim() === '') i++;
+    while (i < lines.length && lines[i].trim() !== '' && !lines[i].startsWith('#')) {
+      out.push(lines[i++]);
+    }
+    out.push('');
+  }
+
+  // Extract ## Dependencies section (full)
+  const depsStart = lines.findIndex(l => /^## Dependencies\s*$/.test(l));
+  if (depsStart !== -1) {
+    let j = depsStart;
+    while (j < lines.length && (j === depsStart || !lines[j].match(/^## /))) {
+      out.push(lines[j++]);
+    }
+    out.push('');
+  }
+
+  // Extract ### Requirement headers + > Implementation lines
+  const reqSection: string[] = [];
+  for (let k = 0; k < lines.length; k++) {
+    if (/^### Requirement:/.test(lines[k])) {
+      reqSection.push(lines[k]);
+      // Look for > Implementation: within next 5 lines
+      for (let m = k + 1; m < Math.min(k + 6, lines.length); m++) {
+        if (/^> Implementation:/.test(lines[m])) {
+          reqSection.push(lines[m]);
+          break;
+        }
+        if (lines[m].startsWith('###') || lines[m].startsWith('##')) break;
+      }
+    }
+  }
+  if (reqSection.length > 0) {
+    out.push('## Requirements (summary)');
+    out.push(...reqSection);
+  }
+
+  return out.join('\n').trim();
 }
