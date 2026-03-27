@@ -833,7 +833,7 @@ export class OpenSpecFormatGenerator {
       const order = { llm: 0, semantic: 1, heuristic: 2 };
       return (order[a.confidence] ?? 3) - (order[b.confidence] ?? 3);
     })[0];
-    lines.push(`> Implementation: \`${best.file}:${best.line}\` · confidence: ${best.confidence}`);
+    lines.push(`> Implementation: \`${best.name}\` in \`${best.file}\` · confidence: ${best.confidence}`);
     lines.push('');
   }
 
