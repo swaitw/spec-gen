@@ -81,6 +81,7 @@ Do not propose spec updates on untested code.
 | Method | Assets |
 |---|---|
 | **BMAD** | [`examples/bmad/`](../../examples/bmad/) — agents, tasks, templates, skills |
+| **Mistral Vibe** | [`examples/mistral-vibe/`](../../examples/mistral-vibe/) — reusable skills for analyze, generate, plan-refactor, execute-refactor |
 | Claude Code | Add `orient` + `analyze_impact` calls to your `CLAUDE.md` workflow section |
 | Cursor | See pre-flight `.cursorrules` pattern in this doc |
 
