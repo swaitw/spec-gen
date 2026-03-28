@@ -126,15 +126,55 @@ explicitly acknowledges the risk and overrides the gate.
 
 ## Step 5 — Informed brainstorming
 
-Only now engage in design discussion with the user.
+Use the **Constrained Option Tree** method. Four phases, in order.
 
-Ask questions that are grounded in the structural context from Steps 2–4:
-- "The proposal identified `$FUNCTION` as the main insertion point — does that align with your intent?"
-- "This feature touches `$DOMAIN` which has `$N` existing requirements. Should it extend or replace `$REQUIREMENT`?"
-- "The architecture shows `$HUB` as a bottleneck in this area — should we route around it or go through it?"
+### 5a — Establish the constraint space
 
-Do not ask generic design questions (e.g. "what should this do?") that ignore
-the structural context already gathered.
+List what the structure prohibits or requires, derived from Steps 2–4:
+
+```
+Hard constraints (non-negotiable):
+  - Functions with riskScore ≥ 70: $BLOCKED_FUNCTIONS (cannot be modified without prior refactor)
+  - Requirements that must be preserved: $REQUIREMENTS_TOUCHED
+  - Domain boundaries that must not be crossed: $DOMAIN_BOUNDARIES
+
+Soft constraints (preferred):
+  - Existing insertion points: $INSERTION_POINTS
+  - Patterns already used in $DOMAINS_AFFECTED
+```
+
+Present this to the user before generating any options. Ask: "Are there additional
+constraints I should know about before we explore approaches?"
+
+### 5b — Generate 2–3 options
+
+Produce exactly 2–3 concrete implementation approaches that each respect the hard
+constraints. Name them clearly (e.g. Option A — Extend existing, Option B — New service,
+Option C — Facade).
+
+For each option, fill this table:
+
+| | Option A | Option B | Option C |
+|---|---|---|---|
+| Insertion point | | | |
+| Domains touched | | | |
+| Risk score impact | | | |
+| Requirements affected | | | |
+| Estimated scope (files) | | | |
+| Trade-off | | | |
+
+### 5c — Recommend
+
+State a recommendation with a single reason grounded in the structural data:
+
+> "Recommend Option B — it inserts at `$SAFE_FUNCTION` (risk 18) and avoids
+> touching `$HUB` entirely. Option A is valid but routes through `$HUB` (fan-in 14),
+> which adds blast radius for marginal benefit."
+
+### 5d — Confirm
+
+Ask the user to choose or modify an option. Do not proceed to Step 6 until
+a choice is made. If the user wants a hybrid, produce a revised option table.
 
 ---
 
