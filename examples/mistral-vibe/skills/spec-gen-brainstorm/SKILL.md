@@ -1,6 +1,6 @@
 ---
 name: spec-gen-brainstorm
-description: Transform a feature idea into an annotated story with risk_context pre-filled, using spec-gen structural context before any design discussion. Ensures architectural reality informs design choices.
+description: Transform a feature idea into an annotated story. Detects greenfield vs brownfield automatically — uses Domain Sketch for greenfield (no existing code), Constrained Option Tree for brownfield (existing codebase with spec-gen analysis).
 license: MIT
 compatibility: spec-gen MCP server
 user-invocable: true
@@ -24,29 +24,14 @@ writing any code, with phrasings like:
 - "let's brainstorm this story"
 - explicit command `/spec-gen-brainstorm`
 
-**The rule**: structural context comes before design questions. Do not ask
-architecture or design questions before running Steps 2–4.
-
-**Prerequisite**: spec-gen analysis must exist (`spec-gen analyze` has been run).
-If `orient` returns `"error": "no cache"` → run `analyze_codebase` first, then retry.
-
 ---
 
-## Step 1 — Read the project context
+## Step 1 — Detect mode
 
-Check whether `openspec/specs/` exists in `$PROJECT_ROOT`.
+Capture `$PROJECT_ROOT`, `$FEATURE_DESCRIPTION`, and
+`$FEATURE_SLUG` (kebab-case, ≤ 5 words, e.g. `payment-retry-flow`).
 
-| Situation | Action |
-|---|---|
-| `openspec/specs/` exists | Proceed — `search_specs` will be available in Step 4 |
-| `openspec/specs/` absent | Warn the user: "No specs found. `search_specs` will be skipped. Run `spec-gen generate` for better results." Proceed without it. |
-
-Capture `$PROJECT_ROOT`, `$FEATURE_DESCRIPTION` (from the user's request),
-and `$FEATURE_SLUG` (kebab-case, ≤ 5 words, e.g. `payment-retry-flow`).
-
----
-
-## Step 2 — Orient
+Then probe the structural index:
 
 ```xml
 <use_mcp_tool>
@@ -60,14 +45,24 @@ and `$FEATURE_SLUG` (kebab-case, ≤ 5 words, e.g. `payment-retry-flow`).
 </use_mcp_tool>
 ```
 
-Extract:
-- **`$TOP_FUNCTIONS`** — top 2–3 functions by relevance score
-- **`$DOMAINS_AFFECTED`** — spec domains touched
-- **`$INSERTION_POINTS`** — candidate insertion locations
+Set `$MODE` based on the result:
+
+| Result | `$MODE` | Meaning |
+|---|---|---|
+| Returns functions with score > 0 | `brownfield` | Existing indexed codebase |
+| Returns `"error": "no cache"` or 0 functions | `greenfield` | No structural index yet |
+
+Inform the user:
+- Brownfield: "I found existing code related to this feature. Using structural analysis to guide design."
+- Greenfield: "No structural index found. Using Domain Sketch — structural analysis will be available after `spec-gen analyze` is run on the first implementation."
 
 ---
 
-## Step 3 — Architecture overview
+## Steps 2–4 — Structural analysis (brownfield only)
+
+*Skip to Step 5 if `$MODE = greenfield`.*
+
+### Step 2 — Architecture overview
 
 ```xml
 <use_mcp_tool>
@@ -77,13 +72,9 @@ Extract:
 </use_mcp_tool>
 ```
 
-Note:
-- **Hub functions** in `$DOMAINS_AFFECTED` — features touching hubs carry inherent risk
-- **Cross-domain dependencies** — signals that the feature may ripple beyond its primary domain
+Note hub functions and cross-domain dependencies in `$DOMAINS_AFFECTED`.
 
----
-
-## Step 4 — Generate change proposal
+### Step 3 — Generate change proposal
 
 ```xml
 <use_mcp_tool>
@@ -97,44 +88,41 @@ Note:
 </use_mcp_tool>
 ```
 
-This tool chains `orient` + `search_specs` + `analyze_impact` and writes
+Chains `orient` + `search_specs` + `analyze_impact` and writes
 `openspec/changes/$FEATURE_SLUG/proposal.md`.
 
-Extract from the result:
-- **`$MAX_RISK_SCORE`** — overall risk level of the feature
+Extract:
+- **`$MAX_RISK_SCORE`** — overall risk level
 - **`$REQUIREMENTS_TOUCHED`** — existing requirements this feature overlaps
-- **`$BLOCKING_REFACTORS`** — functions with risk ≥ 70 that must be refactored first
+- **`$BLOCKING_REFACTORS`** — functions with risk ≥ 70
 
-**Risk gate:**
+### Step 4 — Risk gate
 
-| Score | Situation | Action |
-|---|---|---|
-| 🟢 < 40 | Low risk | Proceed to brainstorming |
-| 🟡 40–69 | Medium risk | Proceed, flag impacted callers to protect during design |
-| 🔴 ≥ 70 | Blocked | Stop — inform the user, propose a blocking refactor story before continuing |
+| Score | Action |
+|---|---|
+| 🟢 < 40 | Proceed to Step 5 |
+| 🟡 40–69 | Proceed, flag impacted callers to protect during design |
+| 🔴 ≥ 70 | Stop — propose a blocking refactor story before continuing |
 
-If `$MAX_RISK_SCORE ≥ 70`, output:
-
+If blocked:
 > "This feature touches `$BLOCKING_FUNCTION` (risk score: $SCORE).
-> A refactor story must be completed before this feature can be implemented safely.
-> I can create the refactor story now if you'd like."
+> A refactor story must be completed first. I can create it now if you'd like."
 
-Do not continue to Step 5 until the user either accepts the refactor story or
-explicitly acknowledges the risk and overrides the gate.
+Do not continue until the user accepts the refactor story or explicitly overrides.
 
 ---
 
-## Step 5 — Informed brainstorming
+## Step 5 — Brainstorming
 
-Use the **Constrained Option Tree** method. Four phases, in order.
+### If `$MODE = brownfield` — Constrained Option Tree
 
-### 5a — Establish the constraint space
+**5a — Establish the constraint space**
 
-List what the structure prohibits or requires, derived from Steps 2–4:
+Derive from Steps 2–4 and present before generating options:
 
 ```
 Hard constraints (non-negotiable):
-  - Functions with riskScore ≥ 70: $BLOCKED_FUNCTIONS (cannot be modified without prior refactor)
+  - Functions with riskScore ≥ 70: $BLOCKED_FUNCTIONS
   - Requirements that must be preserved: $REQUIREMENTS_TOUCHED
   - Domain boundaries that must not be crossed: $DOMAIN_BOUNDARIES
 
@@ -143,16 +131,12 @@ Soft constraints (preferred):
   - Patterns already used in $DOMAINS_AFFECTED
 ```
 
-Present this to the user before generating any options. Ask: "Are there additional
-constraints I should know about before we explore approaches?"
+Ask: "Are there additional constraints before we explore approaches?"
 
-### 5b — Generate 2–3 options
+**5b — Generate 2–3 options**
 
-Produce exactly 2–3 concrete implementation approaches that each respect the hard
-constraints. Name them clearly (e.g. Option A — Extend existing, Option B — New service,
-Option C — Facade).
-
-For each option, fill this table:
+Each option must respect hard constraints. Name them clearly
+(e.g. Option A — Extend existing, Option B — New service, Option C — Facade).
 
 | | Option A | Option B | Option C |
 |---|---|---|---|
@@ -163,18 +147,69 @@ For each option, fill this table:
 | Estimated scope (files) | | | |
 | Trade-off | | | |
 
-### 5c — Recommend
+**5c — Recommend**
 
-State a recommendation with a single reason grounded in the structural data:
+State one recommendation with a single structural reason:
 
-> "Recommend Option B — it inserts at `$SAFE_FUNCTION` (risk 18) and avoids
-> touching `$HUB` entirely. Option A is valid but routes through `$HUB` (fan-in 14),
-> which adds blast radius for marginal benefit."
+> "Recommend Option B — inserts at `$SAFE_FUNCTION` (risk 18), avoids `$HUB`
+> (fan-in 14) entirely. Option A is valid but adds unnecessary blast radius."
 
-### 5d — Confirm
+**5d — Confirm**
 
-Ask the user to choose or modify an option. Do not proceed to Step 6 until
-a choice is made. If the user wants a hybrid, produce a revised option table.
+Do not proceed to Step 6 until the user chooses. If they want a hybrid,
+produce a revised option table.
+
+---
+
+### If `$MODE = greenfield` — Domain Sketch
+
+No existing structure to constrain — the method builds the structure from scratch.
+
+**5a — Entities**
+
+Ask the user: "What are the core data objects this feature creates or transforms?"
+
+List them as nouns with a one-line definition each:
+```
+$ENTITY_1 — definition
+$ENTITY_2 — definition
+```
+
+**5b — Operations**
+
+For each entity, identify the operations the feature needs (create, read,
+transform, delete, emit, receive…):
+
+```
+$ENTITY_1: $OP_1, $OP_2
+$ENTITY_2: $OP_1
+```
+
+Identify which operations cross a system boundary (external API, database,
+event bus, CLI…) — these are the riskiest integration points.
+
+**5c — Boundaries**
+
+Define where the feature sits relative to the system:
+
+```
+Entry point:   $HOW_IT_IS_TRIGGERED (HTTP request / CLI command / event / cron)
+Data in:       $INPUT_FORMAT
+Data out:      $OUTPUT_FORMAT or side-effects
+External deps: $THIRD_PARTY_SERVICES or "none"
+```
+
+**5d — Architecture decisions**
+
+State 2–3 decisions that must be made before coding. For each, list the options
+and a recommendation:
+
+| Decision | Options | Recommendation |
+|---|---|---|
+| e.g. Storage | in-memory / DB / file | DB — survives restarts |
+| e.g. Coupling | new module / extend existing | new module — clear boundary |
+
+Ask the user to confirm or override each decision before proceeding to Step 6.
 
 ---
 
@@ -182,9 +217,10 @@ a choice is made. If the user wants a hybrid, produce a revised option table.
 
 Produce a story file at `$STORIES_DIR/$FEATURE_SLUG.md`.
 
-If a story template exists at `$PROJECT_ROOT/examples/bmad/templates/story.md`
-or `$PROJECT_ROOT/_bmad/spec-gen/templates/story.md`, use it. Otherwise use
-this structure:
+If a story template exists at `$PROJECT_ROOT/_bmad/spec-gen/templates/story.md`
+or `$PROJECT_ROOT/examples/bmad/templates/story.md`, use it. Otherwise:
+
+**Brownfield template:**
 
 ```markdown
 # $STORY_TITLE
@@ -204,21 +240,56 @@ $FEATURE_DESCRIPTION
 
 ## Technical Constraints
 
-$CONSTRAINTS_FROM_PROPOSAL
+$BLOCKING_REFACTORS and caller protection notes from the proposal.
 
 ## Notes
 
+- Chosen approach: $CHOSEN_OPTION — $TRADE_OFF
 - Domains affected: $DOMAINS_AFFECTED
 - Requirements touched: $REQUIREMENTS_TOUCHED
 - Max risk score: $MAX_RISK_SCORE
 ```
 
-Fill `## Technical Constraints` from `$BLOCKING_REFACTORS` and any caller
-protection notes from the proposal.
+**Greenfield template:**
+
+```markdown
+# $STORY_TITLE
+
+## Goal
+
+$FEATURE_DESCRIPTION
+
+## Acceptance Criteria
+
+- [ ] $AC_1
+- [ ] $AC_2
+
+## Domain Sketch
+
+### Entities
+$ENTITIES
+
+### Operations
+$OPERATIONS
+
+### Boundaries
+$BOUNDARIES
+
+## Architecture Decisions
+
+$DECISIONS_TABLE
+
+## Notes
+
+- First implementation — run `spec-gen analyze && spec-gen generate` after
+  to enable structural analysis for future stories.
+```
 
 ---
 
 ## Step 7 — Annotate the story
+
+**Brownfield only.** Skip if `$MODE = greenfield`.
 
 ```xml
 <use_mcp_tool>
@@ -232,23 +303,23 @@ protection notes from the proposal.
 </use_mcp_tool>
 ```
 
-This patches `## Risk Context` in the story file directly. The story is now
-ready to be passed to `spec-gen-implement-story`.
+Patches `## Risk Context` directly. Story is now ready for `spec-gen-implement-story`.
 
-Confirm to the user:
-> "Story written to `$STORY_FILE_PATH` with risk context pre-filled.
-> Pass it to `/spec-gen-implement-story` when ready to implement."
+**Greenfield:** confirm to the user:
+> "Story written to `$STORY_FILE_PATH`. No risk context yet — run
+> `spec-gen analyze` after the first implementation sprint to enable
+> structural analysis for future stories."
 
 ---
 
 ## Absolute constraints
 
-- Do not ask design questions before Step 4 (`generate_change_proposal`) is complete
-- If `$MAX_RISK_SCORE ≥ 70` — do not proceed to brainstorming without acknowledgement
-- If `openspec/specs/` is absent — mention the limitation but do not block
-- Do not fill `## Risk Context` manually — always use `annotate_story`
+- Do not ask design questions before Step 5 (both modes)
+- Brownfield: do not proceed past Step 4 if `$MAX_RISK_SCORE ≥ 70` without acknowledgement
+- Brownfield: do not fill `## Risk Context` manually — always use `annotate_story`
+- Greenfield: do not call `annotate_story` — there is nothing to annotate yet
 - Do not propose implementation steps — this skill ends at story creation
-- `generate_change_proposal` creates `openspec/changes/$FEATURE_SLUG/proposal.md` on disk.
-  Ideas that are abandoned leave orphan files. Inform the user at the end of the session:
+- Brownfield: `generate_change_proposal` creates `openspec/changes/$FEATURE_SLUG/proposal.md`
+  on disk. Inform the user at session end:
   "A proposal file was created at `openspec/changes/$FEATURE_SLUG/proposal.md`.
   Delete it if this idea is not pursued."
