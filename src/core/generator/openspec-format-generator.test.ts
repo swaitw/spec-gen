@@ -898,7 +898,7 @@ describe('OpenSpecFormatGenerator — > Implementation annotations', () => {
     const specs = gen.generateSpecs(result, mapping);
     const userSpec = specs.find(s => s.domain === 'user')!;
 
-    expect(userSpec.content).toContain('> Implementation: `src/services/user.ts:42` · confidence: llm');
+    expect(userSpec.content).toContain('> Implementation: `doSomething` in `src/services/user.ts` · confidence: llm');
   });
 
   it('does not emit > Implementation when no matching mapping', () => {
@@ -944,7 +944,7 @@ describe('OpenSpecFormatGenerator — > Implementation annotations', () => {
     const specs = gen.generateSpecs(result, mapping);
     const userSpec = specs.find(s => s.domain === 'user')!;
 
-    expect(userSpec.content).toContain('src/llm.ts:2');
+    expect(userSpec.content).toContain('`getUserLlm` in `src/llm.ts`');
     expect(userSpec.content).not.toContain('src/h.ts');
     expect(userSpec.content).not.toContain('src/sem.ts');
   });

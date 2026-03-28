@@ -44,6 +44,7 @@ import {
   handleSearchSpecs,
   handleListSpecDomains,
   handleGetSpec,
+  handleUnifiedSearch,
 } from '../../core/services/mcp-handlers/semantic.js';
 import { handleOrient } from '../../core/services/mcp-handlers/orient.js';
 import {
@@ -652,6 +653,46 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'search_unified',
+    description:
+      'USE THIS WHEN: you want to find where something is implemented AND what the spec says about it ' +
+      'in a single call. Searches both code functions and spec requirements simultaneously, then ' +
+      'cross-boosts results that are linked through mapping.json — so a function that implements a ' +
+      'matching requirement ranks higher than one found by code search alone. ' +
+      'Returns results with type "code", "spec", or "both" and a mappingBoost score. ' +
+      'Requires "spec-gen analyze --embed" and a prior "spec-gen generate" run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'Absolute path to the project directory',
+        },
+        query: {
+          type: 'string',
+          description: 'Natural language query, e.g. "validate user authentication"',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of results to return (default: 10)',
+        },
+        language: {
+          type: 'string',
+          description: 'Filter code results by language (e.g. "TypeScript")',
+        },
+        domain: {
+          type: 'string',
+          description: 'Filter spec results by domain name',
+        },
+        section: {
+          type: 'string',
+          description: 'Filter spec results by section type: "requirements", "purpose", etc.',
+        },
+      },
+      required: ['directory', 'query'],
+    },
+  },
+  {
     name: 'get_spec',
     description:
       'Return the full content of a spec domain\'s specification file (spec.md) and the ' +
@@ -855,6 +896,10 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
         const { directory, query, limit = 10, domain, section } =
           args as { directory: string; query: string; limit?: number; domain?: string; section?: string };
         result = await handleSearchSpecs(directory, query, limit, domain, section);
+      } else if (name === 'search_unified') {
+        const { directory, query, limit = 10, language, domain, section } =
+          args as { directory: string; query: string; limit?: number; language?: string; domain?: string; section?: string };
+        result = await handleUnifiedSearch(directory, query, limit, language, domain, section);
       } else if (name === 'list_spec_domains') {
         const { directory } = args as { directory: string };
         result = await handleListSpecDomains(directory);
