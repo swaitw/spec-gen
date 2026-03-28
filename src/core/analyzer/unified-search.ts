@@ -250,7 +250,7 @@ export class UnifiedSearch {
     const { SpecVectorIndex } = await import('./spec-vector-index.js');
 
     // Load mapping index
-    const mappingJsonPath = join(outputDir, '../mapping.json');
+    const mappingJsonPath = join(outputDir, 'mapping.json');
     let mappingIndex = {
       functionToRequirements: new Map<string, Array<{ domain: string; requirement: string }>>(),
       requirementToFunctions: new Map<string, Array<{ file: string; name: string }>>(),
