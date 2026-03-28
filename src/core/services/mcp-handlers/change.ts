@@ -62,7 +62,7 @@ interface ImpactResult {
   file?: string;
   riskScore?: number;
   riskLevel?: string;
-  recommendedStrategy?: string;
+  recommendedStrategy?: string | { approach: string; rationale: string };
   metrics?: { fanIn: number; fanOut: number; isHub: boolean };
   upstreamChain?: Array<{ name?: string; filePath?: string }>;
   error?: string;
@@ -71,6 +71,12 @@ interface ImpactResult {
 // ============================================================================
 // PROPOSAL TEMPLATE BUILDER
 // ============================================================================
+
+function strategyText(s: ImpactResult['recommendedStrategy']): string {
+  if (!s) return 'n/a';
+  if (typeof s === 'string') return s;
+  return s.approach;
+}
 
 function riskBadge(score: number): string {
   if (score <= 20) return '🟢 low';
@@ -216,7 +222,7 @@ function buildProposal(
     for (const i of validImpacts) {
       const score = i.riskScore ?? 0;
       lines.push(
-        `| \`${i.symbol}\` | ${score} | ${riskBadge(score)} | \`${i.recommendedStrategy ?? 'n/a'}\` |`
+        `| \`${i.symbol}\` | ${score} | ${riskBadge(score)} | \`${strategyText(i.recommendedStrategy)}\` |`
       );
     }
     lines.push('');
