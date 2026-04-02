@@ -18,11 +18,11 @@
         {
           default = pkgs.buildNpmPackage {
             pname = "spec-gen";
-            version = "1.0.0";
+            version = "1.2.6";
 
             src = ./.;
 
-            npmDepsHash = "sha256-5l/gdzyivfA5w5/0GA5vte3NY7AMfoFsqMvWgkzfM1A=";
+            npmDepsHash = "sha256-cjPSzdyG3LrSKPwObVXU0YBAFjibi2kx45lItd0zv2w=";
 
             # Build TypeScript
             buildPhase = ''
