@@ -10,15 +10,12 @@ import { confirm } from '@inquirer/prompts';
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
-import { fileExists, formatDuration, formatAge, parseList, readJsonFile, resolveLLMProvider } from '../../utils/command-helpers.js';
+import { fileExists, formatDuration, formatAge, parseList, readJsonFile, resolveLLMProvider, estimateCost } from '../../utils/command-helpers.js';
 import {
-  LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS,
-  GENERATION_OUTPUT_RATIO,
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_OPENAI_MODEL,
   DEFAULT_OPENAI_COMPAT_MODEL,
   DEFAULT_GEMINI_MODEL,
-  DEFAULT_SURVEY_ESTIMATED_TOKENS,
   COST_CONFIRMATION_THRESHOLD,
   SPEC_GEN_DIR,
   SPEC_GEN_ANALYSIS_REL_PATH,
@@ -40,7 +37,6 @@ import {
 } from '../../core/services/config-manager.js';
 import {
   createLLMService,
-  lookupPricing,
   type LLMService,
 } from '../../core/services/llm-service.js';
 import {
@@ -134,33 +130,6 @@ async function loadAnalysis(analysisPath: string): Promise<AnalysisData | null> 
  *   Stage 5 — 1 call  (architecture synthesis, full context)
  *   Stage 6 — 1 call  (ADR, optional — not counted here)
  */
-function estimateCost(
-  llmContext: LLMContext,
-  provider: string,
-  model: string
-): { tokens: number; cost: number } {
-  const OVERHEAD = LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS;
-  const OUTPUT_RATIO = GENERATION_OUTPUT_RATIO;
-
-  const phase2Files = llmContext.phase2_deep.files;
-  const phase2Total = phase2Files.reduce((s, f) => s + f.tokens, 0);
-  const fileOverhead = OVERHEAD * phase2Files.length;
-
-  const stage1Input = (llmContext.phase1_survey.estimatedTokens ?? DEFAULT_SURVEY_ESTIMATED_TOKENS) + OVERHEAD;
-  const stage2Input = phase2Total + fileOverhead;                        // entity extraction
-  const stage3Input = phase2Total + fileOverhead;                        // service analysis (same files)
-  const stage4Input = Math.ceil(phase2Total * 0.5) + OVERHEAD;           // API extraction
-  const stage5Input = Math.ceil((stage1Input + stage2Input) * 0.3) + OVERHEAD; // architecture
-
-  const totalInput = stage1Input + stage2Input + stage3Input + stage4Input + stage5Input;
-  const totalOutput = Math.ceil(totalInput * OUTPUT_RATIO);
-
-  const modelPricing = lookupPricing(provider, model);
-  const cost = (totalInput / 1_000_000) * modelPricing.input
-             + (totalOutput / 1_000_000) * modelPricing.output;
-
-  return { tokens: totalInput + totalOutput, cost };
-}
 
 /**
  * Prompt user for confirmation. Uses @inquirer/prompts in TTY, auto-yes otherwise.
