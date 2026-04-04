@@ -1,6 +1,6 @@
 # Verifier Specification
 
-> Updated: 2026-03-12 (session 3)
+> Updated: 2026-04-04
 > Source: `src/core/verifier/verification-engine.ts`
 
 ## Purpose
@@ -45,7 +45,7 @@ The system SHALL verify a single file against its specification.
 #### Scenario: LlmCallFails
 - **GIVEN** the LLM service throws a network or quota error
 - **WHEN** `verifyFile` is called
-- **THEN** the file is marked as skipped with an error message and does not crash the overall run
+- **THEN** the file is excluded from the report entirely and does not crash the overall run
 
 ### Requirement: Getdomains
 
@@ -282,7 +282,7 @@ The system SHALL calculate a weighted overall score from purpose, import, and ex
 #### Scenario: WeightedScore
 - **GIVEN** `purposeScore=1.0`, `importScore=0.0`, `exportScore=0.0`
 - **WHEN** the overall score is calculated
-- **THEN** the overall score equals the purpose weight (approximately 0.25)
+- **THEN** the overall score equals the purpose weight (approximately 0.40)
 
 #### Scenario: PassThreshold
 - **GIVEN** an overall score above the configured pass threshold (default 0.5)
@@ -351,7 +351,7 @@ The system SHALL collect non-fatal warnings (skipped files, LLM errors) and incl
 #### Scenario: LlmErrorCollected
 - **GIVEN** one file's LLM call throws an error
 - **WHEN** verification completes
-- **THEN** that file appears in the `skippedFiles` list with the error message, and other files are still verified
+- **THEN** that file is absent from the report results, a warning is logged, and other files are still verified
 
 #### Requirement: Skipfiles
 
@@ -369,11 +369,11 @@ The system SHALL fall back to a minimal result when a file cannot be verified, p
 #### Scenario: FallbackResult
 - **GIVEN** a file that fails both parsing and LLM prediction
 - **WHEN** verification runs
-- **THEN** a zero-score result is recorded rather than propagating an exception
+- **THEN** the file is excluded from results and a warning is logged, rather than propagating an exception or recording a misleading zero score
 
 ## Technical Notes
 
 - **Dependencies**: `LLMService`, `DependencyGraphResult`
 - **Pass threshold**: Default 0.5 (configurable via `VerifyApiOptions.threshold`)
-- **Score weights**: purpose = 0.25, imports = 0.30, exports = 0.30, requirements = 0.15 (see `calculateOverallScore`)
-- **Note on weights**: When both import and export prediction return F1=0, the maximum achievable score is 0.40 (purpose 0.25 + requirements 0.15). The default threshold of 0.5 allows files with strong purpose + requirement coverage to pass even with weak import/export prediction.
+- **Score weights**: purpose = 0.40, imports = 0.15, exports = 0.15, requirements = 0.30 (see `calculateOverallScore`)
+- **Note on weights**: Specs describe behaviour and architecture, not exact import paths or export names. Weighting imports+exports too heavily makes it structurally impossible to pass regardless of spec quality. With the current weights, the maximum achievable score when import/export F1=0 is 0.70 (purpose 0.40 + requirements 0.30), which is above the default pass threshold of 0.50. Import/export F1 still contributes as a positive signal when the LLM predicts correctly.
