@@ -512,7 +512,7 @@ export class PaymentService {}`;
 
     // Fix 1: verify the actual weights are 40/15/15/30, not the old 25/30/30/15.
     // Each sub-score is isolated to confirm its exact contribution.
-    it('should apply purpose weight of 40%', () => {
+    it('should apply purpose weight of 50%', () => {
       const engine = new SpecVerificationEngine(llmService, {
         rootPath: testDir,
         openspecPath: openspecDir,
@@ -526,10 +526,10 @@ export class PaymentService {}`;
         { coverage: 0 }
       );
 
-      expect(score).toBeCloseTo(0.40, 5);
+      expect(score).toBeCloseTo(0.50, 5);
     });
 
-    it('should apply requirements weight of 30%', () => {
+    it('should apply requirements weight of 40%', () => {
       const engine = new SpecVerificationEngine(llmService, {
         rootPath: testDir,
         openspecPath: openspecDir,
@@ -543,27 +543,10 @@ export class PaymentService {}`;
         { coverage: 1.0 }
       );
 
-      expect(score).toBeCloseTo(0.30, 5);
+      expect(score).toBeCloseTo(0.40, 5);
     });
 
-    it('should apply import weight of 15%', () => {
-      const engine = new SpecVerificationEngine(llmService, {
-        rootPath: testDir,
-        openspecPath: openspecDir,
-        outputDir,
-      });
-
-      const score = (engine as any).calculateOverallScore(
-        { similarity: 0 },
-        { f1Score: 1.0 },
-        { f1Score: 0 },
-        { coverage: 0 }
-      );
-
-      expect(score).toBeCloseTo(0.15, 5);
-    });
-
-    it('should apply export weight of 15%', () => {
+    it('should apply export weight of 10%', () => {
       const engine = new SpecVerificationEngine(llmService, {
         rootPath: testDir,
         openspecPath: openspecDir,
@@ -577,12 +560,11 @@ export class PaymentService {}`;
         { coverage: 0 }
       );
 
-      expect(score).toBeCloseTo(0.15, 5);
+      expect(score).toBeCloseTo(0.10, 5);
     });
 
-    it('should allow passing with zero import/export F1 when purpose and requirements are strong', () => {
-      // With old weights (25/30/30/15), max without imports/exports was 0.40 — below 0.50 threshold.
-      // With new weights (40/15/15/30), max without imports/exports is 0.70 — above threshold.
+    it('should allow passing with strong purpose and requirements alone', () => {
+      // Imports removed from scoring — max achievable with purpose=1 and requirements=1 is 0.90
       const engine = new SpecVerificationEngine(llmService, {
         rootPath: testDir,
         openspecPath: openspecDir,
@@ -597,7 +579,7 @@ export class PaymentService {}`;
         { coverage: 1.0 }
       );
 
-      expect(score).toBeCloseTo(0.70, 5);
+      expect(score).toBeCloseTo(0.90, 5);
       expect(score).toBeGreaterThan(0.5); // should pass
     });
   });

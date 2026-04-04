@@ -388,7 +388,7 @@ export class SpecVerificationEngine {
     const purposeMatch = this.comparePurpose(prediction.predictedPurpose, fileContent);
     const importMatch = this.compareImports(prediction.predictedImports, fileAnalysis.imports.map(i => i.source));
     const exportMatch = this.compareExports(prediction.predictedExports, fileAnalysis.exports.map(e => e.name));
-    const requirementCoverage = this.analyzeRequirementCoverage(prediction.relatedRequirements, fileContent);
+    const requirementCoverage = this.analyzeRequirementCoverage(candidate.domain, fileContent);
 
     // Calculate overall score
     const overallScore = this.calculateOverallScore(purposeMatch, importMatch, exportMatch, requirementCoverage);
@@ -642,30 +642,70 @@ Respond in JSON:
   }
 
   /**
-   * Analyze requirement coverage
+   * Parse requirements from a spec's markdown content.
+   * Returns an array of { name, description } extracted from
+   * "### Requirement: Name\n\nThe system SHALL ..." blocks.
    */
-  private analyzeRequirementCoverage(relatedRequirements: string[], fileContent: string): RequirementCoverage {
-    const actuallyImplements: string[] = [];
-    const contentLower = fileContent.toLowerCase();
+  private parseSpecRequirements(specContent: string): Array<{ name: string; description: string }> {
+    const requirements: Array<{ name: string; description: string }> = [];
+    const lines = specContent.split('\n');
 
-    for (const req of relatedRequirements) {
-      // Check if requirement keywords appear in the file
-      const reqWords = req.toLowerCase().split(/[\s-_]+/);
-      const matches = reqWords.filter(w => w.length > 3 && contentLower.includes(w));
-      if (matches.length >= Math.min(2, reqWords.length)) {
-        actuallyImplements.push(req);
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^###\s+Requirement:\s+(.+)/i);
+      if (!m) continue;
+      const name = m[1].trim();
+      // Look ahead for the description line (first non-empty line after the heading)
+      let description = '';
+      for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+        const l = lines[j].trim();
+        if (l.length > 0) { description = l; break; }
+      }
+      if (name) requirements.push({ name, description });
+    }
+    return requirements;
+  }
+
+  /**
+   * Analyze requirement coverage using spec requirement descriptions rather than
+   * LLM-predicted requirement names. For each requirement in the domain spec,
+   * check whether its description keywords appear in the file content.
+   */
+  private analyzeRequirementCoverage(domain: string, fileContent: string): RequirementCoverage {
+    const spec = this.specs.find(s => s.domain === domain);
+    if (!spec) {
+      return { relatedRequirements: [], actuallyImplements: [], coverage: 0 };
+    }
+
+    const requirements = this.parseSpecRequirements(spec.content);
+    if (requirements.length === 0) {
+      return { relatedRequirements: [], actuallyImplements: [], coverage: 0 };
+    }
+
+    const contentLower = fileContent.toLowerCase();
+    const actuallyImplements: string[] = [];
+
+    for (const req of requirements) {
+      // Use description keywords (from the "The system SHALL ..." line) for matching.
+      // Fall back to the requirement name if no description was found.
+      const source = req.description.length > 0 ? req.description : req.name;
+      const keywords = source
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !['shall', 'system', 'when', 'given', 'then', 'that', 'this', 'with', 'from', 'have', 'will'].includes(w));
+
+      if (keywords.length === 0) continue;
+      const matched = keywords.filter(w => contentLower.includes(w));
+      // Require at least half the keywords to match
+      if (matched.length >= Math.ceil(keywords.length * 0.5)) {
+        actuallyImplements.push(req.name);
       }
     }
 
-    const coverage = relatedRequirements.length > 0
-      ? actuallyImplements.length / relatedRequirements.length
-      : 0;
+    const coverage = actuallyImplements.length / requirements.length;
+    const relatedRequirements = requirements.map(r => r.name);
 
-    return {
-      relatedRequirements,
-      actuallyImplements,
-      coverage,
-    };
+    return { relatedRequirements, actuallyImplements, coverage };
   }
 
   /**
@@ -678,22 +718,19 @@ Respond in JSON:
     requirementCoverage: RequirementCoverage
   ): number {
     // Weighted combination (total = 1.0):
-    //   Purpose:      40%  — semantic similarity of LLM-predicted vs actual purpose
-    //   Imports:      15%  — F1 of predicted vs actual imports
-    //   Exports:      15%  — F1 of predicted vs actual exports
-    //   Requirements: 30%  — fraction of spec requirements covered by the file
+    //   Purpose:      50%  — semantic similarity of LLM-predicted vs actual purpose
+    //   Exports:      10%  — F1 of predicted vs actual exports
+    //   Requirements: 40%  — fraction of spec requirements whose description keywords
+    //                        appear in the file (parsed directly from spec, not LLM-predicted)
     //
-    // Rationale: specs describe behavior and architecture, not exact import paths
-    // or export names. Weighting imports/exports too heavily (was 60% combined)
-    // made it structurally impossible to pass — the LLM cannot reliably predict
-    // exact module paths from high-level spec descriptions. With this weighting,
-    // the max achievable when import/export F1 = 0 is 0.70 (above the 0.50
-    // threshold), so files with strong semantic alignment pass correctly.
+    // Imports removed: specs never document import paths, so the LLM cannot predict
+    // them reliably and F1 was structurally 0% for all files.
+    // Requirements now use spec content directly (description keywords) instead of
+    // LLM-predicted requirement names, which were opaque camelCase identifiers.
     return (
-      purposeMatch.similarity * 0.40 +
-      importMatch.f1Score * 0.15 +
-      exportMatch.f1Score * 0.15 +
-      requirementCoverage.coverage * 0.30
+      purposeMatch.similarity * 0.50 +
+      exportMatch.f1Score * 0.10 +
+      requirementCoverage.coverage * 0.40
     );
   }
 
