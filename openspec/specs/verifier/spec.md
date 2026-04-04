@@ -213,7 +213,7 @@ The system SHALL send the file's source code to the LLM and receive a structured
 #### Scenario: LlmTimeout
 - **GIVEN** the LLM service exceeds its timeout
 - **WHEN** the prediction request is made
-- **THEN** the file is marked as skipped with a timeout warning
+- **THEN** the file is excluded from the report and a timeout warning is logged
 
 #### Requirement: Parsefile
 
@@ -360,7 +360,7 @@ The system SHALL skip files that cannot be read, parsed, or predicted, and recor
 #### Scenario: UnreadableFile
 - **GIVEN** a candidate file that cannot be read from disk
 - **WHEN** `verifyFile` is called for that file
-- **THEN** the file is added to `skippedFiles` with a read-error reason
+- **THEN** the file is excluded from results and a read-error warning is logged
 
 #### Requirement: Fallbackbehavior
 
