@@ -301,11 +301,21 @@ export class SpecVerificationEngine {
       const data = JSON.parse(raw) as {
         mappings?: Array<{ domain: string; functions?: Array<{ file: string }> }>;
       };
+      // Count how many distinct domains each file appears in
+      const fileDomains = new Map<string, Set<string>>();
       for (const entry of data.mappings ?? []) {
         for (const fn of entry.functions ?? []) {
-          if (fn.file && entry.domain && !this.fileDomainMap.has(fn.file)) {
-            this.fileDomainMap.set(fn.file, entry.domain);
-          }
+          if (!fn.file || !entry.domain) continue;
+          if (!fileDomains.has(fn.file)) fileDomains.set(fn.file, new Set());
+          fileDomains.get(fn.file)!.add(entry.domain);
+        }
+      }
+      // Only map files that belong to exactly one domain — cross-cutting files
+      // (e.g. constants.ts, logger.ts) appear in many domains and can't be fairly
+      // verified against any single spec.
+      for (const [file, domains] of fileDomains) {
+        if (domains.size === 1) {
+          this.fileDomainMap.set(file, [...domains][0]);
         }
       }
       logger.analysis(`Loaded file→domain mapping for ${this.fileDomainMap.size} file(s)`);
