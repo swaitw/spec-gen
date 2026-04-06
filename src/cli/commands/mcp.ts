@@ -59,6 +59,8 @@ import {
   handleGetDecisions,
   handleGetRouteInventory,
   handleGetMiddlewareInventory,
+  handleGetSchemaInventory,
+  handleGetUIComponents,
 } from '../../core/services/mcp-handlers/analysis.js';
 
 // Re-export utilities for tests
@@ -88,6 +90,8 @@ export {
   handleGetFunctionSkeleton,
   handleGetRouteInventory,
   handleGetMiddlewareInventory,
+  handleGetSchemaInventory,
+  handleGetUIComponents,
 };
 
 // ============================================================================
@@ -774,6 +778,40 @@ export const TOOL_DEFINITIONS = [
       required: ['directory'],
     },
   },
+  {
+    name: 'get_schema_inventory',
+    description:
+      'Return the database schema inventory for the project: all detected ORM model/table ' +
+      'definitions with their fields, types, and nullability. ' +
+      'Reads the pre-computed schema-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports Prisma, TypeORM, Drizzle ORM, and SQLAlchemy. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_ui_components',
+    description:
+      'Return the UI component inventory for the project: all detected components with ' +
+      'their framework, props, source file, and line number. ' +
+      'Reads the pre-computed ui-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports React, Vue, Svelte, and Angular. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
 ];
 
 // ============================================================================
@@ -916,6 +954,12 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
       } else if (name === 'get_middleware_inventory') {
         const { directory } = args as { directory: string };
         result = await handleGetMiddlewareInventory(directory);
+      } else if (name === 'get_schema_inventory') {
+        const { directory } = args as { directory: string };
+        result = await handleGetSchemaInventory(directory);
+      } else if (name === 'get_ui_components') {
+        const { directory } = args as { directory: string };
+        result = await handleGetUIComponents(directory);
       } else {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
