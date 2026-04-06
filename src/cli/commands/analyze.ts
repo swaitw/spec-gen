@@ -289,6 +289,7 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       force: options.force ?? false,
       embed: options.embed ?? false,
       reindexSpecs: options.reindexSpecs ?? false,
+      aiConfigs: options.aiConfigs ?? false,
       quiet: false,
       verbose: false,
       noColor: false,
