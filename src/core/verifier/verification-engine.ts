@@ -41,6 +41,8 @@ export interface FilePrediction {
   predictedLogic: string[];
   relatedRequirements: string[];
   confidence: number;
+  /** LLM-as-judge score: how accurately does the spec describe this file (0.0–1.0) */
+  specAccuracyScore?: number;
   reasoning: string;
 }
 
@@ -448,15 +450,15 @@ export class SpecVerificationEngine {
    * Verify a single file
    */
   async verifyFile(candidate: VerificationCandidate): Promise<VerificationResult> {
-    // Get prediction from LLM
-    const prediction = await this.getPrediction(candidate);
-
-    // Analyze actual file
+    // Read actual file first — content is passed to getPrediction for LLM-as-judge scoring
     const fileContent = await readFile(candidate.absolutePath, 'utf-8');
     const fileAnalysis = await this.parser.parseFile(candidate.absolutePath);
 
+    // Get prediction from LLM (includes spec accuracy score via LLM-as-judge)
+    const prediction = await this.getPrediction(candidate, fileContent);
+
     // Compare prediction to actual
-    const purposeMatch = this.comparePurpose(prediction.predictedPurpose, fileContent);
+    const purposeMatch = this.comparePurpose(prediction.predictedPurpose, fileContent, prediction.specAccuracyScore);
     const importMatch = this.analyzeImportCoverage(fileAnalysis.imports.map(i => i.source), candidate.domain);
     const exportMatch = this.compareExports(prediction.predictedExports, fileAnalysis.exports.map(e => e.name));
     const requirementCoverage = this.analyzeRequirementCoverage(candidate.domain, fileContent);
@@ -501,25 +503,38 @@ export class SpecVerificationEngine {
   }
 
   /**
-   * Get prediction from LLM
+   * Get prediction from LLM.
+   *
+   * When fileContent is provided the prompt uses an LLM-as-judge approach:
+   * the model sees both the spec and the actual file content, and returns a
+   * specAccuracyScore (0–1) measuring how well the spec describes the file.
+   * This replaces the brittle Jaccard keyword-overlap used for purposeMatch.
    */
-  private async getPrediction(candidate: VerificationCandidate): Promise<FilePrediction> {
+  private async getPrediction(candidate: VerificationCandidate, fileContent?: string): Promise<FilePrediction> {
     // Prefer the candidate's own domain spec; fall back to full context if not found.
-    // Feeding only the relevant spec reduces noise when a domain covers many files.
     const domainSpec = this.specs.find(s => s.domain === candidate.domain);
     const specsContent = domainSpec
       ? `=== ${domainSpec.domain} (${domainSpec.path}) ===\n${domainSpec.content}`
       : this.buildSpecsContext(24_000);
 
+    // Include a trimmed excerpt of the actual file so the LLM can score spec accuracy
+    const fileExcerpt = fileContent
+      ? `\n\n=== Actual file content (${candidate.path}) ===\n${fileContent.slice(0, 3000)}${fileContent.length > 3000 ? '\n[truncated]' : ''}`
+      : '';
+
+    const judgeInstruction = fileContent
+      ? `\nAlso set "specAccuracyScore" to a float 0.0–1.0 measuring how accurately the spec above describes this specific file's purpose and behavior (1.0 = spec perfectly describes this file, 0.0 = spec is irrelevant).`
+      : '';
+
     const userPrompt = `Here are the specifications:
 
-${specsContent}
+${specsContent}${fileExcerpt}
 
 Predict the contents of: ${candidate.path}
 
 IMPORTANT: The specs may contain entries attributed to specific files using \`> \`path\`\` markers.
 Focus ONLY on entries attributed to \`${candidate.path}\`. Ignore entries attributed to other files.
-If no entries are attributed to this file, use only the general domain purpose.
+If no entries are attributed to this file, use only the general domain purpose.${judgeInstruction}
 
 Respond in JSON:
 {
@@ -529,6 +544,7 @@ Respond in JSON:
   "predictedLogic": ["...", "..."],
   "relatedRequirements": ["RequirementName1", "RequirementName2"],
   "confidence": 0.0-1.0,
+  "specAccuracyScore": 0.0-1.0,
   "reasoning": "..."
 }`;
 
@@ -547,6 +563,7 @@ Respond in JSON:
         predictedLogic: prediction.predictedLogic ?? [],
         relatedRequirements: prediction.relatedRequirements ?? [],
         confidence: prediction.confidence ?? 0.5,
+        specAccuracyScore: typeof prediction.specAccuracyScore === 'number' ? prediction.specAccuracyScore : undefined,
         reasoning: prediction.reasoning ?? '',
       };
     } catch (error) {
@@ -557,14 +574,19 @@ Respond in JSON:
   }
 
   /**
-   * Compare predicted purpose to actual file content
+   * Compare predicted purpose to actual file content.
+   *
+   * When specAccuracyScore is provided (LLM-as-judge), it is used directly as
+   * the similarity score — this is far more reliable than keyword overlap because
+   * the LLM has seen the actual file and can assess whether the spec describes it.
+   * Falls back to Jaccard keyword overlap when no LLM score is available.
    */
-  private comparePurpose(predicted: string, fileContent: string): PurposeMatch {
-    // Extract actual purpose from file comments
+  private comparePurpose(predicted: string, fileContent: string, specAccuracyScore?: number): PurposeMatch {
     const actual = this.extractPurpose(fileContent);
 
-    // Calculate similarity using keyword overlap
-    const similarity = this.calculateSimilarity(predicted, actual);
+    const similarity = typeof specAccuracyScore === 'number'
+      ? specAccuracyScore
+      : this.calculateSimilarity(predicted, actual);
 
     return { predicted, actual, similarity };
   }

@@ -303,6 +303,7 @@ export function createUserService(): UserService {
         predictedLogic: ['authenticate with email/password', 'update profile'],
         relatedRequirements: ['UserAuthentication', 'UserProfile'],
         confidence: 0.8,
+        specAccuracyScore: 0.85,
         reasoning: 'The user spec clearly describes these operations',
       }));
 
@@ -334,11 +335,51 @@ export function createUserService(): UserService {
       expect(result.overallScore).toBeGreaterThanOrEqual(0);
       expect(result.overallScore).toBeLessThanOrEqual(1);
       expect(result.llmConfidence).toBe(0.8);
+      // LLM-as-judge: specAccuracyScore (0.85) should be used as purposeMatch.similarity
+      expect(result.purposeMatch.similarity).toBe(0.85);
+    });
+
+    it('should fall back to Jaccard similarity when specAccuracyScore is absent', async () => {
+      mockProvider.setDefaultResponse(JSON.stringify({
+        predictedPurpose: 'Handles user authentication and profile management',
+        predictedImports: ['database'],
+        predictedExports: ['UserService'],
+        predictedLogic: [],
+        relatedRequirements: [],
+        confidence: 0.7,
+        reasoning: 'no specAccuracyScore in this response',
+      }));
+
+      const engine = new SpecVerificationEngine(llmService, {
+        rootPath: testDir,
+        openspecPath: openspecDir,
+        outputDir,
+      });
+      await (engine as any).loadSpecs();
+
+      const candidate: VerificationCandidate = {
+        path: 'src/user-service.ts',
+        absolutePath: join(srcDir, 'user-service.ts'),
+        domain: 'user',
+        usedInGeneration: false,
+        complexity: 100,
+        lines: 30,
+        imports: 2,
+        exports: 3,
+      };
+
+      const result = await (engine as any).verifyFile(candidate);
+
+      // Falls back to Jaccard — score will be some value in [0,1]
+      expect(result.purposeMatch.similarity).toBeGreaterThanOrEqual(0);
+      expect(result.purposeMatch.similarity).toBeLessThanOrEqual(1);
+      // But it must NOT be 0.85 (the LLM-as-judge value from the other test)
+      expect(result.purposeMatch.similarity).not.toBe(0.85);
     });
   });
 
   describe('comparePurpose', () => {
-    it('should calculate similarity between purposes', () => {
+    it('should calculate similarity between purposes via Jaccard when no score provided', () => {
       const engine = new SpecVerificationEngine(llmService, {
         rootPath: testDir,
         openspecPath: openspecDir,
@@ -353,6 +394,23 @@ export function createUserService(): UserService {
       expect(result.predicted).toBe('Handles user authentication');
       expect(result.actual).toContain('authentication');
       expect(result.similarity).toBeGreaterThan(0);
+    });
+
+    it('should use specAccuracyScore directly when provided (LLM-as-judge)', () => {
+      const engine = new SpecVerificationEngine(llmService, {
+        rootPath: testDir,
+        openspecPath: openspecDir,
+        outputDir,
+      });
+
+      const result = (engine as any).comparePurpose(
+        'Handles user authentication',
+        '// Something completely different',
+        0.92
+      );
+
+      // specAccuracyScore takes precedence over Jaccard
+      expect(result.similarity).toBe(0.92);
     });
   });
 
