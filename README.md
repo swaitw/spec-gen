@@ -507,7 +507,7 @@ spec-gen analyze [options]
 
 ```bash
 spec-gen setup [options]
-  --tools <list>   Comma-separated tools to install: vibe, cline, gsd (default: all)
+  --tools <list>   Comma-separated tools to install: vibe, cline, gsd, bmad (default: interactive prompt)
   --dir <path>     Project root directory (default: current directory)
 ```
 
@@ -520,6 +520,7 @@ Files installed:
 | `vibe` | `.vibe/skills/spec-gen-{name}/SKILL.md` | analyze-codebase, brainstorm, debug, execute-refactor, generate, implement-story, plan-refactor |
 | `cline` | `.clinerules/workflows/spec-gen-{name}.md` | analyze-codebase, check-spec-drift, execute-refactor, implement-feature, plan-refactor, refactor-codebase |
 | `gsd` | `.claude/commands/gsd/spec-gen-{name}.md` | orient, drift |
+| `bmad` | `_bmad/spec-gen/{agents,tasks}/` | agents: architect, dev-brownfield — tasks: implement-story, onboarding, refactor, sprint-planning |
 
 Never overwrites existing files. Combine with `analyze --ai-configs` for a complete agent setup:
 

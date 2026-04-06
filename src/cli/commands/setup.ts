@@ -17,13 +17,14 @@ import { Command } from 'commander';
 import { readFile, writeFile, mkdir, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkbox } from '@inquirer/prompts';
 import { logger } from '../../utils/logger.js';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-type ToolName = 'vibe' | 'cline' | 'gsd';
+type ToolName = 'vibe' | 'cline' | 'gsd' | 'bmad';
 
 interface SkillEntry {
   /** Absolute source path inside the package's examples/ directory */
@@ -90,6 +91,9 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
     'spec-gen-drift.md',
   ];
 
+  const BMAD_AGENTS = ['architect.md', 'dev-brownfield.md'];
+  const BMAD_TASKS  = ['implement-story.md', 'onboarding.md', 'refactor.md', 'sprint-planning.md'];
+
   return {
     vibe: VIBE_SKILLS.map(name => ({
       src: join(ex, 'mistral-vibe', 'skills', name, 'SKILL.md'),
@@ -103,6 +107,16 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
       src: join(ex, 'gsd', 'commands', 'gsd', file),
       dest: join(projectRoot, '.claude', 'commands', 'gsd', file),
     })),
+    bmad: [
+      ...BMAD_AGENTS.map(file => ({
+        src: join(ex, 'bmad', 'agents', file),
+        dest: join(projectRoot, '_bmad', 'spec-gen', 'agents', file),
+      })),
+      ...BMAD_TASKS.map(file => ({
+        src: join(ex, 'bmad', 'tasks', file),
+        dest: join(projectRoot, '_bmad', 'spec-gen', 'tasks', file),
+      })),
+    ],
   };
 }
 
@@ -154,14 +168,33 @@ export const setupCommand = new Command('setup')
   )
   .action(async (options: { tools?: string; dir: string }) => {
     const projectRoot = options.dir;
-    const allTools: ToolName[] = ['vibe', 'cline', 'gsd'];
-    const tools: ToolName[] = options.tools
-      ? (options.tools.split(',').map(t => t.trim()) as ToolName[]).filter(t => allTools.includes(t))
-      : allTools;
+    const allTools: ToolName[] = ['vibe', 'cline', 'gsd', 'bmad'];
 
-    if (tools.length === 0) {
-      logger.error('setup: no valid tools specified. Valid values: vibe, cline, gsd');
-      process.exit(1);
+    let tools: ToolName[];
+    if (options.tools) {
+      tools = (options.tools.split(',').map(t => t.trim()) as ToolName[]).filter(t => allTools.includes(t));
+      if (tools.length === 0) {
+        logger.error('setup: no valid tools specified. Valid values: vibe, cline, gsd, bmad');
+        process.exit(1);
+      }
+    } else if (process.stdout.isTTY) {
+      const selected = await checkbox({
+        message: 'Which agent tools do you want to install skills for?',
+        choices: [
+          { name: 'Mistral Vibe  (.vibe/skills/spec-gen-{name}/SKILL.md — 7 skills)', value: 'vibe' as ToolName, checked: true },
+          { name: 'Cline / Roo   (.clinerules/workflows/spec-gen-{name}.md — 6 workflows)', value: 'cline' as ToolName, checked: true },
+          { name: 'GSD           (.claude/commands/gsd/spec-gen-{name}.md — 2 commands)', value: 'gsd' as ToolName, checked: true },
+          { name: 'BMAD          (_bmad/spec-gen/{agents,tasks}/ — 2 agents, 4 tasks)', value: 'bmad' as ToolName, checked: false },
+        ],
+      });
+      if (selected.length === 0) {
+        console.log('Nothing selected — exiting.');
+        process.exit(0);
+      }
+      tools = selected;
+    } else {
+      // Non-TTY: install all except BMAD (more invasive, requires existing BMAD setup)
+      tools = ['vibe', 'cline', 'gsd'];
     }
 
     logger.success(`Installing workflow skills into ${projectRoot}`);
@@ -184,6 +217,7 @@ export const setupCommand = new Command('setup')
       vibe:  'Mistral Vibe',
       cline: 'Cline / Roo Code',
       gsd:   'get-shit-done (GSD)',
+      bmad:  'BMAD',
     };
 
     for (const tool of tools) {
