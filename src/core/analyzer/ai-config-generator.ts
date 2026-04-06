@@ -122,22 +122,27 @@ async function writeIfAbsent(filePath: string, content: string): Promise<boolean
  * @param options.tools - Which assistants to generate for. Defaults to all.
  * @returns Relative paths (from rootDir) of files that were actually created.
  */
-export async function generateAiConfigs(options: AiConfigOptions): Promise<string[]> {
+export interface AiConfigResult {
+  /** Relative path from rootDir */
+  rel: string;
+  /** true = created now, false = already existed */
+  created: boolean;
+}
+
+export async function generateAiConfigs(options: AiConfigOptions): Promise<AiConfigResult[]> {
   const { rootDir, analysisDir, projectName, tools } = options;
 
   const targets = tools
     ? AI_TOOL_TARGETS.filter(t => tools.includes(t.tool))
     : AI_TOOL_TARGETS;
 
-  const results = await Promise.all(
+  return Promise.all(
     targets.map(async ({ rel, forClaude }) => {
       const absPath = join(rootDir, rel);
       const content = buildContent(analysisDir, projectName, forClaude);
-      const wrote = await writeIfAbsent(absPath, content);
-      return wrote ? rel : null;
+      const created = await writeIfAbsent(absPath, content);
+      return { rel, created };
     })
   );
-
-  return results.filter((r): r is string => r !== null);
 }
 

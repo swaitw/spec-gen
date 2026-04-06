@@ -31,21 +31,23 @@ describe('generateAiConfigs', () => {
   afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
 
   it('creates all 5 files when none exist and returns their relative paths', async () => {
-    const created = await generateAiConfigs({
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
     });
 
-    expect(created).toHaveLength(5);
-    expect(created).toContain('CLAUDE.md');
-    expect(created).toContain('.cursorrules');
-    expect(created).toContain('.clinerules/spec-gen.md');
-    expect(created).toContain('.github/copilot-instructions.md');
-    expect(created).toContain('.windsurf/rules.md');
+    const rels = results.map(r => r.rel);
+    expect(results).toHaveLength(5);
+    expect(results.every(r => r.created)).toBe(true);
+    expect(rels).toContain('CLAUDE.md');
+    expect(rels).toContain('.cursorrules');
+    expect(rels).toContain('.clinerules/spec-gen.md');
+    expect(rels).toContain('.github/copilot-instructions.md');
+    expect(rels).toContain('.windsurf/rules.md');
   });
 
-  it('skips files that already exist — returns [] when all exist', async () => {
+  it('skips files that already exist — all have created=false on second call', async () => {
     // First call creates all files
     await generateAiConfigs({
       rootDir: tmpDir,
@@ -53,26 +55,28 @@ describe('generateAiConfigs', () => {
       projectName: 'my-project',
     });
 
-    // Second call should skip all
-    const created = await generateAiConfigs({
+    // Second call: all files still returned, but created=false
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
     });
 
-    expect(created).toHaveLength(0);
+    expect(results).toHaveLength(5);
+    expect(results.every(r => !r.created)).toBe(true);
   });
 
   it('respects tools filter — tools: ["claude"] creates only CLAUDE.md', async () => {
-    const created = await generateAiConfigs({
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
       tools: ['claude'],
     });
 
-    expect(created).toHaveLength(1);
-    expect(created).toContain('CLAUDE.md');
+    expect(results).toHaveLength(1);
+    expect(results[0].rel).toBe('CLAUDE.md');
+    expect(results[0].created).toBe(true);
   });
 
   it('Claude format uses @analysisDir/CODEBASE.md reference', async () => {
@@ -129,27 +133,29 @@ describe('generateAiConfigs', () => {
   });
 
   it('creates nested directory for .clinerules/spec-gen.md', async () => {
-    const created = await generateAiConfigs({
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
       tools: ['cline'],
     });
 
-    expect(created).toContain('.clinerules/spec-gen.md');
+    expect(results[0].rel).toBe('.clinerules/spec-gen.md');
+    expect(results[0].created).toBe(true);
     const content = await readFile(join(tmpDir, '.clinerules', 'spec-gen.md'), 'utf-8');
     expect(content.length).toBeGreaterThan(0);
   });
 
   it('creates nested directory for .github/copilot-instructions.md', async () => {
-    const created = await generateAiConfigs({
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
       tools: ['copilot'],
     });
 
-    expect(created).toContain('.github/copilot-instructions.md');
+    expect(results[0].rel).toBe('.github/copilot-instructions.md');
+    expect(results[0].created).toBe(true);
     const content = await readFile(join(tmpDir, '.github', 'copilot-instructions.md'), 'utf-8');
     expect(content.length).toBeGreaterThan(0);
   });
@@ -169,15 +175,17 @@ describe('generateAiConfigs', () => {
     // Create only CLAUDE.md ahead of time
     await writeFile(join(tmpDir, 'CLAUDE.md'), 'existing content', 'utf-8');
 
-    const created = await generateAiConfigs({
+    const results = await generateAiConfigs({
       rootDir: tmpDir,
       analysisDir: '.spec-gen/analysis',
       projectName: 'my-project',
     });
 
-    // Should create 4 (all except CLAUDE.md)
-    expect(created).toHaveLength(4);
-    expect(created).not.toContain('CLAUDE.md');
+    // All 5 returned, CLAUDE.md has created=false, the rest created=true
+    expect(results).toHaveLength(5);
+    const claudeResult = results.find(r => r.rel === 'CLAUDE.md');
+    expect(claudeResult?.created).toBe(false);
+    expect(results.filter(r => r.created)).toHaveLength(4);
 
     // Existing file content should be unchanged
     const content = await readFile(join(tmpDir, 'CLAUDE.md'), 'utf-8');

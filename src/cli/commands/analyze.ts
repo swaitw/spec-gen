@@ -47,7 +47,7 @@ import { extractSchemas } from '../../core/analyzer/schema-extractor.js';
 import { buildRouteInventory } from '../../core/analyzer/http-route-parser.js';
 import { extractMiddleware } from '../../core/analyzer/middleware-extractor.js';
 import { extractEnvVars } from '../../core/analyzer/env-extractor.js';
-import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool } from '../../core/analyzer/ai-config-generator.js';
+import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool, type AiConfigResult } from '../../core/analyzer/ai-config-generator.js';
 
 // ============================================================================
 // TYPES
@@ -594,7 +594,7 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       );
 
       // Generate AI tool config files — prompt user to select which assistants
-      let aiConfigsCreated: string[] = [];
+      let aiConfigsCreated: AiConfigResult[] = [];
       if (opts.aiConfigs) {
         let selectedTools: AiTool[] | undefined;
 
@@ -669,9 +669,10 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       }
       console.log('');
       if (aiConfigsCreated.length > 0) {
-        console.log('  Agent config files created:');
-        for (const f of aiConfigsCreated) {
-          console.log(`    ├─ ${f}`);
+        console.log('  Agent config files:');
+        for (const { rel, created } of aiConfigsCreated) {
+          const tag = created ? '(created)' : '(already exists)';
+          console.log(`    ├─ ${rel}  ${tag}`);
         }
       } else {
         console.log('  Agent config files: not generated');
