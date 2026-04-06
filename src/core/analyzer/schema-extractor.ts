@@ -12,6 +12,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { extname, relative } from 'node:path';
+import { getSkeletonContent } from './code-shaper.js';
 
 // ============================================================================
 // TYPES
@@ -253,7 +254,7 @@ export async function extractSchemas(
       let source: string;
 
       try {
-        source = await readFile(filePath, 'utf-8');
+        source = getSkeletonContent(await readFile(filePath, 'utf-8'), ext === '.py' ? 'python' : 'typescript');
       } catch {
         return;
       }

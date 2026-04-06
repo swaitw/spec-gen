@@ -28,6 +28,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { extname } from 'node:path';
+import { getSkeletonContent, detectLanguage } from './code-shaper.js';
 
 // ============================================================================
 // TYPES
@@ -697,7 +698,10 @@ export async function extractTsRouteDefinitions(filePath: string): Promise<Route
   let source: string;
   try {
     const { readFile } = await import('node:fs/promises');
-    source = await readFile(filePath, 'utf-8');
+    // Use skeleton to strip comments — prevents false positives from comment
+    // examples inside parser/extractor files that contain route pattern strings.
+    // Line numbers in the result are approximate (skeleton line positions).
+    source = getSkeletonContent(await readFile(filePath, 'utf-8'), detectLanguage(filePath));
   } catch {
     return [];
   }
