@@ -4,7 +4,7 @@
  * Detects React, Vue, Svelte, and Angular UI components from source files
  * using regex-based analysis (no tree-sitter required).
  *
- * Inspired by Codesight's component detector approach:
+ * Detection strategy per framework:
  *   - React: function/const export with PascalCase name in JSX/TSX files
  *   - Vue: Single File Components (.vue) with <template> blocks
  *   - Svelte: .svelte files (each file = one component)
@@ -49,7 +49,7 @@ const MAX_PROPS = 10;
 const REACT_FUNCTION_COMPONENT = /^export\s+(default\s+)?(?:async\s+)?function\s+([A-Z][A-Za-z0-9_]*)\s*[(<]/m;
 const REACT_ARROW_COMPONENT = /^export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:React\.memo\(|React\.forwardRef\(|\(|async\s*\()/m;
 const REACT_FORWARD_REF = /^export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:forwardRef|memo)\s*[(<]/m;
-const REACT_DEFAULT_EXPORT_ANON = /^export\s+default\s+(?:function|class)\s*\(/m;
+// const REACT_DEFAULT_EXPORT_ANON = /^export\s+default\s+(?:function|class)\s*\(/m; // reserved for future use
 
 // TypeScript interface/type props extraction: interface XxxProps { ... }
 const TS_PROPS_INTERFACE = /interface\s+\w*Props\s*\{([^}]+)\}/gs;
@@ -59,7 +59,7 @@ const TS_PROP_LINE = /^\s+(\w+)(\?)?:\s*([^;,\n]+)/m;
 const VUE_TEMPLATE_BLOCK = /<template[\s>]/;
 const VUE_SCRIPT_SETUP_PROPS = /defineProps\s*[<(]/;
 const VUE_OPTIONS_PROPS = /\bprops\s*:\s*\{([^}]+)\}/s;
-const VUE_PROP_NAME = /^\s+(\w+)\s*:/m;
+// const VUE_PROP_NAME = /^\s+(\w+)\s*:/m; // reserved for future use
 
 // Angular
 const ANGULAR_COMPONENT_DECORATOR = /@Component\s*\(/;

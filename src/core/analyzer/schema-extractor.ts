@@ -7,7 +7,7 @@
  * Audit fields (createdAt, updatedAt, created_at, updated_at, deletedAt,
  * deleted_at) are excluded from field lists to keep output concise.
  *
- * Inspired by Codesight's schema detector approach.
+ * Uses regex-based analysis without requiring tree-sitter.
  */
 
 import { readFile } from 'node:fs/promises';
