@@ -18,10 +18,11 @@ npm install -g spec-gen-cli
 cd /path/to/your-project
 
 # Run the pipeline
-spec-gen init       # Detect project type, create config
-spec-gen analyze    # Static analysis (no API key needed)
-spec-gen generate   # Generate specs (requires API key)
-spec-gen drift      # Check for spec drift
+spec-gen init                  # Detect project type, create config
+spec-gen analyze --ai-configs  # Static analysis + generate context files (CLAUDE.md, .cursorrules…)
+spec-gen setup                 # Install workflow skills (Vibe, Cline, GSD)
+spec-gen generate              # Generate specs (requires API key)
+spec-gen drift                 # Check for spec drift
 
 # Troubleshoot setup issues
 spec-gen doctor     # Check environment and configuration
@@ -420,6 +421,7 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen drift --use-llm` | Detect spec drift (LLM-enhanced) | Yes |
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
 | `spec-gen view` | Launch interactive graph & spec viewer in the browser | No |
+| `spec-gen setup` | Install workflow skills into the project (Vibe, Cline, GSD) | No |
 | `spec-gen mcp` | Start MCP server (stdio, for Cline / Claude Code) | No |
 | `spec-gen doctor` | Check environment and configuration for common issues | No |
 
@@ -501,6 +503,31 @@ spec-gen analyze [options]
   --reindex-specs        # Re-index OpenSpec specs into the vector index without re-running full analysis
 ```
 
+### Setup Options
+
+```bash
+spec-gen setup [options]
+  --tools <list>   Comma-separated tools to install: vibe, cline, gsd (default: all)
+  --dir <path>     Project root directory (default: current directory)
+```
+
+Installs workflow skills from the spec-gen package into the project. Skills are static assets — identical across projects — so this command only needs to be run once at project onboarding and again after upgrading spec-gen.
+
+Files installed:
+
+| Tool | Destination | Skills |
+|------|-------------|--------|
+| `vibe` | `.vibe/skills/spec-gen-{name}/SKILL.md` | analyze-codebase, brainstorm, debug, execute-refactor, generate, implement-story, plan-refactor |
+| `cline` | `.clinerules/workflows/spec-gen-{name}.md` | analyze-codebase, check-spec-drift, execute-refactor, implement-feature, plan-refactor, refactor-codebase |
+| `gsd` | `.claude/commands/gsd/spec-gen-{name}.md` | orient, drift |
+
+Never overwrites existing files. Combine with `analyze --ai-configs` for a complete agent setup:
+
+```bash
+spec-gen analyze --ai-configs   # project-specific context files
+spec-gen setup                   # workflow skills
+```
+
 ### Verify Options
 
 ```bash
@@ -562,7 +589,26 @@ This is structural signal, not prose. It complements `openspec/specs/overview/sp
 
 ### Setup
 
-After running `spec-gen analyze`, wire the generated digest into your agent's context:
+Two commands, run once per project:
+
+```bash
+spec-gen analyze --ai-configs   # generate project-specific context files
+spec-gen setup                   # install workflow skills
+```
+
+**`analyze --ai-configs`** generates files that are specific to this project — they reference `.spec-gen/analysis/CODEBASE.md` and embed the project name. Safe to re-run (skips existing files).
+
+**`spec-gen setup`** copies static workflow assets from the spec-gen package that are identical across all projects. Run once at onboarding; re-run after upgrading spec-gen to get new or updated skills.
+
+```
+spec-gen setup [--tools vibe,cline,gsd]
+
+Mistral Vibe  ->  .vibe/skills/spec-gen-{name}/SKILL.md    (7 skills)
+Cline / Roo   ->  .clinerules/workflows/spec-gen-{name}.md  (6 workflows)
+GSD           ->  .claude/commands/gsd/spec-gen-{name}.md   (2 commands)
+```
+
+Wire the generated digest into your agent's context:
 
 **Claude Code** — add to `CLAUDE.md`:
 
