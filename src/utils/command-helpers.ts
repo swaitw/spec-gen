@@ -63,7 +63,7 @@ export function parseList(value: string): string[] {
   return value.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe' | 'copilot' | 'gemini-cli' | 'cursor-agent';
 
 /**
  * Resolve the LLM provider and base URL from environment variables.
@@ -81,8 +81,8 @@ export function resolveLLMProvider(specGenConfig?: {
 
   const configProvider = specGenConfig?.generation?.provider as ProviderName | undefined;
 
-  // claude-code and mistral-vibe don't need an API key
-  if (configProvider === 'claude-code' || configProvider === 'mistral-vibe') {
+  // These providers don't need an API key
+  if (configProvider === 'claude-code' || configProvider === 'mistral-vibe' || configProvider === 'copilot' || configProvider === 'gemini-cli' || configProvider === 'cursor-agent') {
     return { provider: configProvider };
   }
 
