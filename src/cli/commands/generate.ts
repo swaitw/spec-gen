@@ -10,16 +10,13 @@ import { confirm } from '@inquirer/prompts';
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
-import { fileExists, formatDuration, formatAge, parseList, readJsonFile } from '../../utils/command-helpers.js';
+import { fileExists, formatDuration, formatAge, parseList, readJsonFile, resolveLLMProvider, estimateCost } from '../../utils/command-helpers.js';
 import {
-  LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS,
-  GENERATION_OUTPUT_RATIO,
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_OPENAI_MODEL,
   DEFAULT_OPENAI_COMPAT_MODEL,
   DEFAULT_COPILOT_MODEL,
   DEFAULT_GEMINI_MODEL,
-  DEFAULT_SURVEY_ESTIMATED_TOKENS,
   COST_CONFIRMATION_THRESHOLD,
   SPEC_GEN_DIR,
   SPEC_GEN_ANALYSIS_REL_PATH,
@@ -42,7 +39,6 @@ import {
 } from '../../core/services/config-manager.js';
 import {
   createLLMService,
-  lookupPricing,
   type LLMService,
 } from '../../core/services/llm-service.js';
 import {
@@ -75,6 +71,7 @@ interface ExtendedGenerateOptions extends GenerateOptions {
   noOverwrite?: boolean;
   yes?: boolean;
   outputDir?: string;
+  force?: boolean;
 }
 
 interface AnalysisData {
@@ -137,33 +134,6 @@ async function loadAnalysis(analysisPath: string): Promise<AnalysisData | null> 
  *   Stage 5 — 1 call  (architecture synthesis, full context)
  *   Stage 6 — 1 call  (ADR, optional — not counted here)
  */
-function estimateCost(
-  llmContext: LLMContext,
-  provider: string,
-  model: string
-): { tokens: number; cost: number } {
-  const OVERHEAD = LLM_SYSTEM_PROMPT_OVERHEAD_TOKENS;
-  const OUTPUT_RATIO = GENERATION_OUTPUT_RATIO;
-
-  const phase2Files = llmContext.phase2_deep.files;
-  const phase2Total = phase2Files.reduce((s, f) => s + f.tokens, 0);
-  const fileOverhead = OVERHEAD * phase2Files.length;
-
-  const stage1Input = (llmContext.phase1_survey.estimatedTokens ?? DEFAULT_SURVEY_ESTIMATED_TOKENS) + OVERHEAD;
-  const stage2Input = phase2Total + fileOverhead;                        // entity extraction
-  const stage3Input = phase2Total + fileOverhead;                        // service analysis (same files)
-  const stage4Input = Math.ceil(phase2Total * 0.5) + OVERHEAD;           // API extraction
-  const stage5Input = Math.ceil((stage1Input + stage2Input) * 0.3) + OVERHEAD; // architecture
-
-  const totalInput = stage1Input + stage2Input + stage3Input + stage4Input + stage5Input;
-  const totalOutput = Math.ceil(totalInput * OUTPUT_RATIO);
-
-  const modelPricing = lookupPricing(provider, model);
-  const cost = (totalInput / 1_000_000) * modelPricing.input
-             + (totalOutput / 1_000_000) * modelPricing.output;
-
-  return { tokens: totalInput + totalOutput, cost };
-}
 
 /**
  * Prompt user for confirmation. Uses @inquirer/prompts in TTY, auto-yes otherwise.
@@ -257,6 +227,11 @@ export const generateCommand = new Command('generate')
     'Only generate ADRs (skip spec generation)',
     false
   )
+  .option(
+    '--force',
+    'Force regeneration from scratch, ignoring any cached stage results',
+    false
+  )
   .addHelpText(
     'after',
     `
@@ -274,6 +249,8 @@ Examples:
   $ spec-gen generate --adr          Also generate ADRs
   $ spec-gen generate --adr-only     Only generate ADRs
   $ spec-gen generate -y             Skip confirmation prompts
+  $ spec-gen generate                Auto-resumes from last completed stage if interrupted
+  $ spec-gen generate --force        Force full regeneration, ignoring cached stages
 
 Output structure (OpenSpec format):
   openspec/
@@ -384,21 +361,9 @@ Each spec.md follows OpenSpec conventions:
       // ========================================================================
       logger.section('Pre-flight Checks');
 
-      // Check for API key
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      const openaiKey = process.env.OPENAI_API_KEY;
-      const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
-      const geminiKey = process.env.GEMINI_API_KEY;
-
-      // Resolve provider early so we can skip the API key check for claude-code
-      const envDetectedProvider = anthropicKey ? 'anthropic'
-        : geminiKey ? 'gemini'
-        : openaiCompatKey ? 'openai-compat'
-        : 'openai';
-      const rootConfig = specGenConfig as unknown as Record<string, string>;
-      const effectiveProvider = (specGenConfig.generation.provider ?? rootConfig['provider'] ?? envDetectedProvider) as 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
-
-      if (effectiveProvider !== 'claude-code' && effectiveProvider !== 'mistral-vibe' && effectiveProvider !== 'copilot' && effectiveProvider !== 'gemini-cli' && effectiveProvider !== 'cursor-agent' && !anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
+      // Resolve provider from env vars + config
+      const resolved = resolveLLMProvider(specGenConfig);
+      if (!resolved) {
         logger.error('No LLM API key found.');
         logger.discovery('Set one of the following environment variables:');
         logger.discovery('  ANTHROPIC_API_KEY    → https://console.anthropic.com/');
@@ -409,6 +374,8 @@ Each spec.md follows OpenSpec conventions:
         process.exitCode = 1;
         return;
       }
+      const effectiveProvider = resolved.provider;
+      const effectiveBaseUrl = resolved.openaiCompatBaseUrl;
 
       // Resolve model with priority: CLI flag > config > provider default
       const defaultModels: Record<string, string> = {
@@ -423,9 +390,6 @@ Each spec.md follows OpenSpec conventions:
         'cursor-agent': 'cursor-agent',
       };
       const effectiveModel = opts.model || specGenConfig.generation.model || defaultModels[effectiveProvider];
-
-      // Resolve openai-compat base URL with priority: env var > config (generation or root)
-      const effectiveBaseUrl = process.env.OPENAI_COMPAT_BASE_URL ?? specGenConfig.generation.openaiCompatBaseUrl ?? rootConfig['openaiCompatBaseUrl'];
 
       // Apply SSL verification setting (CLI --insecure or config skipSslVerify)
       if (globalOpts.insecure || specGenConfig.generation.skipSslVerify || specGenConfig.embedding?.skipSslVerify) {
@@ -562,6 +526,7 @@ Each spec.md follows OpenSpec conventions:
         rootPath,
         saveIntermediate: true,
         generateADRs: opts.adr || opts.adrOnly,
+        force: opts.force,
         progress,
         semanticSearch,
       });

@@ -378,6 +378,10 @@ export class OpenSpecFormatGenerator {
       for (const entity of domain.entities) {
         lines.push(`### ${entity.name}`);
         lines.push('');
+        if (entity.location) {
+          lines.push(`> \`${entity.location}\``);
+          lines.push('');
+        }
         lines.push(this.wrapText(entity.description));
         lines.push('');
 
@@ -440,6 +444,10 @@ export class OpenSpecFormatGenerator {
 
     // Service operation requirements
     for (const service of domain.services) {
+      if (service.locationFile) {
+        lines.push(`> \`${service.locationFile}\``);
+        lines.push('');
+      }
       for (const operation of (service.operations ?? [])) {
         const reqName = this.formatRequirementName(operation.name);
         lines.push(`### Requirement: ${reqName}`);

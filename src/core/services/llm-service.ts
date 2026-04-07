@@ -751,6 +751,12 @@ export class OpenAIProvider implements LLMProvider {
  *   OPENAI_COMPAT_API_KEY   — API key (use "ollama" for local setups without auth)
  *   OPENAI_COMPAT_BASE_URL  — Base URL, e.g. https://api.mistral.ai/v1
  */
+interface ModelInfo {
+  id: string;
+  object: string;
+  created?: number;
+  owned_by?: string;
+}
 export class OpenAICompatibleProvider implements LLMProvider {
   name = 'openai-compat';
   maxContextTokens = 128000;
@@ -768,6 +774,73 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
   countTokens(text: string): number {
     return estimateTokens(text);
+  }
+
+  /**
+   * Fetch available models from the API endpoint
+   */
+  private async fetchAvailableModels(): Promise<string[]> {
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        return [];
+      }
+
+      const data = await response.json() as { data: ModelInfo[] };
+      return data.data?.map(model => model.id).sort() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get known models for common API endpoints when /models is not available
+   */
+  private getKnownModelsForEndpoint(): string[] {
+    const url = this.baseUrl.toLowerCase();
+
+    if (url.includes('codestral.mistral.ai')) {
+      return ['codestral-2508', 'codestral-latest'];
+    }
+
+    if (url.includes('api.mistral.ai')) {
+      return [
+        'mistral-large-3-25-12',
+        'mistral-medium-3-1-25-08',
+        'mistral-small-4-0-26-03',
+        'mistral-nemo-12b-24-07',
+        'codestral-2508',
+        'devstral-2-25-12'
+      ];
+    }
+
+    if (url.includes('api.openai.com')) {
+      return [
+        'gpt-4o',
+        'gpt-4o-mini',
+        'gpt-4-turbo',
+        'gpt-4',
+        'gpt-3.5-turbo'
+      ];
+    }
+
+    if (url.includes('api.groq.com')) {
+      return [
+        'llama-3.1-70b-versatile',
+        'llama-3.1-8b-instant',
+        'mixtral-8x7b-32768'
+      ];
+    }
+
+    // For unknown endpoints, return empty array
+    return [];
   }
 
   async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
@@ -908,6 +981,7 @@ export class CopilotProvider implements LLMProvider {
       if (response.status === 429) {
         err.retryAfterMs = parseRetryAfterMs(error, response.headers.get('retry-after'));
       }
+
       throw err;
     }
 
