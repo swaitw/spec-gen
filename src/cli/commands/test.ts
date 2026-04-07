@@ -35,7 +35,6 @@ import type { TestFramework, TestCoverageReport } from '../../types/test-generat
 import {
   SPEC_GEN_DIR,
   SPEC_GEN_LOGS_SUBDIR,
-  SPEC_GEN_CONFIG_REL_PATH,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
 } from '../../constants.js';

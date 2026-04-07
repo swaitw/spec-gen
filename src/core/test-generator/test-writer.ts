@@ -65,7 +65,6 @@ function buildMergedContent(
   existingKeys: Set<string>
 ): { content: string; added: number } {
   const blocks = splitIntoBlocks(newContent);
-  const header = blocks[0]; // imports etc.
   const scenarioBlocks = blocks.slice(1);
 
   let added = 0;
