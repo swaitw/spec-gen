@@ -1,14 +1,16 @@
 # spec-gen
 
-Extract living specifications from any codebase. Enforce them as code evolves. Generate spec-driven tests from them. Give AI agents deep structural understanding of your project — all from a single tool.
+Extract living specifications from any codebase. Enforce them as code evolves. Generate spec-driven tests from them. Eliminate codebase discovery overhead for AI agents — all from a single tool.
 
 ## The Problem
 
 Most software has no specification. The code is the spec — scattered across thousands of files, tribal knowledge, and documentation that was accurate six months ago. Tools like `openspec init` create empty scaffolding, but someone still has to fill it in. By the time specs are written manually, the code has already moved on.
 
-spec-gen closes the loop. It uses static analysis to understand your codebase structurally, then an LLM to extract what that code actually *does* — producing [OpenSpec](https://github.com/Fission-AI/OpenSpec)-compatible specifications grounded in reality, not aspiration. From there it continuously detects when code and specs diverge, generates spec-driven tests with real assertions, and exposes the whole analysis as an MCP server so AI agents navigate your codebase with graph-based precision instead of blind grep.
+The same problem hits AI agents hard. Every new session starts from zero: the agent reads files, runs grep, tries to infer architecture from directory names, and spends a large fraction of its context budget just answering "what does this code do and where should I touch it?" — before writing a single line.
 
-The result: specs that are always accurate, always tested, always CI-enforced.
+spec-gen solves both. It uses static analysis to understand your codebase structurally — call graph, dependency graph, domain clusters, critical hubs — then an LLM to extract what that code actually *does*, producing [OpenSpec](https://github.com/Fission-AI/OpenSpec)-compatible specifications grounded in reality, not aspiration. The result is absorbed by agents passively at session start, so they arrive with full architectural and business context already in place. Active MCP tools handle anything deeper: graph traversal, semantic search, insertion-point discovery, spec-drift checks.
+
+For human workflows: specs stay in sync via continuous drift detection, and `spec-gen test` turns every spec scenario into an executable test with real assertions — with a coverage gate you can enforce in CI.
 
 ## Capabilities at a Glance
 
@@ -19,7 +21,8 @@ The result: specs that are always accurate, always tested, always CI-enforced.
 | Generate spec-driven tests | `spec-gen test` | No *(LLM optional)* | Seconds |
 | Report spec test coverage | `spec-gen test --coverage` | No | Seconds |
 | Verify spec accuracy | `spec-gen verify` | Yes | Minutes |
-| Navigate codebase as an AI agent | `spec-gen mcp` | No | — |
+| Give agents pre-loaded architectural context | `spec-gen analyze` → `CODEBASE.md` | No | — |
+| Let agents navigate with graph-based tools | `spec-gen mcp` | No | — |
 | Inspect the dependency graph visually | `spec-gen view` | No | — |
 
 **Languages supported**: TypeScript · JavaScript · Python · Go · Rust · Ruby · Java · C++
@@ -798,18 +801,30 @@ Run `spec-gen doctor` whenever setup instructions aren't working — it tells yo
 
 ## Agent Setup
 
+Agents working on an unfamiliar codebase spend the first quarter of every session on discovery: reading files, running grep, inferring architecture from directory names. That context burn happens before a single line of useful work is done — and the picture assembled is often incomplete.
+
+spec-gen eliminates this. Run it once, wire two files into your agent's context, and every subsequent session starts with the agent already knowing:
+
+- which functions are the highest-risk hubs to touch carefully
+- where execution enters the system
+- which business domains exist and what each one does
+- how calls flow between files
+- which specs govern which files
+
+The agent arrives informed. Discovery is done before it starts.
+
 ### Passive context vs active tools
 
-Agents have two ways to acquire knowledge about your codebase:
+There are two ways an agent acquires codebase knowledge:
 
-- **Passive (zero friction):** files referenced in `CLAUDE.md` / `.clinerules` are read automatically at session start, before the agent even processes your first message. No decision required, no tool call to make.
-- **Active (friction):** MCP tools must be consciously selected from a list, called, and their output integrated into context. Even when the information would help, agents often skip this step and read files directly instead — it's always the safe fallback.
+- **Passive (zero friction):** files listed in `CLAUDE.md` / `.clinerules` are injected at session start, before the agent processes your first message. No decision required, no token budget spent on tool calls.
+- **Active (friction):** MCP tools must be consciously selected, called, and their output integrated. Even when the information would help, agents often skip this and read files directly — it's the safe fallback.
 
-This means architectural context delivered passively is far more reliably absorbed than context behind a tool call. `spec-gen analyze` generates `.spec-gen/analysis/CODEBASE.md` specifically for this purpose: a compact, agent-optimized digest (~100 lines) that agents absorb at session start without any decision cost.
+Architectural context delivered passively is far more reliably absorbed. `spec-gen analyze` generates `.spec-gen/analysis/CODEBASE.md` for exactly this purpose: a compact, ~100-line digest that agents absorb silently at session start with zero decision cost.
 
 ### What CODEBASE.md contains
 
-Generated from the static analysis artifacts, it surfaces what an agent most needs before touching code:
+Generated from static analysis artifacts, it surfaces what an agent needs before touching code:
 
 - **Entry points** — functions with no internal callers (where execution starts)
 - **Critical hubs** — highest fan-in functions (most risky to modify)
@@ -818,7 +833,7 @@ Generated from the static analysis artifacts, it surfaces what an agent most nee
 - **God functions / oversized orchestrators** — complexity hotspots
 - **Layer violations** — if any
 
-This is structural signal, not prose. It complements `openspec/specs/overview/spec.md`, which provides the functional view (what the system does, what domains exist). Together they give agents both the architectural topology and the business intent.
+This is structural signal, not prose. It pairs with `openspec/specs/overview/spec.md`, which provides the functional view: what the system does, what domains exist, data-flow requirements. Together they give agents both the architectural topology and the business intent — without a single file-read tool call.
 
 ### Setup
 
