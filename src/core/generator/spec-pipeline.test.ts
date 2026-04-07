@@ -51,6 +51,11 @@ function createMockRepoStructure(): RepoStructure {
       routes: ['routes/user.ts'],
       services: ['services/user-service.ts'],
     },
+    uiComponents: [],
+    schemas: [],
+    routeInventory: { total: 0, byMethod: {}, byFramework: {}, routes: [] },
+    middleware: [],
+        envVars: [],
     statistics: {
       totalFiles: 50,
       analyzedFiles: 40,

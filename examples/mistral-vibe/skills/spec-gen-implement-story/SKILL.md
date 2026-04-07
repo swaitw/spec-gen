@@ -80,6 +80,30 @@ blocking refactor task and return to this story once the risk is resolved.
 
 ---
 
+## Step 2.5 — Stack inventory (conditional)
+
+Based on the story title and orient results, call the relevant inventory tool(s) **before reading any source file**. Skip if the story clearly involves none of these areas.
+
+| Story involves | Tool | Purpose |
+|---|---|---|
+| Data models / ORM / database / tables | `get_schema_inventory` | See existing tables and fields — don't re-invent what already exists |
+| HTTP routes / API / endpoints | `get_route_inventory` | See existing routes before adding new ones |
+| Config / env vars / secrets | `get_env_vars` | Identify which vars are required vs have defaults |
+| UI components | `get_ui_components` | See existing component props and framework |
+
+```xml
+<use_mcp_tool>
+  <server_name>spec-gen</server_name>
+  <tool_name>get_schema_inventory</tool_name>
+  <arguments>{"directory": "$PROJECT_ROOT"}</arguments>
+</use_mcp_tool>
+```
+
+Use the results to ground the implementation in existing schemas/routes — the plan cannot contradict what already exists.
+
+---
+
+
 ## Step 3 — Check the spec
 
 First, verify that OpenSpec specs exist:

@@ -18,10 +18,11 @@ npm install -g spec-gen-cli
 cd /path/to/your-project
 
 # Run the pipeline
-spec-gen init       # Detect project type, create config
-spec-gen analyze    # Static analysis (no API key needed)
-spec-gen generate   # Generate specs (requires API key)
-spec-gen drift      # Check for spec drift
+spec-gen init                  # Detect project type, create config
+spec-gen analyze --ai-configs  # Static analysis + generate context files (CLAUDE.md, .cursorrules…)
+spec-gen setup                 # Install workflow skills (Vibe, Cline, GSD, BMAD)
+spec-gen generate              # Generate specs (requires API key)
+spec-gen drift                 # Check for spec drift
 
 # Troubleshoot setup issues
 spec-gen doctor     # Check environment and configuration
@@ -94,6 +95,8 @@ Scans your codebase using pure static analysis:
 - Resolves Python absolute imports (`from services.retriever import X`) to local files
 - Synthesizes cross-file dependency edges from call-graph data for languages without file-level imports (Swift, C++), so the dependency graph and viewer are meaningful even in single-module projects
 - Clusters related files into structural business domains automatically
+- Extracts DB schema tables (Prisma, TypeORM, Drizzle, SQLAlchemy), HTTP routes (Express, NestJS, Next.js, FastAPI, Flask), UI components (React, Vue, Svelte, Angular), middleware chains, and environment variables — saved as structured JSON artifacts in `.spec-gen/analysis/`
+- Generates AI tool config files (`CLAUDE.md`, `.cursorrules`, `.clinerules/`, `.vibe/skills/`, etc.) with `--ai-configs`
 - Produces structured context that makes LLM generation more accurate
 
 **2. Generate** (API key required)
@@ -477,6 +480,7 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen audit` | Report spec coverage gaps: uncovered functions, hub gaps, stale domains | No |
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
 | `spec-gen view` | Launch interactive graph & spec viewer in the browser | No |
+| `spec-gen setup` | Install workflow skills into the project (Vibe, Cline, GSD, BMAD) | No |
 | `spec-gen mcp` | Start MCP server (stdio, for Cline / Claude Code) | No |
 | `spec-gen doctor` | Check environment and configuration for common issues | No |
 | `spec-gen refresh-stories` | Refresh story files with latest structural context after each commit | No |
@@ -552,8 +556,37 @@ spec-gen analyze [options]
   --include <glob>       # Additional include patterns
   --exclude <glob>       # Additional exclude patterns
   --force                # Force re-analysis (bypass 1-hour cache)
+  --ai-configs           # Generate AI tool config files (CLAUDE.md, .cursorrules, .clinerules/spec-gen.md,
+                         #   .github/copilot-instructions.md, .windsurf/rules.md, .vibe/skills/spec-gen.md)
+                         #   Safe to re-run — skips files that already exist, marks pre-existing ones.
   --no-embed             # Skip building the semantic vector index (index is built by default when embedding is configured)
   --reindex-specs        # Re-index OpenSpec specs into the vector index without re-running full analysis
+```
+
+### Setup Options
+
+```bash
+spec-gen setup [options]
+  --tools <list>   Comma-separated tools to install: vibe, cline, gsd, bmad (default: interactive prompt)
+  --dir <path>     Project root directory (default: current directory)
+```
+
+Installs workflow skills from the spec-gen package into the project. Skills are static assets — identical across projects — so this command only needs to be run once at project onboarding and again after upgrading spec-gen.
+
+Files installed:
+
+| Tool | Destination | Skills |
+|------|-------------|--------|
+| `vibe` | `.vibe/skills/spec-gen-{name}/SKILL.md` | analyze-codebase, brainstorm, debug, execute-refactor, generate, implement-story, plan-refactor |
+| `cline` | `.clinerules/workflows/spec-gen-{name}.md` | analyze-codebase, check-spec-drift, execute-refactor, implement-feature, plan-refactor, refactor-codebase |
+| `gsd` | `.claude/commands/gsd/spec-gen-{name}.md` | orient, drift |
+| `bmad` | `_bmad/spec-gen/{agents,tasks}/` | agents: architect, dev-brownfield — tasks: implement-story, onboarding, refactor, sprint-planning |
+
+Never overwrites existing files. Combine with `analyze --ai-configs` for a complete agent setup:
+
+```bash
+spec-gen analyze --ai-configs   # project-specific context files
+spec-gen setup                   # workflow skills
 ```
 
 ### Verify Options
@@ -617,7 +650,27 @@ This is structural signal, not prose. It complements `openspec/specs/overview/sp
 
 ### Setup
 
-After running `spec-gen analyze`, wire the generated digest into your agent's context:
+Two commands, run once per project:
+
+```bash
+spec-gen analyze --ai-configs   # generate project-specific context files
+spec-gen setup                   # install workflow skills
+```
+
+**`analyze --ai-configs`** generates files that are specific to this project — they reference `.spec-gen/analysis/CODEBASE.md` and embed the project name. Safe to re-run (skips existing files).
+
+**`spec-gen setup`** copies static workflow assets from the spec-gen package that are identical across all projects. Run once at onboarding; re-run after upgrading spec-gen to get new or updated skills.
+
+```
+spec-gen setup [--tools vibe,cline,gsd,bmad]
+
+Mistral Vibe  ->  .vibe/skills/spec-gen-{name}/SKILL.md      (7 skills)
+Cline / Roo   ->  .clinerules/workflows/spec-gen-{name}.md   (6 workflows)
+GSD           ->  .claude/commands/gsd/spec-gen-{name}.md    (2 commands)
+BMAD          ->  _bmad/spec-gen/{agents,tasks}/              (2 agents, 4 tasks)
+```
+
+Wire the generated digest into your agent's context:
 
 **Claude Code** — add to `CLAUDE.md`:
 
@@ -625,7 +678,7 @@ After running `spec-gen analyze`, wire the generated digest into your agent's co
 @.spec-gen/analysis/CODEBASE.md
 @openspec/specs/overview/spec.md
 
-## spec-gen MCP tools — when to use them
+## spec-gen MCP workflow
 
 | Situation | Tool |
 |-----------|------|
@@ -638,7 +691,17 @@ After running `spec-gen analyze`, wire the generated digest into your agent's co
 | Finding spec requirements by meaning | `search_specs` |
 | Checking spec coverage before starting a feature | `audit_spec_coverage` |
 
-For all other cases (reading a file, grepping, listing files) use native tools directly.
+**Follow this sequence for every task:**
+
+1. **`orient "<task description>"`** — always start here. Returns relevant functions, files, spec domains, call paths, and insertion points in one call.
+2. **If the task involves data models, APIs, or config** — call the relevant inventory tool:
+   `get_schema_inventory` · `get_route_inventory` · `get_env_vars` · `get_ui_components` · `get_middleware_inventory`
+3. **If debugging a call flow** ("how does X reach Y?") — `trace_execution_path`
+4. **Before modifying a function** — `get_subgraph` to understand blast radius
+5. **Before opening a PR** — `check_spec_drift`
+
+**On-demand** (when orient's results aren't enough):
+`search_code` · `suggest_insertion_points` · `get_spec <domain>` · `search_specs` · `analyze_impact` · `get_function_body` · `get_function_skeleton`
 ```
 
 **Cline / Roo Code / Kilocode** — create `.clinerules/spec-gen.md`:
@@ -656,28 +719,45 @@ Always use these before writing or modifying code.
 - Read `openspec/specs/overview/spec.md` — functional domain map: what the system does,
   which domains exist, data-flow requirements.
 
-## MCP tools — use these instead of grep/read when exploring
+## spec-gen MCP workflow
 
-- **Orient first**: call `orient` at the start of every task — it returns relevant functions,
-  files, specs, call paths, and insertion points in one shot.
-- **Finding code**: use `search_code` when you don't know which file or function handles a concept.
-- **Call topology**: use `get_subgraph` or `analyze_impact` when you need to understand
-  how calls flow across multiple files (not just a single file).
-- **Adding a feature**: call `suggest_insertion_points` before deciding where to add code —
-  it accounts for the dependency graph, not just filenames.
-- **Reading specs**: call `get_spec <domain>` before writing code in that domain;
-  use `search_specs` to find requirements by meaning when you don't know the domain name.
-- **Checking drift**: call `check_spec_drift` after modifying a file to verify it still
-  matches its spec — do not skip this step before opening a PR.
+**Follow this sequence for every task:**
 
-Use native tools (Read, Grep, Glob) only for cases not covered above.
+1. **`orient "<task description>"`** — always start here. Returns relevant functions, files, spec domains, call paths, and insertion points in one call.
+2. **If the task involves data models, APIs, or config** — call the relevant inventory tool:
+   `get_schema_inventory` · `get_route_inventory` · `get_env_vars` · `get_ui_components` · `get_middleware_inventory`
+3. **If debugging a call flow** ("how does X reach Y?") — `trace_execution_path`
+4. **Before modifying a function** — `get_subgraph` to understand blast radius
+5. **Before opening a PR** — `check_spec_drift`
+
+**On-demand** (when orient's results aren't enough):
+`search_code` · `suggest_insertion_points` · `get_spec <domain>` · `search_specs` · `analyze_impact` · `get_function_body` · `get_function_skeleton`
 ```
 
-`CODEBASE.md` gives the agent passive architectural context. `overview/spec.md` gives the functional domain map. The table tells it when the passive context isn't enough and an active MCP tool call is warranted.
+`CODEBASE.md` gives the agent passive architectural context. `overview/spec.md` gives the functional domain map. The workflow tells it exactly what to call and when, without requiring the agent to choose from a menu.
 
 > **Tip:** `spec-gen analyze` prints these snippets after every run as a reminder.
 
 > **Note:** `.spec-gen/analysis/` is git-ignored — each developer generates it locally. Re-run `spec-gen analyze` after significant structural changes to keep the digest current.
+
+**Mistral Vibe (Devstral)** — inject CODEBASE.md into Vibe's global context:
+
+> **Vibe shows "0 skills" after setup?** Check `~/.vibe/config.toml` — if `enabled_skills` is set to a pattern like `["SKILL-*"]` (the old naming format), it won't match the new `spec-gen-*` names. Change it to `["spec-gen-*"]` or `["*"]` to load all skills.
+
+1. Run `spec-gen analyze` to generate `.spec-gen/analysis/CODEBASE.md`
+2. Append it to `~/.vibe/prompts/spec-gen.md` so Devstral absorbs it at every session start:
+
+```bash
+cat .spec-gen/analysis/CODEBASE.md >> ~/.vibe/prompts/spec-gen.md
+```
+
+Or install the Vibe skill (creates a `/spec-gen` slash command in `.vibe/skills/spec-gen.md`):
+
+```bash
+spec-gen analyze --ai-configs   # creates .vibe/skills/spec-gen.md
+```
+
+Then invoke `/spec-gen` inside Vibe to get architecture context on demand.
 
 ---
 
@@ -791,7 +871,7 @@ curl -sL https://raw.githubusercontent.com/clay-good/spec-gen/main/skills/opensp
 
 All tools run on **pure static analysis** -- no LLM quota consumed.
 
-**Analysis**
+**Run analysis**
 
 | Tool | Description | Requires prior analysis |
 |------|-------------|:---:|
@@ -800,30 +880,43 @@ All tools run on **pure static analysis** -- no LLM quota consumed.
 | `get_signatures` | Compact function/class signatures per file. Filter by path substring with `filePattern`. Useful for understanding a module's public API without reading full source. | Yes |
 | `get_duplicate_report` | Detect duplicate code: Type 1 (exact clones), Type 2 (structural -- renamed variables), Type 3 (near-clones with Jaccard similarity >= 0.7). Groups sorted by impact. | Yes |
 
-**Refactoring**
-
-| Tool | Description | Requires prior analysis |
-|------|-------------|:---:|
-| `get_refactor_report` | Prioritized list of functions with structural issues: unreachable code, hub overload (high fan-in), god functions (high fan-out), SRP violations, cyclic dependencies. | Yes |
-| `analyze_impact` | Deep impact analysis for a specific function: fan-in/fan-out, upstream call chain, downstream critical path, risk score (0-100), blast radius, and recommended strategy. | Yes |
-| `get_low_risk_refactor_candidates` | Safest functions to refactor first: low fan-in, low fan-out, not a hub, no cyclic involvement. Best starting point for incremental, low-risk sessions. | Yes |
-| `get_leaf_functions` | Functions that make no internal calls (leaves of the call graph). Zero downstream blast radius. Sorted by fan-in by default -- most-called leaves have the best unit-test ROI. | Yes |
-| `get_critical_hubs` | Highest-impact hub functions ranked by criticality. Each hub gets a stability score (0-100) and a recommended approach: extract, split, facade, or delegate. | Yes |
-| `get_god_functions` | Detect god functions (high fan-out, likely orchestrators) in the project or in a specific file, and return their call-graph neighborhood. Use this to identify which functions need to be refactored and understand what logical blocks to extract. | Yes |
-
-**Navigation**
+**Explore & Navigate**
 
 | Tool | Description | Requires prior analysis |
 |------|-------------|:---:|
 | `orient` | **Single entry point for any new task.** Given a natural-language task description, returns in one call: relevant functions, source files, spec domains, call neighbourhoods, insertion-point candidates, and matching spec sections. Start here. | Yes (+ embedding) |
-| `get_subgraph` | Depth-limited subgraph centred on a function. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. Output as JSON or Mermaid diagram. | Yes |
-| `get_architecture_overview` | High-level cluster map: roles (entry layer, orchestrator, core utilities, API layer, internal), inter-cluster dependencies, global entry points, and critical hubs. No LLM required. | Yes |
-| `get_function_skeleton` | Noise-stripped view of a source file: logs, inline comments, and non-JSDoc block comments removed. Signatures, control flow, return/throw, and call expressions preserved. Returns reduction %. | No |
-| `get_function_body` | Return the exact source code of a named function in a file. | No |
-| `get_file_dependencies` | Return the file-level import dependencies for a given source file (imports, imported-by, or both). | Yes |
-| `trace_execution_path` | Find all call-graph paths between two functions (DFS, configurable depth/max-paths). Use this when debugging: "how does request X reach function Y?" Returns shortest path, all paths sorted by hops, and a step-by-step chain per path. | Yes |
-| `suggest_insertion_points` | Semantic search over the vector index to find the best existing functions to extend or hook into when implementing a new feature. Returns ranked candidates with role and strategy. Falls back to BM25 keyword search when no embedding server is configured. | Yes (+ embedding) |
 | `search_code` | Natural-language semantic search over indexed functions. Returns the closest matches by meaning with similarity score, call-graph neighbourhood enrichment, and spec-linked peer functions. Falls back to BM25 keyword search when no embedding server is configured. | Yes (+ embedding) |
+| `suggest_insertion_points` | Semantic search over the vector index to find the best existing functions to extend or hook into when implementing a new feature. Returns ranked candidates with role and strategy. Falls back to BM25 keyword search when no embedding server is configured. | Yes (+ embedding) |
+| `get_subgraph` | Depth-limited subgraph centred on a function. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. Output as JSON or Mermaid diagram. | Yes |
+| `trace_execution_path` | Find all call-graph paths between two functions (DFS, configurable depth/max-paths). Use this when debugging: "how does request X reach function Y?" Returns shortest path, all paths sorted by hops, and a step-by-step chain per path. | Yes |
+| `get_function_body` | Return the exact source code of a named function in a file. | No |
+| `get_function_skeleton` | Noise-stripped view of a source file: logs, inline comments, and non-JSDoc block comments removed. Signatures, control flow, return/throw, and call expressions preserved. Returns reduction %. | No |
+| `get_file_dependencies` | Return the file-level import dependencies for a given source file (imports, imported-by, or both). | Yes |
+| `get_architecture_overview` | High-level cluster map: roles (entry layer, orchestrator, core utilities, API layer, internal), inter-cluster dependencies, global entry points, and critical hubs. No LLM required. | Yes |
+| `get_signatures` | Compact function/class signatures per file. Filter by path substring with `filePattern`. Useful for understanding a module's public API without reading full source. | Yes |
+
+**Stack inventory**
+
+| Tool | Description | Requires prior analysis |
+|------|-------------|:---:|
+| `get_route_inventory` | All detected HTTP routes with method, path, handler, and framework. Supports Express, NestJS, Next.js, FastAPI, Flask, and more. | Yes |
+| `get_schema_inventory` | ORM schema tables with field names and types. Supports Prisma, TypeORM, Drizzle, and SQLAlchemy. | Yes |
+| `get_ui_components` | Detected UI components with framework, props, and source file. Supports React, Vue, Svelte, and Angular. | Yes |
+| `get_env_vars` | Env vars referenced in source code with `required` (no fallback) and `hasDefault` flags. Supports JS/TS, Python, Go, and Ruby. | Yes |
+| `get_middleware_inventory` | Detected middleware with type (auth/cors/rate-limit/validation/logging/error-handler) and framework. | Yes |
+
+**Code quality**
+
+| Tool | Description | Requires prior analysis |
+|------|-------------|:---:|
+| `get_call_graph` | Hub functions (high fan-in), entry points (no internal callers), and architectural layer violations. Supports TypeScript, JavaScript, Python, Go, Rust, Ruby, Java, C++. | Yes |
+| `get_refactor_report` | Prioritized list of functions with structural issues: unreachable code, hub overload (high fan-in), god functions (high fan-out), SRP violations, cyclic dependencies. | Yes |
+| `get_critical_hubs` | Highest-impact hub functions ranked by criticality. Each hub gets a stability score (0-100) and a recommended approach: extract, split, facade, or delegate. | Yes |
+| `get_god_functions` | Detect god functions (high fan-out, likely orchestrators) in the project or in a specific file, and return their call-graph neighborhood. Use this to identify which functions need to be refactored and understand what logical blocks to extract. | Yes |
+| `analyze_impact` | Deep impact analysis for a specific function: fan-in/fan-out, upstream call chain, downstream critical path, risk score (0-100), blast radius, and recommended strategy. | Yes |
+| `get_low_risk_refactor_candidates` | Safest functions to refactor first: low fan-in, low fan-out, not a hub, no cyclic involvement. Best starting point for incremental, low-risk sessions. | Yes |
+| `get_leaf_functions` | Functions that make no internal calls (leaves of the call graph). Zero downstream blast radius. Sorted by fan-in by default -- most-called leaves have the best unit-test ROI. | Yes |
+| `get_duplicate_report` | Detect duplicate code: Type 1 (exact clones), Type 2 (structural -- renamed variables), Type 3 (near-clones with Jaccard similarity >= 0.7). Groups sorted by impact. | Yes |
 
 **Specs**
 

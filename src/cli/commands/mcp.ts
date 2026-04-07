@@ -59,6 +59,11 @@ import {
   handleGetFunctionSkeleton,
   handleGetFunctionBody,
   handleGetDecisions,
+  handleGetRouteInventory,
+  handleGetMiddlewareInventory,
+  handleGetSchemaInventory,
+  handleGetUIComponents,
+  handleGetEnvVars,
   handleAuditSpecCoverage,
 } from '../../core/services/mcp-handlers/analysis.js';
 
@@ -87,6 +92,11 @@ export {
   handleGetMapping,
   handleCheckSpecDrift,
   handleGetFunctionSkeleton,
+  handleGetRouteInventory,
+  handleGetMiddlewareInventory,
+  handleGetSchemaInventory,
+  handleGetUIComponents,
+  handleGetEnvVars,
   handleAuditSpecCoverage,
 };
 
@@ -851,6 +861,94 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'get_route_inventory',
+    description:
+      'Return the full HTTP/API route inventory for the project: total count, breakdown by ' +
+      'HTTP method and framework, and the list of individual routes with method, path, ' +
+      'framework, source file, and handler name. ' +
+      'Reads the pre-computed route-inventory.json artifact when available (runs in < 1 ms), ' +
+      'otherwise scans source files live. ' +
+      'Supports Express, Hono, Fastify, NestJS, Next.js App Router, FastAPI, Flask, Django, and more. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_middleware_inventory',
+    description:
+      'Return the middleware inventory for the project: all detected middleware entries with ' +
+      'type (auth, cors, rate-limit, validation, logging, error-handler, custom), framework, ' +
+      'source file, line number, and name. ' +
+      'Reads the pre-computed middleware-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports Express, Hono, Fastify, NestJS, Next.js, and more. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_schema_inventory',
+    description:
+      'Return the database schema inventory for the project: all detected ORM model/table ' +
+      'definitions with their fields, types, and nullability. ' +
+      'Reads the pre-computed schema-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports Prisma, TypeORM, Drizzle ORM, and SQLAlchemy. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_ui_components',
+    description:
+      'Return the UI component inventory for the project: all detected components with ' +
+      'their framework, props, source file, and line number. ' +
+      'Reads the pre-computed ui-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports React, Vue, Svelte, and Angular. ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_env_vars',
+    description:
+      'Return all environment variables referenced in the project: names, which files use them, ' +
+      'whether they have a known default (from .env.example), and whether they are required ' +
+      '(used without a fallback in source code). ' +
+      'Reads the pre-computed env-inventory.json artifact when available, ' +
+      'otherwise scans source files live. ' +
+      'Supports JS/TS (process.env), Python (os.environ/os.getenv), Go (os.Getenv), Ruby (ENV[]). ' +
+      'Run analyze_codebase first for the fastest results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        directory: { type: 'string', description: 'Absolute path to the project directory' },
+      },
+      required: ['directory'],
+    },
+  },
+  {
     name: 'audit_spec_coverage',
     description:
       'Parity audit: report spec coverage gaps without any LLM call. ' +
@@ -1024,6 +1122,21 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
       } else if (name === 'get_decisions') {
         const { directory, query } = args as { directory: string; query?: string };
         result = await handleGetDecisions(directory, query);
+      } else if (name === 'get_route_inventory') {
+        const { directory } = args as { directory: string };
+        result = await handleGetRouteInventory(directory);
+      } else if (name === 'get_middleware_inventory') {
+        const { directory } = args as { directory: string };
+        result = await handleGetMiddlewareInventory(directory);
+      } else if (name === 'get_schema_inventory') {
+        const { directory } = args as { directory: string };
+        result = await handleGetSchemaInventory(directory);
+      } else if (name === 'get_ui_components') {
+        const { directory } = args as { directory: string };
+        result = await handleGetUIComponents(directory);
+      } else if (name === 'get_env_vars') {
+        const { directory } = args as { directory: string };
+        result = await handleGetEnvVars(directory);
       } else if (name === 'audit_spec_coverage') {
         const { directory, maxUncovered = 50, hubThreshold = 5 } =
           args as { directory: string; maxUncovered?: number; hubThreshold?: number };

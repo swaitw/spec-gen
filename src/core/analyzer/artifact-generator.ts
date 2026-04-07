@@ -16,11 +16,19 @@ import {
   ARTIFACT_LLM_CONTEXT,
   ARTIFACT_MAPPING,
   ARTIFACT_REFACTOR_PRIORITIES,
+  ARTIFACT_SCHEMA_INVENTORY,
+  ARTIFACT_ROUTE_INVENTORY,
+  ARTIFACT_UI_INVENTORY,
 } from '../../constants.js';
 import type { ScoredFile, ProjectType } from '../../types/index.js';
 import type { RepositoryMap } from './repository-mapper.js';
 import type { DependencyGraphResult } from './dependency-graph.js';
 import { toMermaidFormat, injectCallGraphEdges, IMPLICIT_IMPORT_LANGS } from './dependency-graph.js';
+import type { UIComponent } from './ui-component-extractor.js';
+import type { SchemaTable } from './schema-extractor.js';
+import type { RouteInventory } from './http-route-parser.js';
+import type { MiddlewareEntry } from './middleware-extractor.js';
+import type { EnvVar } from './env-extractor.js';
 
 /**
  * Heuristic to detect test/spec files across languages.
@@ -117,6 +125,16 @@ export interface RepoStructure {
   entryPoints: EntryPointInfo[];
   dataFlow: DataFlowInfo;
   keyFiles: KeyFiles;
+  /** Detected UI components (React, Vue, Svelte, Angular) */
+  uiComponents: UIComponent[];
+  /** Detected database schema tables */
+  schemas: SchemaTable[];
+  /** Aggregated HTTP route inventory */
+  routeInventory: RouteInventory;
+  /** Detected middleware entries */
+  middleware: MiddlewareEntry[];
+  /** Detected environment variables */
+  envVars: EnvVar[];
   statistics: {
     totalFiles: number;
     analyzedFiles: number;
@@ -164,6 +182,17 @@ export interface AnalysisArtifacts {
   summaryMarkdown: string;
   dependencyDiagram: string;
   llmContext: LLMContext;
+}
+
+/**
+ * Optional enrichment data produced by new extractors, passed into generate().
+ */
+export interface EnrichmentData {
+  uiComponents?: UIComponent[];
+  schemas?: SchemaTable[];
+  routeInventory?: RouteInventory;
+  middleware?: MiddlewareEntry[];
+  envVars?: EnvVar[];
 }
 
 /**
@@ -249,10 +278,11 @@ export class AnalysisArtifactGenerator {
    */
   async generate(
     repoMap: RepositoryMap,
-    depGraph: DependencyGraphResult
+    depGraph: DependencyGraphResult,
+    enrichment?: EnrichmentData
   ): Promise<AnalysisArtifacts> {
     // Generate each artifact
-    const repoStructure = this.generateRepoStructure(repoMap, depGraph);
+    const repoStructure = this.generateRepoStructure(repoMap, depGraph, enrichment);
     const summaryMarkdown = this.generateSummaryMarkdown(repoMap, depGraph, repoStructure);
     const dependencyDiagram = this.generateDependencyDiagram(depGraph);
     const llmContext = await this.generateLLMContext(repoMap, depGraph);
@@ -270,15 +300,16 @@ export class AnalysisArtifactGenerator {
    */
   async generateAndSave(
     repoMap: RepositoryMap,
-    depGraph: DependencyGraphResult
+    depGraph: DependencyGraphResult,
+    enrichment?: EnrichmentData
   ): Promise<AnalysisArtifacts> {
-    const artifacts = await this.generate(repoMap, depGraph);
+    const artifacts = await this.generate(repoMap, depGraph, enrichment);
 
     // Ensure output directory exists
     await mkdir(this.options.outputDir, { recursive: true });
 
     // Save each artifact
-    await Promise.all([
+    const saves: Promise<void>[] = [
       writeFile(
         join(this.options.outputDir, ARTIFACT_REPO_STRUCTURE),
         JSON.stringify(artifacts.repoStructure, null, 2)
@@ -295,7 +326,46 @@ export class AnalysisArtifactGenerator {
         join(this.options.outputDir, ARTIFACT_LLM_CONTEXT),
         JSON.stringify(artifacts.llmContext, null, 2)
       ),
-    ]);
+    ];
+
+    if (enrichment?.schemas) {
+      saves.push(writeFile(
+        join(this.options.outputDir, ARTIFACT_SCHEMA_INVENTORY),
+        JSON.stringify(enrichment.schemas, null, 2)
+      ));
+    }
+
+    if (enrichment?.uiComponents) {
+      saves.push(writeFile(
+        join(this.options.outputDir, ARTIFACT_UI_INVENTORY),
+        JSON.stringify(enrichment.uiComponents, null, 2)
+      ));
+    }
+
+    if (enrichment?.routeInventory) {
+      saves.push(writeFile(
+        join(this.options.outputDir, ARTIFACT_ROUTE_INVENTORY),
+        JSON.stringify(enrichment.routeInventory, null, 2)
+      ));
+    }
+
+    if (enrichment?.middleware) {
+      const { ARTIFACT_MIDDLEWARE_INVENTORY } = await import('../../constants.js');
+      saves.push(writeFile(
+        join(this.options.outputDir, ARTIFACT_MIDDLEWARE_INVENTORY),
+        JSON.stringify(enrichment.middleware, null, 2)
+      ));
+    }
+
+    if (enrichment?.envVars) {
+      const { ARTIFACT_ENV_INVENTORY } = await import('../../constants.js');
+      saves.push(writeFile(
+        join(this.options.outputDir, ARTIFACT_ENV_INVENTORY),
+        JSON.stringify(enrichment.envVars, null, 2)
+      ));
+    }
+
+    await Promise.all(saves);
 
     return artifacts;
   }
@@ -305,7 +375,8 @@ export class AnalysisArtifactGenerator {
    */
   private generateRepoStructure(
     repoMap: RepositoryMap,
-    depGraph: DependencyGraphResult
+    depGraph: DependencyGraphResult,
+    enrichment?: EnrichmentData
   ): RepoStructure {
     // Detect architecture pattern
     const architecturePattern = this.detectArchitecturePattern(repoMap, depGraph);
@@ -342,6 +413,11 @@ export class AnalysisArtifactGenerator {
       entryPoints,
       dataFlow,
       keyFiles,
+      uiComponents: enrichment?.uiComponents ?? [],
+      schemas: enrichment?.schemas ?? [],
+      routeInventory: enrichment?.routeInventory ?? { total: 0, byMethod: {}, byFramework: {}, routes: [] },
+      middleware: enrichment?.middleware ?? [],
+      envVars: enrichment?.envVars ?? [],
       statistics: {
         totalFiles: repoMap.summary.totalFiles,
         analyzedFiles: repoMap.summary.analyzedFiles,
@@ -836,6 +912,63 @@ export class AnalysisArtifactGenerator {
       lines.push(rec);
     }
     lines.push('');
+
+    // ── UI Components ─────────────────────────────────────────────────────────
+    if (repoStructure.uiComponents.length > 0) {
+      const byFramework: Record<string, number> = {};
+      for (const c of repoStructure.uiComponents) {
+        byFramework[c.framework] = (byFramework[c.framework] ?? 0) + 1;
+      }
+      lines.push('## UI Components');
+      lines.push(`**Total**: ${repoStructure.uiComponents.length} component(s)`);
+      for (const [fw, count] of Object.entries(byFramework)) {
+        lines.push(`- ${fw}: ${count}`);
+      }
+      lines.push('');
+    }
+
+    // ── Database Schemas ──────────────────────────────────────────────────────
+    if (repoStructure.schemas.length > 0) {
+      const byOrm: Record<string, number> = {};
+      for (const t of repoStructure.schemas) {
+        byOrm[t.orm] = (byOrm[t.orm] ?? 0) + 1;
+      }
+      lines.push('## Database Schemas');
+      lines.push(`**Total tables/models**: ${repoStructure.schemas.length}`);
+      for (const [orm, count] of Object.entries(byOrm)) {
+        lines.push(`- ${orm}: ${count} model(s)`);
+      }
+      lines.push('');
+    }
+
+    // ── Route Inventory ───────────────────────────────────────────────────────
+    if (repoStructure.routeInventory.total > 0) {
+      const inv = repoStructure.routeInventory;
+      lines.push('## API Routes');
+      lines.push(`**Total routes**: ${inv.total}`);
+      const methodSummary = Object.entries(inv.byMethod)
+        .sort((a, b) => b[1] - a[1])
+        .map(([m, n]) => `${m}: ${n}`)
+        .join(', ');
+      if (methodSummary) lines.push(`- By method: ${methodSummary}`);
+      const frameworkSummary = Object.entries(inv.byFramework)
+        .sort((a, b) => b[1] - a[1])
+        .map(([f, n]) => `${f}: ${n}`)
+        .join(', ');
+      if (frameworkSummary) lines.push(`- By framework: ${frameworkSummary}`);
+      lines.push('');
+    }
+
+    // ── Environment Variables ─────────────────────────────────────────────────
+    if (repoStructure.envVars.length > 0) {
+      lines.push('## Environment Variables');
+      lines.push(`**Total**: ${repoStructure.envVars.length} variable(s)`);
+      const required = repoStructure.envVars.filter(v => v.required);
+      if (required.length > 0) {
+        lines.push(`- Required (no default): ${required.map(v => v.name).join(', ')}`);
+      }
+      lines.push('');
+    }
 
     // Footer
     lines.push('---');

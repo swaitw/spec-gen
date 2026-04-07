@@ -18,6 +18,7 @@ import { runCommand } from './commands/run.js';
 import { mcpCommand } from './commands/mcp.js';
 import { viewCommand } from './commands/view.js';
 import { doctorCommand } from './commands/doctor.js';
+import { setupCommand } from './commands/setup.js';
 import { refreshStoriesCommand } from './commands/refresh-stories.js';
 import { auditCommand } from './commands/audit.js';
 import { configureLogger } from '../utils/logger.js';
@@ -73,18 +74,20 @@ program
     'after',
     `
 Workflow:
-  1. spec-gen init      Detect project type, create config
-  2. spec-gen analyze   Scan codebase, build dependency graph
-  3. spec-gen view      Review visually the dependency graph
-  4. spec-gen generate  Create OpenSpec files using LLM
-  5. spec-gen verify    Validate specs against source code
-  6. spec-gen drift     Detect when code outpaces specs
+  1. spec-gen init                    Detect project type, create config
+  2. spec-gen analyze                 Scan codebase, build dependency graph
+  3. spec-gen analyze --ai-configs    Generate context files (CLAUDE.md, .cursorrules…)
+  4. spec-gen setup                   Install workflow skills (Vibe, Cline, GSD)
+  5. spec-gen view                    Review visually the dependency graph
+  6. spec-gen generate                Create OpenSpec files using LLM
+  7. spec-gen verify                  Validate specs against source code
+  8. spec-gen drift                   Detect when code outpaces specs
 
 Quick start:
   $ cd your-project
   $ spec-gen init
-  $ spec-gen analyze
-  $ spec-gen view
+  $ spec-gen analyze --ai-configs
+  $ spec-gen setup
   $ spec-gen generate
 
 Or run the full pipeline at once:
@@ -118,6 +121,7 @@ program.addCommand(runCommand);
 program.addCommand(mcpCommand);
 program.addCommand(viewCommand);
 program.addCommand(doctorCommand);
+program.addCommand(setupCommand);
 program.addCommand(refreshStoriesCommand);
 program.addCommand(auditCommand);
 

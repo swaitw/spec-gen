@@ -2,7 +2,8 @@
  * MCP tool handlers for codebase analysis:
  * analyze_codebase, get_architecture_overview, get_refactor_report,
  * get_duplicate_report, get_signatures, get_mapping, check_spec_drift,
- * get_function_skeleton, get_god_functions.
+ * get_function_skeleton, get_god_functions, get_route_inventory,
+ * get_middleware_inventory, get_schema_inventory, get_ui_components.
  */
 
 import { readFile, stat } from 'node:fs/promises';
@@ -18,6 +19,11 @@ import {
   ARTIFACT_DEPENDENCY_GRAPH,
   ARTIFACT_MAPPING,
   ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_ROUTE_INVENTORY,
+  ARTIFACT_MIDDLEWARE_INVENTORY,
+  ARTIFACT_SCHEMA_INVENTORY,
+  ARTIFACT_UI_INVENTORY,
+  ARTIFACT_ENV_INVENTORY,
 } from '../../../constants.js';
 import { runAnalysis } from '../../../cli/commands/analyze.js';
 import { analyzeForRefactoring } from '../../analyzer/refactor-analyzer.js';
@@ -535,6 +541,208 @@ export async function handleGetDecisions(
       content: a.content,
     })),
   };
+}
+
+// ============================================================================
+// ROUTE INVENTORY HANDLER
+// ============================================================================
+
+/**
+ * Return the pre-computed route inventory from the last analysis run.
+ * Falls back to re-computing from source files if the artifact is missing.
+ */
+export async function handleGetRouteInventory(
+  directory: string
+): Promise<Record<string, unknown>> {
+  const absDir = await validateDirectory(directory);
+  const artifactPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_ROUTE_INVENTORY);
+
+  // Try reading cached artifact first
+  try {
+    const raw = await readFile(artifactPath, 'utf-8');
+    const inventory = JSON.parse(raw) as Record<string, unknown>;
+    return { cached: true, ...inventory };
+  } catch {
+    // Artifact not present — run live extraction
+  }
+
+  const { buildRouteInventory } = await import('../../analyzer/http-route-parser.js');
+  const { RepositoryMapper } = await import('../../analyzer/repository-mapper.js');
+  const { readSpecGenConfig } = await import('../config-manager.js');
+
+  const specGenConfig = await readSpecGenConfig(absDir);
+  const configExclude = specGenConfig?.analysis.excludePatterns ?? [];
+
+  const mapper = new RepositoryMapper(absDir, {
+    maxFiles: DEFAULT_MAX_FILES,
+    excludePatterns: configExclude.length > 0 ? configExclude : undefined,
+  });
+  const repoMap = await mapper.map();
+  const filePaths = repoMap.allFiles.map(f => f.path);
+
+  const inventory = await buildRouteInventory(filePaths, absDir);
+  return { cached: false, ...inventory };
+}
+
+// ============================================================================
+// MIDDLEWARE INVENTORY HANDLER
+// ============================================================================
+
+/**
+ * Return the pre-computed middleware inventory from the last analysis run.
+ * Falls back to re-computing from source files if the artifact is missing.
+ */
+export async function handleGetMiddlewareInventory(
+  directory: string
+): Promise<Record<string, unknown>> {
+  const absDir = await validateDirectory(directory);
+  const artifactPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_MIDDLEWARE_INVENTORY);
+
+  // Try reading cached artifact first
+  try {
+    const raw = await readFile(artifactPath, 'utf-8');
+    const inventory = JSON.parse(raw) as unknown[];
+    return { cached: true, total: inventory.length, entries: inventory };
+  } catch {
+    // Artifact not present — run live extraction
+  }
+
+  const { extractMiddleware } = await import('../../analyzer/middleware-extractor.js');
+  const { RepositoryMapper } = await import('../../analyzer/repository-mapper.js');
+  const { readSpecGenConfig } = await import('../config-manager.js');
+
+  const specGenConfig = await readSpecGenConfig(absDir);
+  const configExclude = specGenConfig?.analysis.excludePatterns ?? [];
+
+  const mapper = new RepositoryMapper(absDir, {
+    maxFiles: DEFAULT_MAX_FILES,
+    excludePatterns: configExclude.length > 0 ? configExclude : undefined,
+  });
+  const repoMap = await mapper.map();
+  const filePaths = repoMap.allFiles.map(f => f.path);
+
+  const entries = await extractMiddleware(filePaths, absDir);
+  return { cached: false, total: entries.length, entries };
+}
+
+// ============================================================================
+// SCHEMA INVENTORY HANDLER
+// ============================================================================
+
+/**
+ * Return the pre-computed database schema inventory from the last analysis run.
+ * Falls back to re-computing from source files if the artifact is missing.
+ */
+export async function handleGetSchemaInventory(
+  directory: string
+): Promise<Record<string, unknown>> {
+  const absDir = await validateDirectory(directory);
+  const artifactPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_SCHEMA_INVENTORY);
+
+  try {
+    const raw = await readFile(artifactPath, 'utf-8');
+    const schemas = JSON.parse(raw) as unknown[];
+    return { cached: true, total: schemas.length, schemas };
+  } catch {
+    // Artifact not present — run live extraction
+  }
+
+  const { extractSchemas } = await import('../../analyzer/schema-extractor.js');
+  const { RepositoryMapper } = await import('../../analyzer/repository-mapper.js');
+  const { readSpecGenConfig } = await import('../config-manager.js');
+
+  const specGenConfig = await readSpecGenConfig(absDir);
+  const configExclude = specGenConfig?.analysis.excludePatterns ?? [];
+
+  const mapper = new RepositoryMapper(absDir, {
+    maxFiles: DEFAULT_MAX_FILES,
+    excludePatterns: configExclude.length > 0 ? configExclude : undefined,
+  });
+  const repoMap = await mapper.map();
+  const filePaths = repoMap.allFiles.map(f => f.path);
+
+  const schemas = await extractSchemas(filePaths, absDir);
+  return { cached: false, total: schemas.length, schemas };
+}
+
+// ============================================================================
+// UI COMPONENTS HANDLER
+// ============================================================================
+
+/**
+ * Return the pre-computed UI component inventory from the last analysis run.
+ * Falls back to re-computing from source files if the artifact is missing.
+ */
+export async function handleGetUIComponents(
+  directory: string
+): Promise<Record<string, unknown>> {
+  const absDir = await validateDirectory(directory);
+  const artifactPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_UI_INVENTORY);
+
+  try {
+    const raw = await readFile(artifactPath, 'utf-8');
+    const components = JSON.parse(raw) as unknown[];
+    return { cached: true, total: components.length, components };
+  } catch {
+    // Artifact not present — run live extraction
+  }
+
+  const { extractUIComponents } = await import('../../analyzer/ui-component-extractor.js');
+  const { RepositoryMapper } = await import('../../analyzer/repository-mapper.js');
+  const { readSpecGenConfig } = await import('../config-manager.js');
+
+  const specGenConfig = await readSpecGenConfig(absDir);
+  const configExclude = specGenConfig?.analysis.excludePatterns ?? [];
+
+  const mapper = new RepositoryMapper(absDir, {
+    maxFiles: DEFAULT_MAX_FILES,
+    excludePatterns: configExclude.length > 0 ? configExclude : undefined,
+  });
+  const repoMap = await mapper.map();
+  const filePaths = repoMap.allFiles.map(f => f.path);
+
+  const components = await extractUIComponents(filePaths, absDir);
+  return { cached: false, total: components.length, components };
+}
+
+// ============================================================================
+// ENV VARS HANDLER
+// ============================================================================
+
+/**
+ * Return the pre-computed environment variable inventory from the last analysis run.
+ * Falls back to re-computing from source files if the artifact is missing.
+ */
+export async function handleGetEnvVars(
+  directory: string
+): Promise<Record<string, unknown>> {
+  const absDir = await validateDirectory(directory);
+  const artifactPath = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_ENV_INVENTORY);
+
+  try {
+    const raw = await readFile(artifactPath, 'utf-8');
+    const envVars = JSON.parse(raw) as unknown[];
+    return { cached: true, total: envVars.length, envVars };
+  } catch {
+    // Artifact not present — run live extraction
+  }
+
+  const { extractEnvVars } = await import('../../analyzer/env-extractor.js');
+  const { RepositoryMapper } = await import('../../analyzer/repository-mapper.js');
+  const { readSpecGenConfig } = await import('../config-manager.js');
+
+  const specGenConfig = await readSpecGenConfig(absDir);
+  const configExclude = specGenConfig?.analysis.excludePatterns ?? [];
+
+  const mapper = new RepositoryMapper(absDir, {
+    maxFiles: DEFAULT_MAX_FILES,
+    excludePatterns: configExclude.length > 0 ? configExclude : undefined,
+  });
+  const repoMap = await mapper.map();
+  const filePaths = repoMap.allFiles.map(f => f.path);
+
+  const envVars = await extractEnvVars(filePaths, absDir);
+  return { cached: false, total: envVars.length, envVars };
 }
 
 /**

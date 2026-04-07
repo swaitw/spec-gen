@@ -115,7 +115,23 @@ For the top 2 candidate functions from Step 2, check their structural properties
 </use_mcp_tool>
 ```
 
-Using the call paths, risk scores, and spec constraints gathered so far,
+If the repro involves a request flow (HTTP request, event, message queue), confirm the call chain before forming the hypothesis:
+
+```xml
+<use_mcp_tool>
+  <server_name>spec-gen</server_name>
+  <tool_name>trace_execution_path</tool_name>
+  <arguments>{
+    "directory": "$PROJECT_ROOT",
+    "from": "$ENTRY_POINT",
+    "to": "$CANDIDATE_FUNCTION"
+  }</arguments>
+</use_mcp_tool>
+```
+
+This replaces speculative file browsing — the path is structural fact, not inference. Skip if `$ENTRY_POINT` is unknown or the repro is not request-driven.
+
+Using the call paths, risk scores, spec constraints, and traced path gathered so far,
 **state an explicit hypothesis before reading any code**:
 
 > "Hypothesis: `$FUNCTION` does not reset `$STATE` when `$CONDITION` because

@@ -21,6 +21,7 @@ import {
   SPEC_GEN_ANALYSIS_SUBDIR,
   ARTIFACT_DEPENDENCY_GRAPH,
   ARTIFACT_MAPPING,
+  ARTIFACT_ROUTE_INVENTORY,
 } from '../../../constants.js';
 
 // ============================================================================
@@ -556,5 +557,86 @@ describe('handleGetDecisions', () => {
 
     expect(result.count).toBe(1);
     expect(result.decisions).toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// handleGetRouteInventory
+// ============================================================================
+
+describe('handleGetRouteInventory', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    tmpDir = await createTmpDir();
+  });
+
+  it('returns cached: true + inventory data when route-inventory.json exists and is valid JSON', async () => {
+    const payload = {
+      total: 3,
+      byMethod: { GET: 2, POST: 1 },
+      byFramework: { express: 3 },
+      routes: [
+        { method: 'GET', path: '/users', framework: 'express', file: 'routes/users.ts', handler: 'getUsers' },
+        { method: 'GET', path: '/users/:id', framework: 'express', file: 'routes/users.ts', handler: 'getUser' },
+        { method: 'POST', path: '/users', framework: 'express', file: 'routes/users.ts', handler: 'createUser' },
+      ],
+    };
+    await writeAnalysisFile(tmpDir, ARTIFACT_ROUTE_INVENTORY, payload);
+
+    const { handleGetRouteInventory } = await import('./analysis.js');
+    const result = await handleGetRouteInventory(tmpDir) as Record<string, unknown>;
+
+    expect(result.cached).toBe(true);
+    expect(result.total).toBe(3);
+    expect(result.byMethod).toEqual({ GET: 2, POST: 1 });
+    expect(result.byFramework).toEqual({ express: 3 });
+    expect(Array.isArray(result.routes)).toBe(true);
+  });
+
+  it('falls back to live extraction (cached: false) when artifact file is absent', async () => {
+    // No artifact written — live extraction runs against empty tmpDir
+    const { handleGetRouteInventory } = await import('./analysis.js');
+    const result = await handleGetRouteInventory(tmpDir) as Record<string, unknown>;
+
+    expect(result.cached).toBe(false);
+    // Structure should have the expected inventory fields
+    expect(result).toHaveProperty('total');
+    expect(result).toHaveProperty('byMethod');
+    expect(result).toHaveProperty('byFramework');
+    expect(result).toHaveProperty('routes');
+  });
+
+  it('returns expected total/byMethod/byFramework structure from cached artifact', async () => {
+    const payload = {
+      total: 5,
+      byMethod: { GET: 3, POST: 1, DELETE: 1 },
+      byFramework: { nestjs: 4, fastapi: 1 },
+      routes: [],
+    };
+    await writeAnalysisFile(tmpDir, ARTIFACT_ROUTE_INVENTORY, payload);
+
+    const { handleGetRouteInventory } = await import('./analysis.js');
+    const result = await handleGetRouteInventory(tmpDir) as Record<string, unknown>;
+
+    expect(result.total).toBe(5);
+    expect((result.byMethod as Record<string, number>)['GET']).toBe(3);
+    expect((result.byMethod as Record<string, number>)['DELETE']).toBe(1);
+    expect((result.byFramework as Record<string, number>)['nestjs']).toBe(4);
+  });
+
+  it('handles malformed JSON artifact gracefully — falls through to live extraction', async () => {
+    // Write a corrupted artifact file
+    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, ARTIFACT_ROUTE_INVENTORY), 'not-valid-json!!!', 'utf-8');
+
+    const { handleGetRouteInventory } = await import('./analysis.js');
+    const result = await handleGetRouteInventory(tmpDir) as Record<string, unknown>;
+
+    // Malformed JSON → JSON.parse throws → falls through to live extraction → cached: false
+    expect(result.cached).toBe(false);
+    expect(result).toHaveProperty('total');
   });
 });

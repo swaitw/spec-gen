@@ -42,6 +42,12 @@ import {
 } from '../../core/analyzer/architecture-writer.js';
 import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
 import { generateCodebaseDigest } from '../../core/analyzer/codebase-digest.js';
+import { extractUIComponents } from '../../core/analyzer/ui-component-extractor.js';
+import { extractSchemas } from '../../core/analyzer/schema-extractor.js';
+import { buildRouteInventory } from '../../core/analyzer/http-route-parser.js';
+import { extractMiddleware } from '../../core/analyzer/middleware-extractor.js';
+import { extractEnvVars } from '../../core/analyzer/env-extractor.js';
+import { generateAiConfigs, AI_TOOL_TARGETS, type AiTool, type AiConfigResult } from '../../core/analyzer/ai-config-generator.js';
 
 // ============================================================================
 // TYPES
@@ -51,6 +57,7 @@ interface ExtendedAnalyzeOptions extends AnalyzeOptions {
   force?: boolean;
   embed?: boolean;
   reindexSpecs?: boolean;
+  aiConfigs?: boolean;
 }
 
 interface AnalysisResult {
@@ -134,7 +141,20 @@ export async function runAnalysis(
   }
   logger.blank();
 
-  // Phase 3: Generate Artifacts
+  // Phase 3: Run new enrichment extractors in parallel
+  logger.analysis('Extracting UI components, schemas, routes, and env vars...');
+
+  const allFilePaths = repoMap.allFiles.map(f => f.path);
+
+  const [uiComponents, schemas, routeInventory, middleware, envVars] = await Promise.all([
+    extractUIComponents(allFilePaths, rootPath),
+    extractSchemas(allFilePaths, rootPath),
+    buildRouteInventory(allFilePaths, rootPath),
+    extractMiddleware(allFilePaths, rootPath),
+    extractEnvVars(allFilePaths, rootPath),
+  ]);
+
+  // Phase 4: Generate Artifacts
   logger.analysis('Generating analysis artifacts...');
 
   const artifactGenerator = new AnalysisArtifactGenerator({
@@ -144,7 +164,13 @@ export async function runAnalysis(
     maxValidationFiles: MAX_VALIDATION_FILES,
   });
 
-  const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph);
+  const artifacts = await artifactGenerator.generateAndSave(repoMap, depGraph, {
+    uiComponents,
+    schemas,
+    routeInventory,
+    middleware,
+    envVars,
+  });
 
   // Also save the raw dependency graph
   await writeFile(
@@ -204,6 +230,11 @@ export const analyzeCommand = new Command('analyze')
     'Re-index OpenSpec specs into the vector index without re-running full analysis (requires EMBED_BASE_URL + EMBED_MODEL)',
     false
   )
+  .option(
+    '--ai-configs',
+    'Generate AI tool config files (.cursorrules, .clinerules/spec-gen.md, CLAUDE.md) if they do not already exist',
+    false
+  )
   .addHelpText(
     'after',
     `
@@ -246,6 +277,7 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
       force: options.force ?? false,
       embed: options.embed ?? false,
       reindexSpecs: options.reindexSpecs ?? false,
+      aiConfigs: options.aiConfigs ?? false,
       quiet: false,
       verbose: false,
       noColor: false,
@@ -331,6 +363,38 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
             // If embed is requested, run the embed step (incremental: only re-embeds changed functions)
             if (opts.embed) {
               await runEmbedStep(rootPath, outputPath, specGenConfig, opts.force ?? false, null);
+            }
+
+            // If --ai-configs is requested, generate them even from cached analysis
+            if (opts.aiConfigs) {
+              let selectedTools: AiTool[] | undefined;
+              if (process.stdin.isTTY) {
+                const { checkbox } = await import('@inquirer/prompts');
+                const chosen = await checkbox<AiTool>({
+                  message: 'Generate config files for which AI assistants?',
+                  choices: AI_TOOL_TARGETS.map(t => ({
+                    name: t.label,
+                    value: t.tool,
+                    checked: true,
+                  })),
+                });
+                selectedTools = chosen.length > 0 ? chosen : undefined;
+              }
+              if (selectedTools === undefined || selectedTools.length > 0) {
+                const aiResults = await generateAiConfigs({
+                  rootDir: rootPath,
+                  analysisDir: opts.output.replace(/\/$/, ''),
+                  projectName: repoStructure.projectName ?? 'project',
+                  tools: selectedTools,
+                });
+                logger.blank();
+                console.log('  Agent config files:');
+                for (const { rel, created } of aiResults) {
+                  const tag = created ? '(created)' : '(already exists)';
+                  console.log(`    ├─ ${rel}  ${tag}`);
+                }
+                logger.blank();
+              }
             }
 
             logger.info('Next step', "Run 'spec-gen generate' to create OpenSpec files");
@@ -550,12 +614,56 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
         { rootPath, outputDir: outputPath },
       );
 
+      // Generate AI tool config files — prompt user to select which assistants
+      let aiConfigsCreated: AiConfigResult[] = [];
+      if (opts.aiConfigs) {
+        let selectedTools: AiTool[] | undefined;
+
+        if (process.stdin.isTTY) {
+          const { checkbox } = await import('@inquirer/prompts');
+          const chosen = await checkbox<AiTool>({
+            message: 'Generate config files for which AI assistants?',
+            choices: AI_TOOL_TARGETS.map(t => ({
+              name: t.label,
+              value: t.tool,
+              checked: true,
+            })),
+          });
+          selectedTools = chosen.length > 0 ? chosen : undefined;
+        }
+        // Non-TTY: generate for all tools (CI / pipe usage)
+
+        if (selectedTools === undefined || selectedTools.length > 0) {
+          aiConfigsCreated = await generateAiConfigs({
+            rootDir: rootPath,
+            analysisDir: opts.output.replace(/\/$/, ''),
+            projectName: result.repoMap.metadata.projectName,
+            tools: selectedTools,
+          });
+        }
+      }
+
       // Files generated
       console.log('  Output Files:');
       console.log(`    ├─ ${opts.output}repo-structure.json`);
       console.log(`    ├─ ${opts.output}dependency-graph.json`);
       console.log(`    ├─ ${opts.output}llm-context.json`);
       console.log(`    ├─ ${opts.output}dependencies.mermaid`);
+      if (artifacts.repoStructure.schemas.length > 0) {
+        console.log(`    ├─ ${opts.output}schema-inventory.json  (${artifacts.repoStructure.schemas.length} table(s))`);
+      }
+      if (artifacts.repoStructure.routeInventory.total > 0) {
+        console.log(`    ├─ ${opts.output}route-inventory.json  (${artifacts.repoStructure.routeInventory.total} route(s))`);
+      }
+      if (artifacts.repoStructure.middleware.length > 0) {
+        console.log(`    ├─ ${opts.output}middleware-inventory.json  (${artifacts.repoStructure.middleware.length} middleware entry(ies))`);
+      }
+      if (artifacts.repoStructure.uiComponents.length > 0) {
+        console.log(`    ├─ ${opts.output}ui-inventory.json  (${artifacts.repoStructure.uiComponents.length} UI component(s))`);
+      }
+      if (artifacts.repoStructure.envVars.length > 0) {
+        console.log(`    ├─ ${opts.output}env-inventory.json  (${artifacts.repoStructure.envVars.length} env var(s))`);
+      }
       if (architectureMdWritten) {
         console.log(`    ├─ ${opts.output}SUMMARY.md`);
         console.log('    ├─ ARCHITECTURE.md');
@@ -579,6 +687,17 @@ After analysis, run 'spec-gen generate' to create OpenSpec files.
         console.log('    | Planning where to add a feature                 | suggest_insertion_points          |');
         console.log('    | Checking if code still matches spec             | check_spec_drift                  |');
         console.log('    | Finding spec requirements by meaning            | search_specs                      |');
+      }
+      console.log('');
+      if (aiConfigsCreated.length > 0) {
+        console.log('  Agent config files:');
+        for (const { rel, created } of aiConfigsCreated) {
+          const tag = created ? '(created)' : '(already exists)';
+          console.log(`    ├─ ${rel}  ${tag}`);
+        }
+      } else {
+        console.log('  Agent config files: not generated');
+        console.log('    Tip: Re-run with --ai-configs to generate CLAUDE.md, .cursorrules, AGENTS.md, etc.');
       }
       console.log('');
 

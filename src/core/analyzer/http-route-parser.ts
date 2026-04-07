@@ -28,6 +28,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { extname } from 'node:path';
+import { getSkeletonContent, detectLanguage } from './code-shaper.js';
 
 // ============================================================================
 // TYPES
@@ -61,10 +62,16 @@ export interface RouteDefinition {
   normalizedPath: string;
   /** Name of the handler function */
   handlerName: string;
-  /** fastapi / flask / django / starlette */
+  /** fastapi / flask / django / starlette / express / nestjs / nextjs-app etc. */
   framework: string;
   /** 1-based source line */
   line: number;
+  /** Request body type extracted from handler signature, e.g. "CreateUserDto" or "z.infer<typeof schema>" */
+  requestBodyType?: string;
+  /** Response body type extracted from handler return type annotation, e.g. "User[]" or "void" */
+  responseType?: string;
+  /** How the contract was sourced */
+  contractSource: 'annotation' | 'validator' | 'none';
 }
 
 /** A resolved cross-language edge */
@@ -317,6 +324,7 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
       handlerName,
       framework: 'fastapi',
       line: lineNum,
+      contractSource: 'none' as const,
     });
   }
 
@@ -338,6 +346,7 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
         handlerName,
         framework: 'fastapi',
         line: lineNum,
+        contractSource: 'none' as const,
       });
     }
   }
@@ -363,6 +372,7 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
           handlerName,
           framework: 'flask',
           line: lineNum,
+          contractSource: 'none' as const,
         });
       }
     } else {
@@ -375,6 +385,7 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
         handlerName,
         framework: 'flask',
         line: lineNum,
+        contractSource: 'none' as const,
       });
     }
   }
@@ -403,6 +414,7 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
       handlerName,
       framework: 'django',
       line: lineNum,
+      contractSource: 'none' as const,
     });
   }
 
@@ -568,4 +580,324 @@ function extractNextDefName(lines: string[], decoratorLine: number): string {
     if (defMatch) return defMatch[1];
   }
   return 'unknown';
+}
+
+// ============================================================================
+// CONTRACT / TYPE EXTRACTION HELPERS
+// ============================================================================
+
+/**
+ * Extract contract information from a handler function body or surrounding context.
+ *
+ * Strategies:
+ *   1. TypeScript Request<P, ResBody, ReqBody, Q> generic → requestBodyType = ReqBody
+ *   2. NestJS @Body() dto: Type → requestBodyType = Type
+ *   3. Zod .parse( / .parseAsync( → contractSource = 'validator'
+ *   4. Promise<ResponseType> return annotation
+ */
+function extractContractFromHandler(
+  handlerSource: string
+): { requestBodyType?: string; responseType?: string; contractSource: 'annotation' | 'validator' | 'none' } {
+  let requestBodyType: string | undefined;
+  let responseType: string | undefined;
+  let contractSource: 'annotation' | 'validator' | 'none' = 'none';
+
+  // 1. TypeScript Request<P, ResBody, ReqBody, Q> generic
+  //    handler(req: Request<Params, ResBody, Body, Query>)
+  const reqGenericRe = /:\s*Request\s*<[^,>]+,\s*([^,>]+),\s*([^,>]+)/;
+  const reqGenericMatch = reqGenericRe.exec(handlerSource);
+  if (reqGenericMatch) {
+    const resBodyType = reqGenericMatch[1].trim();
+    const reqBodyType = reqGenericMatch[2].trim();
+    if (reqBodyType && reqBodyType !== 'unknown' && reqBodyType !== 'any') {
+      requestBodyType = reqBodyType;
+      contractSource = 'annotation';
+    }
+    if (resBodyType && resBodyType !== 'unknown' && resBodyType !== 'any') {
+      responseType = resBodyType;
+    }
+  }
+
+  // 2. NestJS @Body() dto: CreateUserDto
+  const bodyParamRe = /@Body\s*\(\s*\)\s+\w+\s*:\s*(\w+)/;
+  const bodyParamMatch = bodyParamRe.exec(handlerSource);
+  if (bodyParamMatch) {
+    requestBodyType = bodyParamMatch[1];
+    contractSource = 'annotation';
+  }
+
+  // 3. Zod validators: schema.parse( / schema.parseAsync( / z.infer<typeof
+  const zodRe = /\b\w+\.parse(?:Async)?\s*\(|z\.infer\s*<\s*typeof\s+(\w+)/;
+  const zodMatch = zodRe.exec(handlerSource);
+  if (zodMatch) {
+    contractSource = 'validator';
+    if (zodMatch[1]) {
+      requestBodyType = `z.infer<typeof ${zodMatch[1]}>`;
+    } else {
+      // Extract schema variable name from .parse( call
+      const parseVarRe = /(\w+)\.parse(?:Async)?\s*\(/;
+      const parseVarMatch = parseVarRe.exec(handlerSource);
+      if (parseVarMatch) {
+        requestBodyType = parseVarMatch[1];
+      }
+    }
+  }
+
+  // 4. Promise<ResponseType> return type annotation
+  const returnTypeRe = /\):\s*Promise\s*<\s*([^>]+)>/;
+  const returnTypeMatch = returnTypeRe.exec(handlerSource);
+  if (returnTypeMatch && !responseType) {
+    const rType = returnTypeMatch[1].trim();
+    if (rType && rType !== 'void' && rType !== 'unknown' && rType !== 'any') {
+      responseType = rType;
+    }
+  }
+
+  return { requestBodyType, responseType, contractSource };
+}
+
+// ============================================================================
+// TS/JS SERVER ROUTE EXTRACTION
+// ============================================================================
+
+// Express / Hono / Fastify / Koa / Elysia style:
+//   app.get('/path', handler)
+//   router.post('/path', ...)
+//   app.use('/prefix', router)     ← prefix accumulation
+const EXPRESS_ROUTE_RE = /(?:^|[\s;(,])(?:app|router|server|api|r)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"`]([^'"`]+)['"`]/gm;
+const EXPRESS_USE_RE = /(?:^|[\s;(,])(?:app|router|server|api|r)\.use\s*\(\s*['"`]([^'"`]+)['"`]/gm;
+
+// NestJS decorator-based:
+//   @Controller('prefix')  →  class methods with @Get / @Post etc.
+const NESTJS_CONTROLLER_RE = /@Controller\s*\(\s*['"`]([^'"`]*)['"`]\s*\)/g;
+const NESTJS_METHOD_RE = /@(Get|Post|Put|Delete|Patch|Head|Options|All)\s*\(\s*(?:['"`]([^'"`]*)['"`])?\s*\)/g;
+const NESTJS_HANDLER_RE = /(?:async\s+)?(\w+)\s*\(/;
+
+// Next.js App Router: export (async) function GET(...) in app/**/route.ts
+const NEXTJS_APP_ROUTER_RE = /^export\s+(?:async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(/gm;
+
+/** Detected framework from a file's content */
+function detectTsFramework(source: string, filePath: string): string {
+  if (/@Controller\s*\(/.test(source) && /@(Get|Post|Put|Delete|Patch)\s*\(/.test(source)) return 'nestjs';
+  if (/app\/.*\/route\.[jt]sx?$/.test(filePath.replace(/\\/g, '/'))) return 'nextjs-app';
+  if (/pages\/api\//.test(filePath.replace(/\\/g, '/'))) return 'nextjs-pages';
+  if (/from\s+['"]hono['"]/.test(source) || /new\s+Hono\s*[(<]/.test(source)) return 'hono';
+  if (/from\s+['"]fastify['"]/.test(source) || /fastify\s*\(/.test(source)) return 'fastify';
+  if (/from\s+['"]express['"]/.test(source) || /require\s*\(\s*['"]express['"]\s*\)/.test(source)) return 'express';
+  if (/from\s+['"]koa['"]/.test(source)) return 'koa';
+  if (/from\s+['"]elysia['"]/.test(source)) return 'elysia';
+  if (new RegExp(EXPRESS_ROUTE_RE.source).test(source)) return 'express';
+  return 'unknown';
+}
+
+/**
+ * Extract HTTP route definitions from a TypeScript/JavaScript server file.
+ * Handles Express-style, NestJS decorators, and Next.js App Router.
+ */
+export async function extractTsRouteDefinitions(filePath: string): Promise<RouteDefinition[]> {
+  let source: string;
+  try {
+    const { readFile } = await import('node:fs/promises');
+    // Use skeleton to strip comments — prevents false positives from comment
+    // examples inside parser/extractor files that contain route pattern strings.
+    // Line numbers in the result are approximate (skeleton line positions).
+    source = getSkeletonContent(await readFile(filePath, 'utf-8'), detectLanguage(filePath));
+  } catch {
+    return [];
+  }
+
+  const framework = detectTsFramework(source, filePath);
+  const routes: RouteDefinition[] = [];
+  const lines = source.split('\n');
+
+  function lineOf(index: number): number {
+    return source.slice(0, index).split('\n').length;
+  }
+
+  // ── Next.js App Router ────────────────────────────────────────────────────
+  if (framework === 'nextjs-app') {
+    // Derive path from file location: app/users/route.ts → /users
+    const rel = filePath.replace(/\\/g, '/');
+    const appIdx = rel.lastIndexOf('/app/');
+    let routePath = '/';
+    if (appIdx >= 0) {
+      routePath = rel.slice(appIdx + 4).replace(/\/route\.[jt]sx?$/, '') || '/';
+      // Remove dynamic segments brackets for display: [id] → :id
+      routePath = routePath.replace(/\[([^\]]+)\]/g, ':$1');
+    }
+
+    const re = new RegExp(NEXTJS_APP_ROUTER_RE.source, NEXTJS_APP_ROUTER_RE.flags);
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(source)) !== null) {
+      // Extract handler body for contract detection (scan next 500 chars)
+      const handlerBody = source.slice(m.index, m.index + 500);
+      const contract = extractContractFromHandler(handlerBody);
+      routes.push({
+        file: filePath,
+        method: m[1].toUpperCase(),
+        path: routePath,
+        normalizedPath: normalizeUrl(routePath),
+        handlerName: m[1],
+        framework: 'nextjs-app',
+        line: lineOf(m.index),
+        ...contract,
+      });
+    }
+    return routes;
+  }
+
+  // ── NestJS ────────────────────────────────────────────────────────────────
+  if (framework === 'nestjs') {
+    // Collect controller prefixes
+    const ctrlRe = new RegExp(NESTJS_CONTROLLER_RE.source, NESTJS_CONTROLLER_RE.flags);
+    let ctrlPrefix = '';
+    const ctrlMatch = ctrlRe.exec(source);
+    if (ctrlMatch) {
+      ctrlPrefix = ctrlMatch[1] ? `/${ctrlMatch[1].replace(/^\//, '')}` : '';
+    }
+
+    const methodRe = new RegExp(NESTJS_METHOD_RE.source, NESTJS_METHOD_RE.flags);
+    let m: RegExpExecArray | null;
+    while ((m = methodRe.exec(source)) !== null) {
+      const httpMethod = m[1].toUpperCase();
+      const subPath = m[2] ? `/${m[2].replace(/^\//, '')}` : '';
+      const fullPath = `${ctrlPrefix}${subPath}` || '/';
+
+      // Find handler function name on subsequent lines
+      const afterDecorator = source.slice(m.index + m[0].length);
+      const handlerMatch = NESTJS_HANDLER_RE.exec(afterDecorator.slice(0, 200));
+      const handlerName = handlerMatch?.[1] ?? 'unknown';
+
+      // Extract contract from decorator + handler context (scan next 400 chars)
+      const handlerContext = source.slice(m.index, m.index + 400);
+      const contract = extractContractFromHandler(handlerContext);
+
+      routes.push({
+        file: filePath,
+        method: httpMethod,
+        path: fullPath,
+        normalizedPath: normalizeUrl(fullPath),
+        handlerName,
+        framework: 'nestjs',
+        line: lineOf(m.index),
+        ...contract,
+      });
+    }
+    return routes;
+  }
+
+  // ── Express / Hono / Fastify / Koa / Elysia ───────────────────────────────
+  // Collect prefix map from .use() calls (best-effort)
+  const prefixes: string[] = [];
+  const useRe = new RegExp(EXPRESS_USE_RE.source, EXPRESS_USE_RE.flags);
+  let um: RegExpExecArray | null;
+  while ((um = useRe.exec(source)) !== null) {
+    prefixes.push(um[1]);
+  }
+
+  const routeRe = new RegExp(EXPRESS_ROUTE_RE.source, EXPRESS_ROUTE_RE.flags);
+  let m: RegExpExecArray | null;
+  while ((m = routeRe.exec(source)) !== null) {
+    const method = m[1].toUpperCase();
+    let path = m[2];
+
+    // Apply a prefix if the route is relative (no leading slash)
+    if (!path.startsWith('/') && prefixes.length > 0) {
+      path = `${prefixes[0]}/${path}`;
+    }
+
+    // Find the handler name from the same line
+    const lineText = lines[lineOf(m.index) - 1] ?? '';
+    const handlerMatch = lineText.match(/,\s*(?:async\s+)?(?:function\s+)?(\w+)\s*[,)]/);
+    const handlerName = handlerMatch?.[1] ?? 'handler';
+
+    // Extract contract from route context (scan next 600 chars)
+    const routeContext = source.slice(m.index, m.index + 600);
+    const contract = extractContractFromHandler(routeContext);
+
+    routes.push({
+      file: filePath,
+      method,
+      path,
+      normalizedPath: normalizeUrl(path),
+      handlerName,
+      framework,
+      line: lineOf(m.index),
+      ...contract,
+    });
+  }
+
+  return routes;
+}
+
+// ============================================================================
+// ROUTE INVENTORY
+// ============================================================================
+
+export interface RouteInventory {
+  total: number;
+  byMethod: Record<string, number>;
+  byFramework: Record<string, number>;
+  routes: Array<{
+    method: string;
+    path: string;
+    framework: string;
+    file: string;
+    handler: string;
+    requestBodyType?: string;
+    responseType?: string;
+    contractSource: 'annotation' | 'validator' | 'none';
+  }>;
+}
+
+/**
+ * Build a complete route inventory from all source files.
+ * Combines Python routes (extractRouteDefinitions) and TS/JS routes
+ * (extractTsRouteDefinitions) into a single summary.
+ *
+ * @param filePaths - Absolute paths to all source files in the project
+ * @param rootDir   - Project root for computing relative paths
+ */
+export async function buildRouteInventory(
+  filePaths: string[],
+  rootDir: string
+): Promise<RouteInventory> {
+  const { relative } = await import('node:path');
+
+  const allRoutes: RouteDefinition[] = [];
+
+  await Promise.all(
+    filePaths.map(async fp => {
+      const ext = extname(fp).toLowerCase();
+      if (['.py', '.pyw'].includes(ext)) {
+        allRoutes.push(...await extractRouteDefinitions(fp));
+      } else if (['.ts', '.tsx', '.js', '.jsx', '.mjs'].includes(ext)) {
+        allRoutes.push(...await extractTsRouteDefinitions(fp));
+      }
+    })
+  );
+
+  const byMethod: Record<string, number> = {};
+  const byFramework: Record<string, number> = {};
+
+  for (const r of allRoutes) {
+    byMethod[r.method] = (byMethod[r.method] ?? 0) + 1;
+    byFramework[r.framework] = (byFramework[r.framework] ?? 0) + 1;
+  }
+
+  return {
+    total: allRoutes.length,
+    byMethod,
+    byFramework,
+    routes: allRoutes.map(r => ({
+      method: r.method,
+      path: r.path,
+      framework: r.framework,
+      file: relative(rootDir, r.file),
+      handler: r.handlerName,
+      requestBodyType: r.requestBodyType,
+      responseType: r.responseType,
+      contractSource: r.contractSource,
+    })),
+  };
 }

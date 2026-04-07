@@ -79,6 +79,11 @@ describe('generate command', () => {
         entryPoints: [],
         dataFlow: { sources: [], sinks: [], transformers: [] },
         keyFiles: { schemas: [], config: [], auth: [], database: [], routes: [], services: [] },
+        uiComponents: [],
+        schemas: [],
+        routeInventory: { total: 0, byMethod: {}, byFramework: {}, routes: [] },
+        middleware: [],
+        envVars: [],
         statistics: {
           totalFiles: 100,
           analyzedFiles: 50,

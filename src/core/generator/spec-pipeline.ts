@@ -77,6 +77,8 @@ export class SpecGenerationPipeline implements PipelineContext {
   private semanticSearch?: SemanticSearchFn;
   /** Set at the start of run() and used by stage methods for graph-based prompts */
   private currentLLMContext?: LLMContext;
+  /** Set at the start of run() and used by schemasFor() / routesFor() */
+  private currentRepoStructure?: RepoStructure;
 
   constructor(llm: LLMService, options: PipelineOptions) {
     this.llm = llm;
@@ -104,6 +106,7 @@ export class SpecGenerationPipeline implements PipelineContext {
     refactorReport?: RefactorReport
   ): Promise<PipelineResult> {
     this.currentLLMContext = llmContext;
+    this.currentRepoStructure = repoStructure;
     const startTime = Date.now();
     let totalTokens = 0;
     const completedStages: string[] = [];
@@ -411,10 +414,6 @@ export class SpecGenerationPipeline implements PipelineContext {
     return null;
   }
 
-  /**
-   * Return a formatted list of function signatures for a given file, or null if unavailable.
-   * Used by Stage 3 to ground extracted service operations in real function names.
-   */
   signaturesFor(filePath: string): string | null {
     const sigs = this.currentLLMContext?.signatures;
     if (!sigs) return null;
@@ -423,6 +422,29 @@ export class SpecGenerationPipeline implements PipelineContext {
     return fileMap.entries
       .map(e => `- ${e.signature}${e.docstring ? ` — ${e.docstring}` : ''}`)
       .join('\n');
+  }
+
+  schemasFor(filePath: string): string | null {
+    const schemas = this.currentRepoStructure?.schemas;
+    if (!schemas || schemas.length === 0) return null;
+    const fileSchemas = schemas.filter(s => s.file === filePath);
+    if (fileSchemas.length === 0) return null;
+    return fileSchemas.map(s => {
+      const fields = s.fields
+        .map(f => `${f.name} (${f.type}${f.nullable ? '' : ', required'})`)
+        .join(', ');
+      return `- ${s.name} [${s.orm}]: ${fields}`;
+    }).join('\n');
+  }
+
+  routesFor(filePath: string): string | null {
+    const routes = this.currentRepoStructure?.routeInventory?.routes;
+    if (!routes || routes.length === 0) return null;
+    const fileRoutes = routes.filter(r => r.file === filePath);
+    if (fileRoutes.length === 0) return null;
+    return fileRoutes.map(r =>
+      `- ${r.method} ${r.path}${r.handler ? ` → ${r.handler}` : ''}`
+    ).join('\n');
   }
 
   /**
