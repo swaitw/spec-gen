@@ -5,8 +5,10 @@
  * Unlike `analyze --ai-configs` (which generates project-specific context files),
  * `setup` copies static workflow assets that are the same for every project:
  *
- *   - Mistral Vibe skills  -> .vibe/skills/spec-gen-{name}/SKILL.md  (8 skills)
+ *   - Mistral Vibe skills  -> .vibe/skills/spec-gen-{name}/SKILL.md      (8 skills)
  *   - Cline workflows      -> .clinerules/workflows/spec-gen-{name}.md
+ *   - Claude Code skills   -> .claude/skills/spec-gen-{name}/SKILL.md    (8 skills)
+ *   - OpenCode skills      -> .opencode/skills/spec-gen-{name}/SKILL.md  (8 skills)
  *   - GSD commands         -> .claude/commands/gsd/spec-gen-{name}.md
  *
  * Files are never overwritten — existing files are skipped silently.
@@ -24,7 +26,7 @@ import { logger } from '../../utils/logger.js';
 // TYPES
 // ============================================================================
 
-type ToolName = 'vibe' | 'cline' | 'gsd' | 'bmad';
+type ToolName = 'vibe' | 'cline' | 'gsd' | 'bmad' | 'claude' | 'opencode';
 
 interface SkillEntry {
   /** Absolute source path inside the package's examples/ directory */
@@ -78,6 +80,8 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
     'spec-gen-write-tests',
   ];
 
+  const OPENCODE_SKILLS = VIBE_SKILLS; // same skill names, different source + dest
+
   const CLINE_WORKFLOWS = [
     'spec-gen-analyze-codebase.md',
     'spec-gen-check-spec-drift.md',
@@ -119,6 +123,14 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
         dest: join(projectRoot, '_bmad', 'spec-gen', 'tasks', file),
       })),
     ],
+    claude: OPENCODE_SKILLS.map(name => ({
+      src: join(ex, 'opencode-skills', name, 'SKILL.md'),
+      dest: join(projectRoot, '.claude', 'skills', name, 'SKILL.md'),
+    })),
+    opencode: OPENCODE_SKILLS.map(name => ({
+      src: join(ex, 'opencode-skills', name, 'SKILL.md'),
+      dest: join(projectRoot, '.opencode', 'skills', name, 'SKILL.md'),
+    })),
   };
 }
 
@@ -161,7 +173,7 @@ export const setupCommand = new Command('setup')
   )
   .option(
     '--tools <list>',
-    'Comma-separated list of tools to install: vibe, cline, gsd (default: all)',
+    'Comma-separated list of tools to install: vibe, cline, claude, opencode, gsd, bmad (default: all)',
   )
   .option(
     '--dir <path>',
@@ -170,13 +182,13 @@ export const setupCommand = new Command('setup')
   )
   .action(async (options: { tools?: string; dir: string }) => {
     const projectRoot = options.dir;
-    const allTools: ToolName[] = ['vibe', 'cline', 'gsd', 'bmad'];
+    const allTools: ToolName[] = ['vibe', 'cline', 'gsd', 'bmad', 'claude', 'opencode'];
 
     let tools: ToolName[];
     if (options.tools) {
       tools = (options.tools.split(',').map(t => t.trim()) as ToolName[]).filter(t => allTools.includes(t));
       if (tools.length === 0) {
-        logger.error('setup: no valid tools specified. Valid values: vibe, cline, gsd, bmad');
+        logger.error('setup: no valid tools specified. Valid values: vibe, cline, gsd, bmad, claude, opencode');
         process.exit(1);
       }
     } else if (process.stdout.isTTY) {
@@ -185,6 +197,8 @@ export const setupCommand = new Command('setup')
         choices: [
           { name: 'Mistral Vibe  (.vibe/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'vibe' as ToolName, checked: true },
           { name: 'Cline / Roo   (.clinerules/workflows/spec-gen-{name}.md — 7 workflows)', value: 'cline' as ToolName, checked: true },
+          { name: 'Claude Code   (.claude/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'claude' as ToolName, checked: true },
+          { name: 'OpenCode      (.opencode/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'opencode' as ToolName, checked: false },
           { name: 'GSD           (.claude/commands/gsd/spec-gen-{name}.md — 2 commands)', value: 'gsd' as ToolName, checked: true },
           { name: 'BMAD          (_bmad/spec-gen/{agents,tasks}/ — 2 agents, 4 tasks)', value: 'bmad' as ToolName, checked: false },
         ],
@@ -195,8 +209,8 @@ export const setupCommand = new Command('setup')
       }
       tools = selected;
     } else {
-      // Non-TTY: install all except BMAD (more invasive, requires existing BMAD setup)
-      tools = ['vibe', 'cline', 'gsd'];
+      // Non-TTY: install all except BMAD (more invasive) and OpenCode (less common)
+      tools = ['vibe', 'cline', 'claude', 'gsd'];
     }
 
     logger.success(`Installing workflow skills into ${projectRoot}`);
@@ -216,10 +230,12 @@ export const setupCommand = new Command('setup')
     }
 
     const LABELS: Record<ToolName, string> = {
-      vibe:  'Mistral Vibe',
-      cline: 'Cline / Roo Code',
-      gsd:   'get-shit-done (GSD)',
-      bmad:  'BMAD',
+      vibe:     'Mistral Vibe',
+      cline:    'Cline / Roo Code',
+      claude:   'Claude Code',
+      opencode: 'OpenCode',
+      gsd:      'get-shit-done (GSD)',
+      bmad:     'BMAD',
     };
 
     for (const tool of tools) {
