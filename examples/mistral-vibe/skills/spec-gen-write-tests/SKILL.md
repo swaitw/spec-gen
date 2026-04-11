@@ -158,16 +158,24 @@ Write (or append to) `$EXISTING_TEST_FILE` (or create `<name>.test.ts` / `test_<
 2. **One test = one scenario** — each `it()` / `def test_` / `TEST()` maps to one GIVEN/WHEN/THEN
    clause. Use the spec scenario name (or a descriptive contract statement) as the test description.
 
-3. **Mock only system boundaries** — mock filesystem, network, LLM API, DB connections, and
+3. **Annotation tag (mandatory)** — place a coverage tag on the line immediately above each
+   `describe` / class / suite block so `spec-gen test --coverage` can track it:
+   - TypeScript/JS: `// spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO","specFile":"openspec/specs/$DOMAIN/spec.md"}`
+   - Python: `# spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO"}`
+   - C++/Go: `// spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO"}`
+   
+   If no spec scenario exists (contract inferred), omit the tag.
+
+4. **Mock only system boundaries** — mock filesystem, network, LLM API, DB connections, and
    external processes. Do not mock the function under test, its pure helpers, or in-memory logic.
 
-4. **One suite per function** — `describe` / class / suite named after the function.
+5. **One suite per function** — `describe` / class / suite named after the function.
    Use nested blocks for distinct concerns (happy path, error path, edge cases).
 
-5. **At least one edge case** — empty input, null/None/nullptr, maximum value, or an error path
+6. **At least one edge case** — empty input, null/None/nullptr, maximum value, or an error path
    must be included for every function tested.
 
-6. **Small model constraint** — if the test file exceeds 200 lines, split into multiple files
+7. **Small model constraint** — if the test file exceeds 200 lines, split into multiple files
    grouped by concern. Each file must be independently runnable.
 
 ### Structure reference (adapt to the detected framework)
@@ -179,6 +187,7 @@ import { $TARGET_FUNCTION } from '../$TARGET_FILE';
 
 vi.mock('../$DEPENDENCY', () => ({ ... }));
 
+// spec-gen: {"domain":"$DOMAIN","requirement":"$REQUIREMENT","scenario":"$SCENARIO","specFile":"openspec/specs/$DOMAIN/spec.md"}
 describe('$TARGET_FUNCTION', () => {
   beforeEach(() => { vi.resetAllMocks(); });
 
@@ -200,6 +209,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from $MODULE import $TARGET_FUNCTION
 
+# spec-gen: {"domain":"$DOMAIN","requirement":"$REQUIREMENT","scenario":"$SCENARIO"}
 class Test$TargetFunction:
     def test_$scenario_name_when_$condition(self):
         # GIVEN / WHEN / THEN

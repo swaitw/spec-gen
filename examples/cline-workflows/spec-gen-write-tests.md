@@ -122,6 +122,11 @@ Write (or append to) `$EXISTING_TEST_FILE`. Create it next to the source file if
 
 - **No placeholder assertions** — every assertion must test a real return value or side effect
 - **One test = one scenario** — `it()` / `def test_` description = spec scenario name or contract statement
+- **Annotation tag** — place immediately above each `describe` / class / suite block:
+  - TS/JS: `// spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO","specFile":"openspec/specs/$DOMAIN/spec.md"}`
+  - Python: `# spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO"}`
+  - C++/Go: `// spec-gen: {"domain":"$DOMAIN","requirement":"$REQ","scenario":"$SCENARIO"}`
+  - Omit if no spec scenario exists (contract inferred from implementation)
 - **Mock only system boundaries** — filesystem, network, LLM API, DB, external process. Not pure helpers
 - **One suite per function** — `describe` / class / suite named after the function
 - **At least one edge case** per function — empty input, null, max value, or error path
