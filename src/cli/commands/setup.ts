@@ -5,7 +5,7 @@
  * Unlike `analyze --ai-configs` (which generates project-specific context files),
  * `setup` copies static workflow assets that are the same for every project:
  *
- *   - Mistral Vibe skills  -> .vibe/skills/spec-gen-{name}/SKILL.md  (7 skills)
+ *   - Mistral Vibe skills  -> .vibe/skills/spec-gen-{name}/SKILL.md  (8 skills)
  *   - Cline workflows      -> .clinerules/workflows/spec-gen-{name}.md
  *   - GSD commands         -> .claude/commands/gsd/spec-gen-{name}.md
  *
@@ -75,6 +75,7 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
     'spec-gen-generate',
     'spec-gen-implement-story',
     'spec-gen-plan-refactor',
+    'spec-gen-write-tests',
   ];
 
   const CLINE_WORKFLOWS = [
@@ -84,6 +85,7 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
     'spec-gen-implement-feature.md',
     'spec-gen-plan-refactor.md',
     'spec-gen-refactor-codebase.md',
+    'spec-gen-write-tests.md',
   ];
 
   const GSD_COMMANDS = [
@@ -181,8 +183,8 @@ export const setupCommand = new Command('setup')
       const selected = await checkbox({
         message: 'Which agent tools do you want to install skills for?',
         choices: [
-          { name: 'Mistral Vibe  (.vibe/skills/spec-gen-{name}/SKILL.md — 7 skills)', value: 'vibe' as ToolName, checked: true },
-          { name: 'Cline / Roo   (.clinerules/workflows/spec-gen-{name}.md — 6 workflows)', value: 'cline' as ToolName, checked: true },
+          { name: 'Mistral Vibe  (.vibe/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'vibe' as ToolName, checked: true },
+          { name: 'Cline / Roo   (.clinerules/workflows/spec-gen-{name}.md — 7 workflows)', value: 'cline' as ToolName, checked: true },
           { name: 'GSD           (.claude/commands/gsd/spec-gen-{name}.md — 2 commands)', value: 'gsd' as ToolName, checked: true },
           { name: 'BMAD          (_bmad/spec-gen/{agents,tasks}/ — 2 agents, 4 tasks)', value: 'bmad' as ToolName, checked: false },
         ],
