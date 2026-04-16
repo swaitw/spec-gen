@@ -562,6 +562,23 @@ Or in `config.json`:
 }
 ```
 
+**Proxies that don't support `response_format`** (vLLM, custom gateways):
+
+Some endpoints reject requests that include `response_format` with an error like
+`{"detail":"There was an error parsing the body"}`. Set `disableResponseFormat: true`
+to omit that field — the model still produces JSON via the system prompt:
+
+```json
+{
+  "generation": {
+    "provider": "openai-compat",
+    "openaiCompatBaseUrl": "https://your-gateway.corp.net/v1",
+    "disableResponseFormat": true,
+    "domains": "auto"
+  }
+}
+```
+
 Works with: Ollama, LM Studio, Mistral AI, Groq, Together AI, LiteLLM, vLLM,
 text-generation-inference, LocalAI, Azure OpenAI, and any `/v1/chat/completions` server.
 
