@@ -93,6 +93,7 @@ export class SpecGenerationPipeline implements PipelineContext {
       rootPath: options.rootPath ?? '',
       saveIntermediate: options.saveIntermediate ?? true,
       generateADRs: options.generateADRs ?? false,
+      chunkMaxChars: options.chunkMaxChars ?? STAGE_CHUNK_MAX_CHARS,
     };
   }
 
@@ -403,7 +404,7 @@ export class SpecGenerationPipeline implements PipelineContext {
     // ── Path 2: skeleton fallback for large files without god functions ─────
     // Avoids splitting files into multiple chunks (and the resulting [PARTIAL SPEC] marker)
     // when the skeleton alone is a complete, noise-free representation.
-    if (content && content.length > STAGE_CHUNK_MAX_CHARS) {
+    if (content && content.length > this.options.chunkMaxChars) {
       const language = detectLanguage(filePath);
       const skeleton = getSkeletonContent(content, language);
       if (isSkeletonWorthIncluding(content, skeleton) && skeleton.length <= SKELETON_STANDALONE_MAX_CHARS) {

@@ -220,6 +220,7 @@ export async function specGenGenerate(options: GenerateApiOptions = {}): Promise
     saveIntermediate: true,
     generateADRs: adr || adrOnly,
     force: options.force,
+    chunkMaxChars: specGenConfig.generation?.chunkMaxChars,
   });
 
   let pipelineResult;

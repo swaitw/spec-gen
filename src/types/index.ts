@@ -46,6 +46,8 @@ export interface GenerationConfig {
   disableResponseFormat?: boolean;
   /** LLM request timeout in milliseconds. Default: 120000 (2 minutes) */
   timeout?: number;
+  /** Max characters per file chunk sent to the LLM. Default: 8000. Increase for large-context models. */
+  chunkMaxChars?: number;
   domains: string | string[];
 }
 

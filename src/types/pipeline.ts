@@ -186,6 +186,8 @@ export interface PipelineOptions {
    *  schema/service/API file selection in stages 2–4. Falls back to heuristics if absent
    *  or if the search returns no results for a given domain. */
   semanticSearch?: SemanticSearchFn;
+  /** Max characters per file chunk sent to the LLM. Default: 8000. Increase for large-context models. */
+  chunkMaxChars?: number;
 }
 
 // ============================================================================
@@ -194,7 +196,7 @@ export interface PipelineOptions {
 
 export interface PipelineContext {
   llm: LLMService;
-  options: { saveIntermediate: boolean };
+  options: { saveIntermediate: boolean; chunkMaxChars: number };
   saveResult(name: string, data: unknown): Promise<void>;
   chunkContent(content: string, maxChars: number): string[];
   graphPromptFor(filePath: string, content?: string): string | null;

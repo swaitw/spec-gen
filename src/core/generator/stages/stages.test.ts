@@ -28,7 +28,7 @@ function makePipeline(overrides?: Partial<PipelineContext>): PipelineContext {
       completeJSON: vi.fn().mockResolvedValue([]),
       getTokenUsage: vi.fn().mockReturnValue({ totalTokens: 42 }),
     } as unknown as PipelineContext['llm'],
-    options: { saveIntermediate: false },
+    options: { saveIntermediate: false, chunkMaxChars: 8000 },
     saveResult: vi.fn().mockResolvedValue(undefined),
     chunkContent: vi.fn().mockImplementation((content: string) => [content]),
     graphPromptFor: vi.fn().mockReturnValue(null),
