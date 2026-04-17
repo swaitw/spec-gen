@@ -183,3 +183,7 @@ docker-compose.yml
 ARCHITECTURE.md
 openspec/
 .opencode/
+.cursorrules
+.clinerules/spec-gen.md
+.windsurf/rules.md
+.github/copilot-instructions.md
