@@ -4,13 +4,9 @@ Extract living specifications from any codebase. Enforce them as code evolves. T
 
 ## The Problem
 
-Most software has no specification. The code is the spec — scattered across thousands of files, tribal knowledge, and documentation that was accurate six months ago. Tools like `openspec init` create empty scaffolding, but someone still has to fill it in. By the time specs are written manually, the code has already moved on.
+Most software has no specification. The code is the spec, scattered across thousands of files, tribal knowledge, and stale documentation. Tools like `openspec init` create empty scaffolding, but someone still has to write everything. By the time specs are written manually, the code has already changed. And by the time an AI agent has written the code, the architectural decisions behind it have been forgotten entirely.
 
-The same problem hits AI agents hard. Every new session starts from zero: the agent reads files, runs grep, tries to infer architecture from directory names, and burns thousands of tokens just answering "what does this code do and where should I touch it?" — before writing a single line. Token budgets are real costs, and discovery is pure waste.
-
-spec-gen solves both. It uses static analysis to understand your codebase structurally — call graph, dependency graph, domain clusters, critical hubs — then an LLM to extract what that code actually *does*, producing [OpenSpec](https://github.com/Fission-AI/OpenSpec)-compatible specifications grounded in reality, not aspiration. The result is absorbed by agents passively at session start, so they arrive with full architectural and business context already in place. Active MCP tools handle anything deeper: graph traversal, semantic search, insertion-point discovery, spec-drift checks.
-
-For human workflows: specs stay in sync via continuous drift detection, and `spec-gen test` tracks which spec scenarios have corresponding tests — with a coverage gate you can enforce in CI. AI agent skills (`spec-gen-write-tests`) write the actual tests.
+spec-gen closes this loop. It reverse-engineers structured specifications from existing codebases, continuously detects when code and specs fall out of sync, captures architectural decisions as agents work (and gates commits until they are reviewed), and exposes the entire analysis as an MCP server so agents can navigate your codebase with semantic search, call-graph expansion, and spec-linked context.
 
 ## Capabilities at a Glance
 
