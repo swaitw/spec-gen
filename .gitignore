@@ -182,3 +182,4 @@ docker/
 docker-compose.yml
 ARCHITECTURE.md
 openspec/
+.opencode/
