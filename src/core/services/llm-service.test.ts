@@ -38,6 +38,17 @@ function mockResponse(body: object, status = 200, headers: Record<string, string
   });
 }
 
+function mockStreamResponse(chunks: object[], status = 200): Response {
+  const lines = [
+    ...chunks.map(c => `data: ${JSON.stringify(c)}\n\n`),
+    'data: [DONE]\n\n',
+  ].join('');
+  return new Response(lines, {
+    status,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+}
+
 function mockErrorResponse(body: string, status: number, headers: Record<string, string> = {}): Response {
   return new Response(body, { status, headers });
 }
@@ -917,7 +928,10 @@ describe('OpenAICompatibleProvider', () => {
   };
 
   it('returns content on success', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mockResponse(SUCCESS_BODY)));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mockStreamResponse([
+      { choices: [{ delta: { content: 'compat response' }, finish_reason: null }], model: 'mistral-large-latest' },
+      { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }, model: 'mistral-large-latest' },
+    ])));
     const provider = new OpenAICompatibleProvider('key', 'https://api.mistral.ai/v1');
     const result = await provider.generateCompletion({ systemPrompt: '', userPrompt: 'hi' });
     expect(result.content).toBe('compat response');
@@ -932,6 +946,25 @@ describe('OpenAICompatibleProvider', () => {
     await provider.generateCompletion({ systemPrompt: '', userPrompt: 'hi', responseFormat: 'json', jsonSchema: schema });
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.response_format.type).toBe('json_schema');
+  });
+
+  it('omits response_format when disableResponseFormat=true', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse(SUCCESS_BODY));
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new OpenAICompatibleProvider('key', 'https://api.mistral.ai/v1', 'mistral-small-4', true);
+    const schema = { type: 'array' };
+    await provider.generateCompletion({ systemPrompt: '', userPrompt: 'hi', responseFormat: 'json', jsonSchema: schema });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.response_format).toBeUndefined();
+  });
+
+  it('includes response_format when disableResponseFormat=false (default)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse(SUCCESS_BODY));
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new OpenAICompatibleProvider('key', 'https://api.mistral.ai/v1', 'mistral-small-4', false);
+    await provider.generateCompletion({ systemPrompt: '', userPrompt: 'hi', responseFormat: 'json' });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.response_format).toBeDefined();
   });
 
   it('throws retryable error on 500', async () => {

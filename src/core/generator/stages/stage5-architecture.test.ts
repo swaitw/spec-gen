@@ -197,7 +197,7 @@ function createMockPipelineContext() {
   const saveResult = vi.fn().mockResolvedValue(undefined);
   const pipeline: PipelineContext = {
     llm,
-    options: { saveIntermediate: false },
+    options: { saveIntermediate: false, chunkMaxChars: 8000 },
     saveResult,
     chunkContent: vi.fn(),
     graphPromptFor: vi.fn().mockReturnValue(null),
