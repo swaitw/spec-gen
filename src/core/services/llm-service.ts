@@ -858,6 +858,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
       ],
       max_tokens: request.maxTokens ?? this.maxOutputTokens,
       temperature: request.temperature ?? 0.3,
+      stream: true,
+      stream_options: { include_usage: true },
       ...(request.stopSequences && { stop: request.stopSequences }),
     };
 
@@ -896,22 +898,49 @@ export class OpenAICompatibleProvider implements LLMProvider {
       throw err;
     }
 
-    const data = await response.json() as {
-      choices: Array<{ message: { content: string }; finish_reason: string }>;
-      usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-      model: string;
-    };
+    let content = '';
+    let usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    let finishReason: 'stop' | 'length' | 'error' = 'stop';
+    let model = this.model;
 
-    return {
-      content: data.choices[0]?.message?.content ?? '',
-      usage: {
-        inputTokens: data.usage.prompt_tokens,
-        outputTokens: data.usage.completion_tokens,
-        totalTokens: data.usage.total_tokens,
-      },
-      model: data.model ?? this.model,
-      finishReason: data.choices[0]?.finish_reason === 'stop' ? 'stop' : data.choices[0]?.finish_reason === 'length' ? 'length' : 'error',
-    };
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    outer: while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break outer;
+        try {
+          const chunk = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>;
+            usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+            model?: string;
+          };
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) content += delta;
+          const fr = chunk.choices?.[0]?.finish_reason;
+          if (fr) finishReason = fr === 'length' ? 'length' : 'stop';
+          if (chunk.model) model = chunk.model;
+          if (chunk.usage) {
+            usage = {
+              inputTokens: chunk.usage.prompt_tokens,
+              outputTokens: chunk.usage.completion_tokens,
+              totalTokens: chunk.usage.total_tokens,
+            };
+          }
+        } catch { /* ignore malformed SSE chunks */ }
+      }
+    }
+
+    return { content, usage, model, finishReason };
   }
 }
 
