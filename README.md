@@ -153,7 +153,15 @@ Turns every spec scenario into an executable test skeleton — or a test with re
 - `--min-coverage <n>` exits non-zero when coverage drops below threshold — CI gate for spec adherence
 - Business-logic controls: annotate scenarios with `<!-- spec-gen-test: priority=high tags=smoke -->` directly in the spec; annotations are auto-generated during `spec-gen generate`
 
-**5. Drift Detection** (no API key needed)
+**5. Decisions** (API key required for consolidation)
+
+Tracks architectural decisions across the full development lifecycle:
+- Agents call `record_decision` during development to capture design choices before writing code
+- At commit time, a pre-commit hook consolidates drafts, cross-checks them against the git diff, and blocks until decisions are reviewed
+- Approved decisions are synced to spec.md files (as requirements) and to ADR files in `openspec/decisions/`
+- A diff-based fallback extractor mines decisions from git changes when the agent produced no drafts
+
+**6. Drift Detection** (no API key needed)
 
 Compares git changes against spec file mappings to find divergence:
 - **Gap**: Code changed but its spec was not updated
@@ -458,6 +466,15 @@ spec-gen drift --uninstall-hook   # Remove
 
 The hook runs in static mode (fast, no API key needed) and blocks commits when drift is detected at warning level or above.
 
+A second hook — installed separately — gates commits until all recorded architectural decisions have been reviewed:
+
+```bash
+spec-gen decisions --install-hook     # Install decisions pre-commit hook
+spec-gen decisions --uninstall-hook   # Remove
+```
+
+The decisions hook consolidates agent-recorded drafts, cross-checks them against the current git diff, and blocks the commit if unreviewed decisions remain. Pending decisions are stored in `.spec-gen/decisions/pending.json` (auto-added to `.gitignore` on install).
+
 ### GitHub Actions / CI Pipelines
 
 ```yaml
@@ -685,6 +702,8 @@ Priority: CLI flags > environment variables > config file > provider defaults.
 | `spec-gen test` | Generate spec-driven tests (Vitest / Playwright / pytest / GTest / Catch2) | No |
 | `spec-gen test --coverage` | Report which spec scenarios have corresponding tests | No |
 | `spec-gen digest` | Plain-English summary of all specs for human review | No |
+| `spec-gen decisions` | Manage architectural decisions: list, approve, reject, sync to specs and ADRs | No |
+| `spec-gen decisions --install-hook` | Install the pre-commit hook that gates commits until decisions are reviewed | No |
 | `spec-gen run` | Full pipeline: init, analyze, generate | Yes |
 | `spec-gen view` | Launch interactive graph & spec viewer in the browser | No |
 | `spec-gen setup` | Install workflow skills into the project (Vibe, Cline, GSD, BMAD) | No |
@@ -1151,6 +1170,16 @@ All tools run on **pure static analysis** -- no LLM quota consumed.
 | `search_specs` | Semantic search over OpenSpec specifications to find requirements, design notes, and architecture decisions by meaning. Returns linked source files for graph highlighting. Use this when asked "which spec covers X?" or "where should we implement Z?". Requires a spec index built with `spec-gen analyze` or `--reindex-specs`. | Yes (generate) |
 | `list_spec_domains` | List all OpenSpec domains available in this project. Use this to discover what domains exist before doing a targeted `search_specs` call. | Yes (generate) |
 | `audit_spec_coverage` | Parity audit: uncovered functions (in call graph, no spec), hub gaps (high fan-in + no spec), orphan requirements (spec with no implementation found), and stale domains (source changed after spec). Run before starting a feature to understand coverage health. No LLM required. | Yes (analyze) |
+
+**Decisions**
+
+| Tool | Description | Requires prior analysis |
+|------|-------------|:---:|
+| `record_decision` | Record an architectural decision before writing code. Drafts are consolidated and cross-checked against the git diff at commit time via the decisions pre-commit hook. | No |
+| `list_decisions` | List decisions in the store, optionally filtered by status (`draft`, `consolidated`, `verified`, `approved`, `synced`, `phantom`). | No |
+| `approve_decision` | Approve one or more decisions by ID, marking them ready to sync into specs and ADRs. | No |
+| `reject_decision` | Reject a decision by ID with a reason. Rejected decisions are excluded from sync. | No |
+| `sync_decisions` | Write approved decisions into OpenSpec spec.md files (as requirements) and create ADR files in `openspec/decisions/`. Append-only — never rewrites existing content. Pass `dryRun: true` to preview. | No |
 
 **Story Management**
 
