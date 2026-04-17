@@ -13,5 +13,6 @@
 | Checking if code still matches spec | `check_spec_drift` |
 | Finding spec requirements by meaning | `search_specs` |
 | Checking spec coverage before starting a feature | `audit_spec_coverage` |
+| Recording an architectural decision before writing code | `record_decision` |
 
 For all other cases (reading a file, grepping, listing files) use native tools directly.
