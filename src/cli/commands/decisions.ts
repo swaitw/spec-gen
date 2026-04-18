@@ -367,6 +367,16 @@ Examples:
       });
       await saveDecisionStore(rootPath, updated);
       logger.success(`Decision ${id} rejected.`);
+
+      if (!options.json && decision.affectedFiles.length > 0) {
+        console.log('\nIf this change should not be committed, revert it manually:');
+        for (const f of decision.affectedFiles) {
+          console.log(`  git restore ${f}`);
+        }
+        console.log('\nOr to document why this approach was rejected:');
+        console.log('  spec-gen decisions --record');
+        console.log('  (then re-run --consolidate before committing)');
+      }
       return;
     }
 
