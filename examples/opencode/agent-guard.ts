@@ -64,9 +64,7 @@ export const AgentGuard: Plugin = async ({ directory }) => {
   }
 
   return {
-    // Agent may only declare completion when BOTH conditions are true:
-    //   1. at least one file modification was made
-    //   2. check_spec_drift was called (confirms intent is realised)
+    // Keep agent working until it has explicitly verified completion.
     "experimental.chat.system.transform": async ({ sessionID }, output) => {
       const n = toolCalls.get(sessionID) ?? 0
       const checked = driftChecked.get(sessionID) ?? false
@@ -78,8 +76,8 @@ export const AgentGuard: Plugin = async ({ directory }) => {
         )
       } else if (!checked) {
         output.system.push(
-          "Do not say 'Task completed' until you have called check_spec_drift and confirmed " +
-          "that all required changes are in place and the code matches the spec.",
+          "Before saying 'Task completed': re-read the original request and verify every part " +
+          "of it is addressed. If anything is missing or untested, keep working.",
         )
       }
     },
