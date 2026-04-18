@@ -128,10 +128,16 @@ function buildManifest(projectRoot: string): Record<ToolName, SkillEntry[]> {
       src: join(ex, 'opencode-skills', name, 'SKILL.md'),
       dest: join(projectRoot, '.claude', 'skills', name, 'SKILL.md'),
     })),
-    opencode: OPENCODE_SKILLS.map(name => ({
-      src: join(ex, 'opencode-skills', name, 'SKILL.md'),
-      dest: join(projectRoot, '.opencode', 'skills', name, 'SKILL.md'),
-    })),
+    opencode: [
+      ...OPENCODE_SKILLS.map(name => ({
+        src: join(ex, 'opencode-skills', name, 'SKILL.md'),
+        dest: join(projectRoot, '.opencode', 'skills', name, 'SKILL.md'),
+      })),
+      {
+        src: join(ex, 'opencode', 'agent-guard.ts'),
+        dest: join(projectRoot, '.opencode', 'plugins', 'agent-guard.ts'),
+      },
+    ],
   };
 }
 
