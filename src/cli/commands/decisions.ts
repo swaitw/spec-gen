@@ -466,8 +466,8 @@ Examples:
       } else {
         if (!options.json) logger.discovery(`No drafts found — extracting decisions from diff via ${resolved.provider}...`);
         const specMap = specMapResult ?? await buildSpecMap({ rootPath, openspecPath });
-        // Use HEAD as base so the fallback only sees staged changes, not the full branch diff.
-        consolidated = await extractFromDiff({ rootPath, baseRef: 'HEAD', specMap, sessionId: store.sessionId, llm });
+        // Use staged-only scope so the fallback only sees what's actually being committed.
+        consolidated = await extractFromDiff({ rootPath, stagedOnly: true, specMap, sessionId: store.sessionId, llm });
       }
       if (consolidated.length === 0) {
         if (!options.json) console.log('No architectural decisions found in drafts.');
