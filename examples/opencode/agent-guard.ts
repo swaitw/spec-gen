@@ -1,24 +1,57 @@
 /**
  * spec-gen Agent Guard — OpenCode plugin
  *
- * Install globally:  spec-gen decisions --install-opencode-plugin
- * Install manually:  copy to ~/.config/opencode/plugins/
- *                    add "./plugins/agent-guard.ts" to the "plugin" array in opencode.json
+ * Install: spec-gen setup --tools opencode
+ * (copies to .opencode/plugins/ — auto-loaded by OpenCode)
  *
  * What it does:
  *   1. Anti-premature-stop: injects a system-prompt rule that prevents the agent
- *      from declaring "Task completed" / "Done" without having made real file changes.
+ *      from declaring "Task completed" without having made real file changes.
+ *      Once real work is done, switches to a check_spec_drift reminder instead.
  *   2. record_decision nudge: when a structural file (service/, domain/, core/, adapter/)
- *      is modified without a prior record_decision call in the session, appends a
- *      non-blocking reminder to the tool output the agent sees.
+ *      is modified without a prior record_decision call, appends a non-blocking
+ *      reminder to the tool output the agent reads.
+ *   3. Compaction safety: injects pending decisions into the compaction context
+ *      so they survive session summarisation.
+ *   4. tool.definition enrichment: adds known spec domains to the record_decision
+ *      tool description so the model uses the right domain names.
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
+import { readFile, readdir } from "node:fs/promises"
+import { join } from "node:path"
 
 const STRUCTURAL = /\/(service|domain|core|adapter)\//
 
-export const AgentGuard: Plugin = async () => {
-  // Per-session counters — keyed by sessionID so parallel sessions don't interfere
+interface PendingDecision {
+  id: string
+  title: string
+  status: string
+  affectedDomains: string[]
+}
+
+async function loadPendingDecisions(directory: string): Promise<PendingDecision[]> {
+  try {
+    const raw = await readFile(join(directory, ".spec-gen", "decisions", "pending.json"), "utf-8")
+    const store = JSON.parse(raw)
+    return (store.decisions ?? []).filter(
+      (d: PendingDecision) => !["synced", "rejected"].includes(d.status),
+    )
+  } catch {
+    return []
+  }
+}
+
+async function loadSpecDomains(directory: string): Promise<string[]> {
+  try {
+    const entries = await readdir(join(directory, "openspec", "specs"), { withFileTypes: true })
+    return entries.filter(e => e.isDirectory()).map(e => e.name)
+  } catch {
+    return []
+  }
+}
+
+export const AgentGuard: Plugin = async ({ directory }) => {
   const toolCalls = new Map<string, number>()
   const rdCalled = new Map<string, boolean>()
 
@@ -26,19 +59,24 @@ export const AgentGuard: Plugin = async () => {
   const reset = (sid: string) => { toolCalls.set(sid, 0); rdCalled.set(sid, false) }
 
   return {
-    // Inject guard into every system prompt sent to the LLM.
-    // Prevents "Task completed" before any real work has been done.
+    // Before work: prevent premature stop.
+    // After work: remind to check spec drift before closing.
     "experimental.chat.system.transform": async ({ sessionID }, output) => {
-      if ((toolCalls.get(sessionID) ?? 0) === 0) {
+      const n = toolCalls.get(sessionID) ?? 0
+      if (n === 0) {
         output.system.push(
           "Do not say 'Task completed', 'Done', or 'Finished' without having executed " +
           "at least one file modification tool call. If no real work has been done yet, keep working.",
         )
+      } else {
+        output.system.push(
+          "Before declaring the task complete, call check_spec_drift to verify " +
+          "the code still matches the spec.",
+        )
       }
     },
 
-    // Track tool calls per session.
-    // Append a record_decision nudge when a structural file is modified.
+    // Track tool calls; nudge record_decision on structural file changes.
     "tool.execute.after": async (input, output) => {
       const { sessionID, tool, args } = input
       inc(sessionID)
@@ -56,7 +94,30 @@ export const AgentGuard: Plugin = async () => {
       }
     },
 
-    // Reset per-session counters on session lifecycle events.
+    // Inject pending decisions into compaction context so they survive summarisation.
+    "experimental.session.compacting": async (_input, output) => {
+      const decisions = await loadPendingDecisions(directory)
+      if (decisions.length > 0) {
+        const lines = decisions.map(
+          d => `  - [${d.status}] ${d.title} (domains: ${d.affectedDomains.join(", ")})`,
+        )
+        output.context.push(
+          `Pending architectural decisions — do not lose track of these:\n${lines.join("\n")}`,
+        )
+      }
+    },
+
+    // Enrich record_decision description with known spec domains.
+    "tool.definition": async ({ toolID }, output) => {
+      if (!toolID.includes("record_decision")) return
+      const domains = await loadSpecDomains(directory)
+      if (domains.length > 0) {
+        output.description +=
+          `\n\nKnown affectedDomains values for this project: ${domains.join(", ")}`
+      }
+    },
+
+    // Reset per-session counters on lifecycle events.
     event: async ({ event }) => {
       const sid = (event as any).properties?.sessionID
       if (sid && ["session.idle", "session.created"].includes((event as any).type)) {
