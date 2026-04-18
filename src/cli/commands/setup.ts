@@ -21,6 +21,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkbox } from '@inquirer/prompts';
 import { logger } from '../../utils/logger.js';
+import { installPreCommitHook, installClaudeHook } from './decisions.js';
 
 // ============================================================================
 // TYPES
@@ -210,7 +211,7 @@ export const setupCommand = new Command('setup')
         choices: [
           { name: 'Mistral Vibe  (.vibe/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'vibe' as ToolName },
           { name: 'Cline / Roo   (.clinerules/workflows/spec-gen-{name}.md — 7 workflows)', value: 'cline' as ToolName },
-          { name: 'Claude Code   (.claude/skills/spec-gen-{name}/SKILL.md — 8 skills)', value: 'claude' as ToolName },
+          { name: 'Claude Code   (.claude/skills/ — 8 skills + pre-commit & PostToolUse hooks)', value: 'claude' as ToolName },
           { name: 'OpenCode      (.opencode/skills/spec-gen-{name}/SKILL.md — 8 skills + agent-guard plugin)', value: 'opencode' as ToolName },
           { name: 'GSD           (.claude/commands/gsd/spec-gen-{name}.md — 2 commands)', value: 'gsd' as ToolName },
           { name: 'BMAD          (_bmad/spec-gen/{agents,tasks}/ — 2 agents, 4 tasks)', value: 'bmad' as ToolName },
@@ -238,6 +239,12 @@ export const setupCommand = new Command('setup')
     } catch (err) {
       logger.error(`setup failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
+      return;
+    }
+
+    if (tools.includes('claude')) {
+      await installPreCommitHook(projectRoot);
+      await installClaudeHook(projectRoot);
     }
 
     // ── Report ───────────────────────────────────────────────────────────────

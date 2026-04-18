@@ -117,7 +117,7 @@ async function ensureGitignored(rootPath: string, entry: string): Promise<void> 
   logger.discovery(`  → added ${entry} to .gitignore`);
 }
 
-async function installPreCommitHook(rootPath: string): Promise<void> {
+export async function installPreCommitHook(rootPath: string): Promise<void> {
   const hooksDir = join(rootPath, '.git', 'hooks');
   const hookPath = join(hooksDir, 'pre-commit');
 
@@ -166,7 +166,7 @@ async function installPreCommitHook(rootPath: string): Promise<void> {
   }
 }
 
-async function uninstallPreCommitHook(rootPath: string): Promise<void> {
+export async function uninstallPreCommitHook(rootPath: string): Promise<void> {
   const hookPath = join(rootPath, '.git', 'hooks', 'pre-commit');
 
   if (!(await fileExists(hookPath))) {
@@ -212,7 +212,7 @@ async function uninstallPreCommitHook(rootPath: string): Promise<void> {
 
 const CLAUDE_HOOK_MARKER = 'spec-gen-mine-last';
 
-async function installClaudeHook(rootPath: string): Promise<void> {
+export async function installClaudeHook(rootPath: string): Promise<void> {
   const settingsDir = join(rootPath, '.claude');
   const settingsPath = join(settingsDir, 'settings.json');
 
@@ -250,7 +250,7 @@ async function installClaudeHook(rootPath: string): Promise<void> {
   logger.discovery('  → spec-gen decisions --mine-last will run after each Edit/Write');
 }
 
-async function uninstallClaudeHook(rootPath: string): Promise<void> {
+export async function uninstallClaudeHook(rootPath: string): Promise<void> {
   const settingsPath = join(rootPath, '.claude', 'settings.json');
   if (!(await fileExists(settingsPath))) return;
 
@@ -374,7 +374,6 @@ export const decisionsCommand = new Command('decisions')
   .option('--dry-run', 'Preview sync without writing', false)
   .option('--list', 'List decisions (default action when no other flag given)', false)
   .option('--status <status>', 'Filter list by status (draft|consolidated|verified|approved|rejected|synced)')
-  .option('--install-hook', 'Install pre-commit hook + Claude Code PostToolUse hook', false)
   .option('--uninstall-hook', 'Remove pre-commit hook + Claude Code PostToolUse hook', false)
   .option('--mine-last', 'Extract decisions from the last Edit/Write (called by Claude Code hook via stdin)', false)
   .option('--verbose', 'Show detailed decision info', false)
@@ -383,17 +382,17 @@ export const decisionsCommand = new Command('decisions')
     'after',
     `
 Workflow:
-  1. During dev: agent calls record_decision MCP tool
-  2. At commit: spec-gen decisions --consolidate  (or via hook)
-  3. Review: spec-gen decisions --approve <id>
-  4. Write to spec: spec-gen decisions --sync
+  1. Install once: spec-gen setup --tools claude  (hooks + skills)
+  2. During dev: agent calls record_decision MCP tool
+  3. At commit: spec-gen decisions --consolidate  (or via hook)
+  4. Review: spec-gen decisions --approve <id>
+  5. Write to spec: spec-gen decisions --sync
 
 Examples:
   $ spec-gen decisions                             List pending decisions
   $ spec-gen decisions --consolidate               Consolidate + verify drafts
   $ spec-gen decisions --approve a1b2c3d4          Approve decision a1b2c3d4
   $ spec-gen decisions --sync                      Sync approved decisions
-  $ spec-gen decisions --install-hook              Install pre-commit gate
   $ spec-gen decisions --status verified --json    Machine-readable output
 `
   )
@@ -407,7 +406,6 @@ Examples:
     dryRun: boolean;
     list: boolean;
     status?: string;
-    installHook: boolean;
     uninstallHook: boolean;
     mineLast: boolean;
     verbose: boolean;
@@ -417,11 +415,6 @@ Examples:
     const rootPath = process.cwd();
 
     // ── Hook management ──────────────────────────────────────────────────────
-    if (options.installHook) {
-      await installPreCommitHook(rootPath);
-      await installClaudeHook(rootPath);
-      return;
-    }
     if (options.uninstallHook) {
       await uninstallPreCommitHook(rootPath);
       await uninstallClaudeHook(rootPath);
