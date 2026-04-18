@@ -806,7 +806,8 @@ spec-gen analyze [options]
 
 ```bash
 spec-gen setup [options]
-  --tools <list>   Comma-separated tools to install: vibe, cline, gsd, bmad (default: interactive prompt)
+  --tools <list>   Comma-separated tools to install: vibe, cline, claude, opencode, gsd, bmad (default: interactive prompt)
+  --force          Overwrite existing files (use after upgrading spec-gen)
   --dir <path>     Project root directory (default: current directory)
 ```
 
@@ -814,12 +815,14 @@ Installs workflow skills from the spec-gen package into the project. Skills are 
 
 Files installed:
 
-| Tool | Destination | Skills |
-|------|-------------|--------|
-| `vibe` | `.vibe/skills/spec-gen-{name}/SKILL.md` | analyze-codebase, brainstorm, debug, execute-refactor, generate, implement-story, plan-refactor |
-| `cline` | `.clinerules/workflows/spec-gen-{name}.md` | analyze-codebase, check-spec-drift, execute-refactor, implement-feature, plan-refactor, refactor-codebase |
-| `gsd` | `.claude/commands/gsd/spec-gen-{name}.md` | orient, drift |
-| `bmad` | `_bmad/spec-gen/{agents,tasks}/` | agents: architect, dev-brownfield — tasks: implement-story, onboarding, refactor, sprint-planning |
+| Tool | Destination | Content |
+|------|-------------|---------|
+| `vibe` | `.vibe/skills/spec-gen-{name}/SKILL.md` | 8 skills |
+| `cline` | `.clinerules/workflows/spec-gen-{name}.md` | 7 workflows |
+| `claude` | `.claude/skills/spec-gen-{name}/SKILL.md` | 8 skills |
+| `opencode` | `.opencode/skills/spec-gen-{name}/SKILL.md` + `.opencode/plugins/agent-guard.ts` | 8 skills + guard plugin |
+| `gsd` | `.claude/commands/gsd/spec-gen-{name}.md` | 2 commands |
+| `bmad` | `_bmad/spec-gen/{agents,tasks}/` | 2 agents, 4 tasks |
 
 Never overwrites existing files. Combine with `analyze --ai-configs` for a complete agent setup:
 
@@ -930,12 +933,15 @@ spec-gen setup                   # install workflow skills
 **`spec-gen setup`** copies static workflow assets from the spec-gen package that are identical across all projects. Run once at onboarding; re-run after upgrading spec-gen to get new or updated skills.
 
 ```
-spec-gen setup [--tools vibe,cline,gsd,bmad]
+spec-gen setup [--tools vibe,cline,claude,opencode,gsd,bmad]
 
-Mistral Vibe  ->  .vibe/skills/spec-gen-{name}/SKILL.md      (7 skills)
-Cline / Roo   ->  .clinerules/workflows/spec-gen-{name}.md   (6 workflows)
-GSD           ->  .claude/commands/gsd/spec-gen-{name}.md    (2 commands)
-BMAD          ->  _bmad/spec-gen/{agents,tasks}/              (2 agents, 4 tasks)
+Mistral Vibe  ->  .vibe/skills/spec-gen-{name}/SKILL.md       (8 skills)
+Cline / Roo   ->  .clinerules/workflows/spec-gen-{name}.md    (7 workflows)
+Claude Code   ->  .claude/skills/spec-gen-{name}/SKILL.md     (8 skills)
+OpenCode      ->  .opencode/skills/spec-gen-{name}/SKILL.md   (8 skills)
+              ->  .opencode/plugins/agent-guard.ts             (guard plugin)
+GSD           ->  .claude/commands/gsd/spec-gen-{name}.md     (2 commands)
+BMAD          ->  _bmad/spec-gen/{agents,tasks}/               (2 agents, 4 tasks)
 ```
 
 Wire the generated digest into your agent's context:
@@ -1026,6 +1032,23 @@ spec-gen analyze --ai-configs   # creates .vibe/skills/spec-gen.md
 ```
 
 Then invoke `/spec-gen` inside Vibe to get architecture context on demand.
+
+**OpenCode** — install skills and the agent-guard plugin:
+
+```bash
+spec-gen setup --tools opencode
+```
+
+This installs 8 workflow skills into `.opencode/skills/` and an `agent-guard.ts` plugin into `.opencode/plugins/`. OpenCode loads plugins from `.opencode/plugins/` automatically — no further configuration needed.
+
+The plugin does four things at runtime, with no LLM calls of its own:
+
+| Hook | Behaviour |
+|------|-----------|
+| `experimental.chat.system.transform` | Before any file change: prevents premature "Task completed". After work is done: reminds the agent to call `check_spec_drift`. |
+| `tool.execute.after` | Appends a `record_decision` nudge to the output of any write/edit that touches a structural file (`service/`, `domain/`, `core/`, `adapter/`). |
+| `experimental.session.compacting` | Injects pending decisions into the compaction context so they survive session summarisation. |
+| `tool.definition` | Enriches the `record_decision` tool description with the known spec domains for the current project. |
 
 ---
 
