@@ -543,7 +543,34 @@ Examples:
         return;
       }
 
-      // Non-TTY fallback: plain text recap
+      // Non-TTY (agent/IDE context): structured JSON for ACP consumption
+      if (options.gate && !process.stdout.isTTY) {
+        const payload = {
+          gated: verified.length > 0 || missing.length > 0,
+          verified: verified.map((d) => ({
+            id: d.id,
+            title: d.title,
+            rationale: d.rationale,
+            consequences: d.consequences,
+            proposedRequirement: d.proposedRequirement,
+            affectedDomains: d.affectedDomains,
+            affectedFiles: d.affectedFiles,
+            confidence: d.confidence,
+          })),
+          phantom: phantom.map((d) => ({ id: d.id, title: d.title })),
+          missing: missing.map((m) => ({ file: m.file, description: m.description })),
+          actions: {
+            approve: 'spec-gen decisions --approve <id>',
+            reject: 'spec-gen decisions --reject <id>',
+            sync: 'spec-gen decisions --sync',
+          },
+        };
+        process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+        if (payload.gated) process.exitCode = 1;
+        return;
+      }
+
+      // Plain text recap (non-gate or explicit --list context)
       logger.section('Architectural Decisions — Review Required');
 
       if (verified.length > 0) {
@@ -569,6 +596,62 @@ Examples:
         logger.warning('\nDecisions verified — approve them before syncing: spec-gen decisions --approve <id>');
         process.exitCode = 1;
       }
+      return;
+    }
+
+    // ── Gate only (no consolidation — consolidation happens on record_decision) ──
+    if (options.gate && !options.consolidate) {
+      const verified = getDecisionsByStatus(store, 'verified');
+      const missing: Array<{ file: string; description: string }> = [];
+
+      if (verified.length === 0 && missing.length === 0) {
+        process.exitCode = 0;
+        return;
+      }
+
+      // TTY: interactive TUI
+      if (process.stdin.isTTY && process.stdout.isTTY && verified.length > 0) {
+        const results = await runTuiApproval(verified);
+        let gateStore = store;
+        for (const [id, decision] of results) {
+          if (decision === 'approved' || decision === 'rejected') {
+            gateStore = patchDecision(gateStore, id, {
+              status: decision,
+              reviewedAt: new Date().toISOString(),
+            });
+          }
+        }
+        await saveDecisionStore(rootPath, gateStore);
+        const stillPending = verified.filter(
+          (d) => !results.has(d.id) || results.get(d.id) === 'skipped',
+        );
+        if (stillPending.length > 0) process.exitCode = 1;
+        return;
+      }
+
+      // Non-TTY: JSON for ACP/agent consumption
+      const payload = {
+        gated: true,
+        verified: verified.map((d) => ({
+          id: d.id,
+          title: d.title,
+          rationale: d.rationale,
+          consequences: d.consequences,
+          proposedRequirement: d.proposedRequirement,
+          affectedDomains: d.affectedDomains,
+          affectedFiles: d.affectedFiles,
+          confidence: d.confidence,
+        })),
+        phantom: [],
+        missing,
+        actions: {
+          approve: 'spec-gen decisions --approve <id>',
+          reject: 'spec-gen decisions --reject <id>',
+          sync: 'spec-gen decisions --sync',
+        },
+      };
+      process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+      process.exitCode = 1;
       return;
     }
 
