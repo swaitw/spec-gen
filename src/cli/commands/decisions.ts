@@ -224,17 +224,25 @@ export async function installClaudeHook(_rootPath: string): Promise<void> {
   // Hook installation is now a no-op; kept for API compatibility with setup.ts.
 }
 
+interface ClaudeSettings {
+  hooks?: {
+    PostToolUse?: Array<{ _comment?: string; [key: string]: unknown }>;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
 export async function uninstallClaudeHook(rootPath: string): Promise<void> {
   const settingsPath = join(rootPath, '.claude', 'settings.json');
   if (!(await fileExists(settingsPath))) return;
 
   try {
-    const settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
-    const hooks = (settings.hooks as any)?.PostToolUse ?? [];
-    const filtered = hooks.filter((h: any) => !JSON.stringify(h).includes('spec-gen-mine-last'));
+    const settings = JSON.parse(await readFile(settingsPath, 'utf-8')) as ClaudeSettings;
+    const hooks = settings.hooks?.PostToolUse ?? [];
+    const filtered = hooks.filter((h) => !JSON.stringify(h).includes('spec-gen-mine-last'));
     if (filtered.length === hooks.length) return;
-    settings.hooks.PostToolUse = filtered.length > 0 ? filtered : undefined;
-    if (filtered.length === 0) delete settings.hooks.PostToolUse;
+    if (filtered.length === 0) delete settings.hooks!.PostToolUse;
+    else settings.hooks!.PostToolUse = filtered;
     await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
     logger.success('Claude Code PostToolUse hook removed from .claude/settings.json');
   } catch { /* settings corrupt — skip */ }
