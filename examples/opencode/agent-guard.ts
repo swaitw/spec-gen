@@ -54,24 +54,32 @@ async function loadSpecDomains(directory: string): Promise<string[]> {
 export const AgentGuard: Plugin = async ({ directory }) => {
   const toolCalls = new Map<string, number>()
   const rdCalled = new Map<string, boolean>()
+  const driftChecked = new Map<string, boolean>()
 
   const inc = (sid: string) => toolCalls.set(sid, (toolCalls.get(sid) ?? 0) + 1)
-  const reset = (sid: string) => { toolCalls.set(sid, 0); rdCalled.set(sid, false) }
+  const reset = (sid: string) => {
+    toolCalls.set(sid, 0)
+    rdCalled.set(sid, false)
+    driftChecked.set(sid, false)
+  }
 
   return {
-    // Before work: prevent premature stop.
-    // After work: remind to check spec drift before closing.
+    // Agent may only declare completion when BOTH conditions are true:
+    //   1. at least one file modification was made
+    //   2. check_spec_drift was called (confirms intent is realised)
     "experimental.chat.system.transform": async ({ sessionID }, output) => {
       const n = toolCalls.get(sessionID) ?? 0
+      const checked = driftChecked.get(sessionID) ?? false
+
       if (n === 0) {
         output.system.push(
           "Do not say 'Task completed', 'Done', or 'Finished' without having executed " +
           "at least one file modification tool call. If no real work has been done yet, keep working.",
         )
-      } else {
+      } else if (!checked) {
         output.system.push(
-          "Before declaring the task complete, call check_spec_drift to verify " +
-          "the code still matches the spec.",
+          "Do not say 'Task completed' until you have called check_spec_drift and confirmed " +
+          "that all required changes are in place and the code matches the spec.",
         )
       }
     },
@@ -80,6 +88,11 @@ export const AgentGuard: Plugin = async ({ directory }) => {
     "tool.execute.after": async (input, output) => {
       const { sessionID, tool, args } = input
       inc(sessionID)
+
+      if (tool.includes("check_spec_drift")) {
+        driftChecked.set(sessionID, true)
+        return
+      }
 
       if (tool.includes("record_decision")) {
         rdCalled.set(sessionID, true)
