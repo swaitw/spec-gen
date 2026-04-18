@@ -146,8 +146,11 @@ export async function specGenConsolidateDecisions(
 
   const store = await loadDecisionStore(rootPath);
 
+  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const specMap = await buildSpecMap({ rootPath, openspecPath }).catch(() => undefined);
+
   progress(onProgress, 'Consolidating drafts', 'start');
-  const { decisions: consolidated, supersededIds } = await consolidateDrafts(store, llm);
+  const { decisions: consolidated, supersededIds } = await consolidateDrafts(store, llm, specMap);
   progress(onProgress, 'Consolidating drafts', 'complete', `${consolidated.length} decisions`);
 
   if (consolidated.length === 0) {

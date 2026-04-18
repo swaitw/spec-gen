@@ -380,17 +380,18 @@ Examples:
       });
 
       // Step 1 — Consolidate drafts OR extract from diff as fallback
+      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+      const specMapResult = await buildSpecMap({ rootPath, openspecPath }).catch(() => undefined);
       let consolidated: PendingDecision[];
       let supersededIds: string[] = [];
       if (hasDrafts) {
         if (!options.json) logger.discovery(`Consolidating ${drafts.length} draft decision(s) via ${resolved.provider}...`);
-        const result = await consolidateDrafts(store, llm);
+        const result = await consolidateDrafts(store, llm, specMapResult);
         consolidated = result.decisions;
         supersededIds = result.supersededIds;
       } else {
         if (!options.json) logger.discovery(`No drafts found — extracting decisions from diff via ${resolved.provider}...`);
-        const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
-        const specMap = await buildSpecMap({ rootPath, openspecPath });
+        const specMap = specMapResult ?? await buildSpecMap({ rootPath, openspecPath });
         consolidated = await extractFromDiff({ rootPath, specMap, sessionId: store.sessionId, llm });
       }
       if (consolidated.length === 0) {

@@ -9,6 +9,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
+import { logger } from '../../utils/logger.js';
 import { parseSpecHeader } from '../drift/spec-mapper.js';
 import type { PendingDecision, DecisionStore, SpecMap } from '../../types/index.js';
 import { patchDecision, saveDecisionStore } from './store.js';
@@ -71,7 +72,10 @@ async function syncDecision(
 
   for (const domain of decision.affectedDomains) {
     const mapping = options.specMap.byDomain.get(domain);
-    if (!mapping) continue;
+    if (!mapping) {
+      logger.warning(`Decision "${decision.title}": domain "${domain}" not found in spec map — skipping sync to spec`);
+      continue;
+    }
 
     const specAbsPath = join(options.rootPath, mapping.specPath);
     if (!(await fileExists(specAbsPath))) continue;

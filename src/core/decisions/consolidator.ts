@@ -10,8 +10,9 @@ import {
 } from '../../constants.js';
 import { logger } from '../../utils/logger.js';
 import type { LLMService } from '../services/llm-service.js';
-import type { PendingDecision, DecisionStore } from '../../types/index.js';
+import type { PendingDecision, DecisionStore, SpecMap } from '../../types/index.js';
 import { makeDecisionId } from './store.js';
+import { matchFileToDomains } from '../drift/spec-mapper.js';
 
 const SYSTEM_PROMPT = `You are an architectural decision consolidator for a software project.
 
@@ -56,6 +57,7 @@ export interface ConsolidateResult {
 export async function consolidateDrafts(
   store: DecisionStore,
   llm: LLMService,
+  specMap?: SpecMap,
 ): Promise<ConsolidateResult> {
   const drafts = store.decisions.filter((d) => d.status === 'draft');
   if (drafts.length === 0) return { decisions: [], supersededIds: [] };
@@ -93,7 +95,10 @@ export async function consolidateDrafts(
   const allSupersededIds = consolidated.flatMap((c) => c.supersededIds ?? []);
 
   const decisions = consolidated.map((c): PendingDecision => {
-    const domain = c.affectedDomains[0] ?? 'unknown';
+    // Remap LLM-produced domain names to spec-map ground truth using affectedFiles.
+    // Falls back to LLM names if specMap is absent or files yield no match.
+    const resolvedDomains = resolveDomainsFromFiles(c.affectedFiles, c.affectedDomains, specMap);
+    const domain = resolvedDomains[0] ?? 'unknown';
     return {
       id: makeDecisionId(store.sessionId, domain, c.title),
       status: 'consolidated',
@@ -101,7 +106,7 @@ export async function consolidateDrafts(
       rationale: c.rationale,
       consequences: c.consequences,
       proposedRequirement: c.proposedRequirement,
-      affectedDomains: c.affectedDomains,
+      affectedDomains: resolvedDomains,
       affectedFiles: c.affectedFiles,
       confidence: 'medium',
       sessionId: store.sessionId,
@@ -112,6 +117,36 @@ export async function consolidateDrafts(
   });
 
   return { decisions, supersededIds: allSupersededIds };
+}
+
+/**
+ * Remap LLM-produced domain names to spec-map ground truth.
+ * Uses affectedFiles as the anchor: if files can be matched to known spec domains,
+ * those names take precedence over whatever the LLM suggested.
+ */
+function resolveDomainsFromFiles(
+  files: string[],
+  llmDomains: string[],
+  specMap?: SpecMap,
+): string[] {
+  if (!specMap || files.length === 0) return llmDomains.length > 0 ? llmDomains : ['unknown'];
+
+  const matched = new Set<string>();
+  for (const file of files) {
+    for (const domain of matchFileToDomains(file, specMap)) {
+      matched.add(domain);
+    }
+  }
+
+  if (matched.size > 0) return [...matched];
+
+  // Files didn't match — try normalising LLM names against known domains
+  const knownDomains = [...specMap.byDomain.keys()];
+  const normalised = llmDomains
+    .map((d) => knownDomains.find((k) => k.toLowerCase() === d.toLowerCase()) ?? null)
+    .filter((d): d is string => d !== null);
+
+  return normalised.length > 0 ? normalised : llmDomains.length > 0 ? llmDomains : ['unknown'];
 }
 
 function parseJSON<T>(text: string, fallback: T): T {
