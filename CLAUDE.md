@@ -42,12 +42,25 @@ Decisions are consolidated in the background immediately after `record_decision`
 ## When git commit is blocked by the decisions gate
 
 If `git commit` fails and the output is JSON with `"gated": true`, do NOT retry silently.
-Parse the JSON and present each decision in the chat:
+Check the `reason` field and act accordingly:
 
+**`reason: "verified"` — decisions await review:**
+Present each decision to the user:
 > "The commit is blocked — I found N architectural decision(s) to validate:
 > 1. **[id]** Title — rationale
 > Do you approve? (yes/no)"
-
-For each decision the user approves, call `approve_decision`. For rejections, call `reject_decision`.
+For each approval call `approve_decision`, for rejections call `reject_decision`.
 Then run `spec-gen decisions --sync` and retry `git commit`.
+
+**`reason: "drafts_pending_consolidation"` — drafts were recorded but not yet consolidated:**
+Present to the user:
+> "N decision draft(s) were recorded but never consolidated. Run consolidation now? (~10-30s)"
+If yes: run `spec-gen decisions --consolidate --gate` and handle the result.
+If no: retry with `git commit --no-verify` to skip the gate.
+
+**`reason: "no_decisions_recorded"` — source files staged but nothing recorded:**
+Present to the user:
+> "Source files are staged but no architectural decisions were recorded. Run fallback extraction to check for undocumented decisions? (~10-30s)"
+If yes: run `spec-gen decisions --consolidate --gate` and handle the result.
+If no: retry with `git commit --no-verify` to skip the gate.
 <!-- end-spec-gen-decisions-instructions -->

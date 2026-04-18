@@ -10,11 +10,11 @@
 
 import { Command } from 'commander';
 import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 import { join } from 'node:path';
+
 import { logger } from '../../utils/logger.js';
 import { fileExists, resolveLLMProvider } from '../../utils/command-helpers.js';
 import { readSpecGenConfig } from '../../core/services/config-manager.js';
@@ -613,47 +613,21 @@ Examples:
       if (verified.length === 0 && missing.length === 0) {
         const drafts = getDecisionsByStatus(store, 'draft');
         if (drafts.length > 0) {
-          // Drafts exist but consolidation never completed — offer to run it now
-          if (process.stdin.isTTY && process.stdout.isTTY) {
-            const answer = await new Promise<string>((resolve) => {
-              process.stderr.write(
-                `\n[decisions] ${drafts.length} draft decision(s) were never consolidated.\n` +
-                'Run consolidation now? [y/N] ',
-              );
-              process.stdin.setRawMode(true);
-              process.stdin.resume();
-              process.stdin.once('data', (buf: Buffer) => {
-                process.stdin.setRawMode(false);
-                process.stdin.pause();
-                process.stderr.write('\n');
-                resolve(buf.toString().toLowerCase());
-              });
-            });
-            if (answer === 'y') {
-              const localBin = join(rootPath, 'node_modules', '.bin', 'spec-gen');
-              const localDist = join(rootPath, 'dist', 'cli', 'index.js');
-              let cmd: string; let args: string[];
-              if (existsSync(localBin)) {
-                cmd = localBin; args = ['decisions', '--consolidate', '--gate'];
-              } else if (existsSync(localDist)) {
-                cmd = process.execPath; args = [localDist, 'decisions', '--consolidate', '--gate'];
-              } else {
-                cmd = 'spec-gen'; args = ['decisions', '--consolidate', '--gate'];
-              }
-              const exitCode = await new Promise<number>((resolve) => {
-                const child = spawn(cmd, args, { cwd: rootPath, stdio: 'inherit' });
-                child.on('close', (code) => resolve(code ?? 0));
-              });
-              process.exitCode = exitCode;
-              return;
-            }
-          } else {
-            process.stderr.write(
-              `[decisions] ${drafts.length} draft decision(s) pending consolidation. ` +
-              'Run: spec-gen decisions --consolidate\n',
-            );
-          }
-          process.exitCode = 0;
+          // Drafts recorded but consolidation never completed.
+          // Output structured JSON so the agent can relay to the user and act on the answer.
+          const payload = {
+            gated: true,
+            reason: 'drafts_pending_consolidation',
+            message: `${drafts.length} draft decision(s) were recorded but never consolidated.`,
+            drafts: drafts.map((d) => ({ id: d.id, title: d.title, recordedAt: d.recordedAt })),
+            actions: {
+              consolidate: 'spec-gen decisions --consolidate',
+              consolidateAndGate: 'spec-gen decisions --consolidate --gate',
+              skip: 'git commit --no-verify',
+            },
+          };
+          process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+          process.exitCode = 1;
           return;
         }
 
@@ -671,60 +645,18 @@ Examples:
             const SOURCE_EXTS = /\.(ts|js|tsx|jsx|py|go|rs|rb|java|cpp|cc|swift)$/;
             const hasSourceChanges = stagedFiles.some((f) => SOURCE_EXTS.test(f));
             if (hasSourceChanges) {
-              if (process.stdin.isTTY && process.stdout.isTTY) {
-                // TTY: ask the user
-                const answer = await new Promise<string>((resolve) => {
-                  process.stderr.write(
-                    '\n[decisions] Source files staged but no decisions recorded.\n' +
-                    'Run fallback extraction now? This will call the LLM (~10-30s). [y/N] ',
-                  );
-                  process.stdin.setRawMode(true);
-                  process.stdin.resume();
-                  process.stdin.once('data', (buf: Buffer) => {
-                    process.stdin.setRawMode(false);
-                    process.stdin.pause();
-                    process.stderr.write('\n');
-                    resolve(buf.toString().toLowerCase());
-                  });
-                });
-                if (answer === 'y') {
-                  // Re-invoke with --consolidate --gate so the full pipeline runs
-                  const localBin = join(rootPath, 'node_modules', '.bin', 'spec-gen');
-                  const localDist = join(rootPath, 'dist', 'cli', 'index.js');
-                  let cmd: string; let args: string[];
-                  if (existsSync(localBin)) {
-                    cmd = localBin; args = ['decisions', '--consolidate', '--gate'];
-                  } else if (existsSync(localDist)) {
-                    cmd = process.execPath; args = [localDist, 'decisions', '--consolidate', '--gate'];
-                  } else {
-                    cmd = 'spec-gen'; args = ['decisions', '--consolidate', '--gate'];
-                  }
-                  const exitCode = await new Promise<number>((resolve) => {
-                    const child = spawn(cmd, args, { cwd: rootPath, stdio: 'inherit' });
-                    child.on('close', (code) => resolve(code ?? 0));
-                  });
-                  process.exitCode = exitCode;
-                  return;
-                }
-              } else {
-                // Non-TTY (agent): spawn background consolidation for next commit
-                const localBin = join(rootPath, 'node_modules', '.bin', 'spec-gen');
-                const localDist = join(rootPath, 'dist', 'cli', 'index.js');
-                let bgCmd: string; let bgArgs: string[];
-                if (existsSync(localBin)) {
-                  bgCmd = localBin; bgArgs = ['decisions', '--consolidate'];
-                } else if (existsSync(localDist)) {
-                  bgCmd = process.execPath; bgArgs = [localDist, 'decisions', '--consolidate'];
-                } else {
-                  bgCmd = 'spec-gen'; bgArgs = ['decisions', '--consolidate'];
-                }
-                const bg = spawn(bgCmd, bgArgs, { cwd: rootPath, detached: true, stdio: 'ignore' });
-                bg.unref();
-                process.stderr.write(
-                  '[decisions] Source files staged but no decisions recorded. ' +
-                  'Background consolidation started — decisions will be gated on the next commit.\n',
-                );
-              }
+              // Source files staged but nothing recorded — output JSON for agent to relay.
+              const payload = {
+                gated: true,
+                reason: 'no_decisions_recorded',
+                message: 'Source files are staged but no architectural decisions were recorded.',
+                actions: {
+                  consolidateAndGate: 'spec-gen decisions --consolidate --gate',
+                  skip: 'git commit --no-verify',
+                },
+              };
+              process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+              process.exitCode = 1;
             }
           } catch { /* git unavailable — skip */ }
         }
