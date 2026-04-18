@@ -36,4 +36,16 @@ record_decision({
 ```
 
 Decisions are consolidated and cross-checked against the git diff before each commit.
+
+## When git commit is blocked by the decisions gate
+
+If `git commit` fails and the output is JSON with `"gated": true`, do NOT retry silently.
+Parse the JSON and present each decision in the chat:
+
+> "The commit is blocked — I found N architectural decision(s) to validate:
+> 1. **[id]** Title — rationale
+> Do you approve? (yes/no)"
+
+For each decision the user approves, call `approve_decision`. For rejections, call `reject_decision`.
+Then run `spec-gen decisions --sync` and retry `git commit`.
 <!-- end-spec-gen-decisions-instructions -->
