@@ -15,7 +15,7 @@ import { logger } from '../../utils/logger.js';
 import { fileExists, resolveLLMProvider } from '../../utils/command-helpers.js';
 import { readSpecGenConfig } from '../../core/services/config-manager.js';
 import { createLLMService } from '../../core/services/llm-service.js';
-import { isGitRepository, getChangedFiles, getFileDiff, resolveBaseRef, buildSpecMap } from '../../core/drift/index.js';
+import { isGitRepository, getChangedFiles, getFileDiff, getCommitMessages, resolveBaseRef, buildSpecMap } from '../../core/drift/index.js';
 import {
   loadDecisionStore,
   saveDecisionStore,
@@ -400,8 +400,9 @@ Examples:
         return;
       }
 
-      // Step 2 — Build diff for verification
+      // Step 2 — Build diff + commit messages for verification
       let combinedDiff = '';
+      let commitMessages = '';
       try {
         if (await isGitRepository(rootPath)) {
           const baseRef = await resolveBaseRef(rootPath, 'auto');
@@ -411,6 +412,7 @@ Examples:
             relevant.map((f) => getFileDiff(rootPath, f.path, baseRef, DECISIONS_DIFF_MAX_CHARS))
           );
           combinedDiff = diffs.join('\n\n');
+          commitMessages = await getCommitMessages(rootPath, baseRef).catch(() => '');
         }
       } catch (err) {
         logger.warning(`Could not build git diff for verification: ${(err as Error).message}`);
@@ -418,7 +420,7 @@ Examples:
 
       // Step 3 — Verify
       const { verified, phantom, missing } = combinedDiff
-        ? await verifyDecisions(consolidated, combinedDiff, llm)
+        ? await verifyDecisions(consolidated, combinedDiff, llm, commitMessages)
         : { verified: consolidated.map((d) => ({ ...d, status: 'verified' as const, confidence: 'medium' as const })), phantom: [], missing: [] };
 
       // Step 4 — Persist

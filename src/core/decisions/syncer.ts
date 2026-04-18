@@ -237,8 +237,25 @@ ${decision.consequences}
 }
 
 function isArchitectural(decision: PendingDecision): boolean {
-  const keywords = /architect|design|pattern|interface|contract|api|schema|model|framework|dependency|module|layer|service|auth|database|cache|queue/i;
-  return keywords.test(decision.title) || keywords.test(decision.rationale);
+  // Require at least 2 keyword matches across title + rationale to avoid ADR explosion.
+  // Broad terms like "api" or "service" alone are too common; structural weight matters.
+  const keywords = [
+    /\barchitect(ure|ural)?\b/i,
+    /\bdesign pattern\b/i,
+    /\binterface contract\b/i,
+    /\bpublic api\b/i,
+    /\bschema\b/i,
+    /\bframework\b/i,
+    /\bdependency\b/i,
+    /\blayer(ing|ed)?\b/i,
+    /\bauthentication\b|\bauthorization\b/i,
+    /\bdatabase\b|\bdata store\b/i,
+    /\bcaching strategy\b/i,
+    /\bmessage queue\b|\bevent bus\b/i,
+  ];
+  const combined = `${decision.title} ${decision.rationale}`;
+  const matches = keywords.filter((re) => re.test(combined)).length;
+  return matches >= 2;
 }
 
 function toPascalCase(str: string): string {

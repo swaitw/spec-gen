@@ -8,19 +8,14 @@
  */
 
 import { DECISIONS_VERIFICATION_MAX_TOKENS } from '../../constants.js';
-import { logger } from '../../utils/logger.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { PendingDecision } from '../../types/index.js';
 
 const SYSTEM_PROMPT = `You are an architectural decision verifier for a software project.
 
-You receive:
-1. A list of consolidated architectural decisions (with their IDs)
-2. A git diff
+You receive a list of architectural decisions. Each decision includes a "targetedDiff" field containing the git diff hunks for its affected files (or a sample of the overall diff if no specific files matched). You may also receive commit messages for context.
 
-Your task: for each decision, determine if the diff contains clear evidence that it was implemented.
-
-Also identify significant changes in the diff that are NOT covered by any decision.
+Your task: for each decision, determine if its targetedDiff contains clear evidence that it was implemented. Also identify significant changes not covered by any decision.
 
 Respond with JSON only:
 {
@@ -30,8 +25,8 @@ Respond with JSON only:
 }
 
 Rules:
-- "verified": the diff clearly shows this decision being implemented (look for matching patterns, types, function names, config keys)
-- "phantom": the diff shows no sign this was implemented (may have been rolled back)
+- "verified": the diff clearly shows this decision being implemented (matching patterns, types, function names, config keys, commit messages)
+- "phantom": no sign of implementation in the diff (may have been rolled back or not yet committed)
 - "missing": a structurally significant change (new interface, new function, dependency added, API change) that no decision covers
 - Only report "missing" for architectural-level changes, not trivial ones`;
 
@@ -47,27 +42,76 @@ export interface VerificationResult {
   missing: Array<{ file: string; description: string }>;
 }
 
+/** Maximum chars to include per file hunk in targeted diff */
+const FILE_HUNK_LIMIT = 4_000;
+/** Maximum total diff chars passed to LLM across all targeted hunks */
+const TARGETED_DIFF_LIMIT = 16_000;
+
+/**
+ * Parse a combined git diff into a map of { filePath → hunk text }.
+ * File paths are normalised to strip the leading a/ or b/ prefix.
+ */
+function parseDiffByFile(diff: string): Map<string, string> {
+  const result = new Map<string, string>();
+  const sections = diff.split(/^(?=diff --git )/m);
+  for (const section of sections) {
+    if (!section.trim()) continue;
+    const header = section.match(/^diff --git a\/(.+?) b\//);
+    if (!header) continue;
+    const file = header[1];
+    result.set(file, section.length > FILE_HUNK_LIMIT ? section.slice(0, FILE_HUNK_LIMIT) + '\n... (truncated)' : section);
+  }
+  return result;
+}
+
+/**
+ * Build a targeted diff string for a single decision.
+ * Includes only hunks for files listed in affectedFiles.
+ * Falls back to a slice of the full diff if no files match.
+ */
+function buildTargetedDiff(
+  decision: PendingDecision,
+  diffByFile: Map<string, string>,
+  fallbackDiff: string,
+): string {
+  const parts: string[] = [];
+  let total = 0;
+  for (const file of decision.affectedFiles) {
+    const normalised = file.replace(/^[ab]\//, '');
+    const hunk = diffByFile.get(normalised);
+    if (!hunk) continue;
+    const chunk = hunk.length > FILE_HUNK_LIMIT ? hunk.slice(0, FILE_HUNK_LIMIT) + '\n... (truncated)' : hunk;
+    if (total + chunk.length > TARGETED_DIFF_LIMIT) break;
+    parts.push(chunk);
+    total += chunk.length;
+  }
+  if (parts.length > 0) return parts.join('\n');
+  // No matching files — pass a slice of the global diff so the LLM can still check
+  return fallbackDiff.slice(0, 4_000);
+}
+
 export async function verifyDecisions(
   decisions: PendingDecision[],
   diff: string,
   llm: LLMService,
+  commitMessages?: string,
 ): Promise<VerificationResult> {
   if (decisions.length === 0) {
     return { verified: [], phantom: [], missing: [] };
   }
+
+  const diffByFile = parseDiffByFile(diff);
 
   const decisionSummary = decisions.map((d) => ({
     id: d.id,
     title: d.title,
     affectedFiles: d.affectedFiles,
     proposedRequirement: d.proposedRequirement,
+    targetedDiff: buildTargetedDiff(d, diffByFile, diff),
   }));
 
-  const DIFF_LIMIT = 20_000;
-  if (diff.length > DIFF_LIMIT) {
-    logger.warning(`verifyDecisions: diff truncated to ${DIFF_LIMIT} chars (was ${diff.length}) — some decisions may be incorrectly marked phantom`);
-  }
-  const userContent = `Decisions:\n${JSON.stringify(decisionSummary, null, 2)}\n\nDiff:\n${diff.slice(0, DIFF_LIMIT)}`;
+  const commitSection = commitMessages ? `\nCommit messages:\n${commitMessages}\n` : '';
+  const userContent = `Decisions:\n${JSON.stringify(decisionSummary, null, 2)}${commitSection}`;
 
   const response = await llm.complete({
     systemPrompt: SYSTEM_PROMPT,

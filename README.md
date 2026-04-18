@@ -182,6 +182,7 @@ graph TD
         API_VERIFY[specGenVerify]
         API_DRIFT[specGenDrift]
         API_RUN[specGenRun]
+        API_DECISIONS[specGenConsolidateDecisions / specGenSyncDecisions]
     end
 
     subgraph Core["Core Layer"]
@@ -219,16 +220,17 @@ graph TD
         end
 
         subgraph Decisions["Decisions -- LLM optional"]
-            DR[Decision Recorder] --> DC[Consolidator]
-            DC -.->|LLM cross-check| DV[Verifier]
+            DR[Decision Recorder]
+            DR --> DC[Consolidator]
+            DC -.->|LLM consolidate| DV[Verifier]
             DV --> DS[Syncer]
-            GA -.->|fallback| DC
+            GA -.->|fallback extractor| DC
         end
 
         LLM[LLM Service -- Anthropic / OpenAI / Compatible]
     end
 
-    CMD --> API_INIT & API_ANALYZE & API_GENERATE & API_VERIFY & API_DRIFT
+    CMD --> API_INIT & API_ANALYZE & API_GENERATE & API_VERIFY & API_DRIFT & API_DECISIONS
     API_RUN --> API_INIT & API_ANALYZE & API_GENERATE
 
     API_INIT --> Init
@@ -236,10 +238,15 @@ graph TD
     API_GENERATE --> Generate
     API_VERIFY --> Verify
     API_DRIFT --> Drift
+    API_DECISIONS --> Decisions
 
     Generate --> LLM
     Verify --> LLM
     LE -.-> LLM
+    DC -.-> LLM
+    DV -.-> LLM
+
+    MCP([MCP / Agent]) -.->|record_decision| DR
 
     AG -->|analysis artifacts| SP
     AG -->|analysis artifacts| VE

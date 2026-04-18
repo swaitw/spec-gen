@@ -154,26 +154,48 @@ describe('verifyDecisions — JSON parsing robustness', () => {
 });
 
 // ============================================================================
-// Diff truncation warning (M3)
+// File-targeted diff (M3)
 // ============================================================================
 
-describe('verifyDecisions — diff truncation warning', () => {
+const MULTI_FILE_DIFF = [
+  'diff --git a/src/cache.ts b/src/cache.ts\nindex 0000000..1111111 100644\n--- a/src/cache.ts\n+++ b/src/cache.ts\n@@ -1,2 +1,3 @@\n+import Redis from "ioredis";\n export default {};',
+  'diff --git a/src/auth.ts b/src/auth.ts\nindex 0000000..2222222 100644\n--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1 +1,2 @@\n+export function verifyJWT() {}',
+].join('\n');
+
+describe('verifyDecisions — file-targeted diff', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('does not warn when diff is within limit', async () => {
-    const { logger } = await import('./verifier.js').then(() => import('../../utils/logger.js'));
+  it('passes only affected file hunks in the targetedDiff field', async () => {
     const llm = makeLLM(VALID_RESPONSE);
-    await verifyDecisions([makeDecision()], 'short diff', llm);
-    expect(vi.mocked(logger.warning)).not.toHaveBeenCalled();
+    const d = makeDecision({ affectedFiles: ['src/cache.ts'] });
+    await verifyDecisions([d], MULTI_FILE_DIFF, llm);
+    const prompt = vi.mocked(llm.complete).mock.calls[0][0].userPrompt as string;
+    const parsed = JSON.parse(prompt.replace('Decisions:\n', ''));
+    expect(parsed[0].targetedDiff).toContain('src/cache.ts');
+    expect(parsed[0].targetedDiff).not.toContain('src/auth.ts');
   });
 
-  it('warns when diff exceeds 20 000 chars', async () => {
-    const { logger } = await import('../../utils/logger.js');
+  it('falls back to global diff slice when no affectedFiles match', async () => {
     const llm = makeLLM(VALID_RESPONSE);
-    const longDiff = 'x'.repeat(20_001);
-    await verifyDecisions([makeDecision()], longDiff, llm);
-    expect(vi.mocked(logger.warning)).toHaveBeenCalledWith(
-      expect.stringContaining('truncated'),
-    );
+    const d = makeDecision({ affectedFiles: ['src/unknown.ts'] });
+    await verifyDecisions([d], MULTI_FILE_DIFF, llm);
+    const prompt = vi.mocked(llm.complete).mock.calls[0][0].userPrompt as string;
+    const parsed = JSON.parse(prompt.replace('Decisions:\n', ''));
+    expect(parsed[0].targetedDiff).toBeTruthy();
+  });
+
+  it('includes commit messages in the prompt when provided', async () => {
+    const llm = makeLLM(VALID_RESPONSE);
+    await verifyDecisions([makeDecision()], MULTI_FILE_DIFF, llm, 'abc1234 add Redis caching');
+    const prompt = vi.mocked(llm.complete).mock.calls[0][0].userPrompt as string;
+    expect(prompt).toContain('Commit messages:');
+    expect(prompt).toContain('add Redis caching');
+  });
+
+  it('does not include commit section when commitMessages is absent', async () => {
+    const llm = makeLLM(VALID_RESPONSE);
+    await verifyDecisions([makeDecision()], MULTI_FILE_DIFF, llm);
+    const prompt = vi.mocked(llm.complete).mock.calls[0][0].userPrompt as string;
+    expect(prompt).not.toContain('Commit messages:');
   });
 });

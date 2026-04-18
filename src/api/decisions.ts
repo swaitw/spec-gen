@@ -17,8 +17,7 @@ import {
 import { fileExists } from '../utils/command-helpers.js';
 import { readSpecGenConfig } from '../core/services/config-manager.js';
 import { createLLMService } from '../core/services/llm-service.js';
-import { isGitRepository, getChangedFiles, getFileDiff, resolveBaseRef } from '../core/drift/index.js';
-import { buildSpecMap } from '../core/drift/index.js';
+import { isGitRepository, getChangedFiles, getFileDiff, getCommitMessages, resolveBaseRef, buildSpecMap } from '../core/drift/index.js';
 import {
   loadDecisionStore,
   saveDecisionStore,
@@ -157,8 +156,9 @@ export async function specGenConsolidateDecisions(
     return { verified: [], phantom: [], missing: [], store };
   }
 
-  // Build combined diff for verification
+  // Build combined diff + commit messages for verification
   let combinedDiff = '';
+  let commitMessages = '';
   if (await isGitRepository(rootPath)) {
     progress(onProgress, 'Building git diff', 'start');
     try {
@@ -169,6 +169,7 @@ export async function specGenConsolidateDecisions(
         relevant.map((f) => getFileDiff(rootPath, f.path, baseRef, DECISIONS_DIFF_MAX_CHARS))
       );
       combinedDiff = diffs.join('\n\n');
+      commitMessages = await getCommitMessages(rootPath, baseRef).catch(() => '');
       progress(onProgress, 'Building git diff', 'complete', `${relevant.length} files`);
     } catch {
       progress(onProgress, 'Building git diff', 'skip', 'diff unavailable');
@@ -177,7 +178,7 @@ export async function specGenConsolidateDecisions(
 
   progress(onProgress, 'Verifying decisions', 'start');
   const { verified, phantom, missing } = combinedDiff
-    ? await verifyDecisions(consolidated, combinedDiff, llm)
+    ? await verifyDecisions(consolidated, combinedDiff, llm, commitMessages)
     : { verified: consolidated.map((d) => ({ ...d, status: 'verified' as const, confidence: 'medium' as const })), phantom: [], missing: [] };
   progress(onProgress, 'Verifying decisions', 'complete', `${verified.length} verified`);
 
