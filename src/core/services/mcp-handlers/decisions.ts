@@ -8,6 +8,7 @@
  * sync_decisions       — write approved decisions to spec.md files
  */
 
+import { spawn } from 'node:child_process';
 import { validateDirectory, sanitizeMcpError } from './utils.js';
 import {
   loadDecisionStore,
@@ -22,6 +23,30 @@ import { readSpecGenConfig } from '../config-manager.js';
 import { join } from 'node:path';
 import { OPENSPEC_DIR } from '../../../constants.js';
 import type { PendingDecision } from '../../../types/index.js';
+
+function spawnConsolidateBackground(rootPath: string): void {
+  // Resolve binary: prefer local build over global install (same order as pre-commit hook)
+  const localDist = join(rootPath, 'dist', 'cli', 'index.js');
+  const localBin = join(rootPath, 'node_modules', '.bin', 'spec-gen');
+
+  import('node:fs').then(({ existsSync }) => {
+    let cmd: string;
+    let args: string[];
+    if (existsSync(localBin)) {
+      cmd = localBin; args = ['decisions', '--consolidate'];
+    } else if (existsSync(localDist)) {
+      cmd = process.execPath; args = [localDist, 'decisions', '--consolidate'];
+    } else {
+      cmd = 'spec-gen'; args = ['decisions', '--consolidate'];
+    }
+    const child = spawn(cmd, args, {
+      cwd: rootPath,
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+  }).catch(() => { /* ignore */ });
+}
 
 // ============================================================================
 // record_decision
@@ -63,9 +88,12 @@ export async function handleRecordDecision(
     const updated = upsertDecisions(store, [decision]);
     await saveDecisionStore(rootPath, updated);
 
+    // Consolidate in background so commit-time gate is instant
+    spawnConsolidateBackground(rootPath);
+
     return {
       id,
-      message: `Decision recorded: "${title}". Use spec-gen decisions --consolidate before committing.`,
+      message: `Decision recorded: "${title}". Consolidation running in background.`,
     };
   } catch (err) {
     return { error: sanitizeMcpError(err) };

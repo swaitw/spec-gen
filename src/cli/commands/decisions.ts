@@ -36,6 +36,7 @@ import {
   DECISIONS_DIFF_MAX_CHARS,
 } from '../../constants.js';
 import type { PendingDecision } from '../../types/index.js';
+import { runTuiApproval } from '../tui-approval.js';
 
 // ============================================================================
 // AGENT INSTRUCTION FILES
@@ -97,15 +98,15 @@ const HOOK_CONTENT = `${HOOK_MARKER}
 
 # Prefer local build over global install.
 if [ -f "./node_modules/.bin/spec-gen" ]; then
-  ./node_modules/.bin/spec-gen decisions --consolidate --gate 2>&1
+  ./node_modules/.bin/spec-gen decisions --gate 2>&1
   DECISIONS_EXIT=$?
 elif [ -f "./dist/cli/index.js" ]; then
-  node ./dist/cli/index.js decisions --consolidate --gate 2>&1
+  node ./dist/cli/index.js decisions --gate 2>&1
   DECISIONS_EXIT=$?
 else
   SPEC_GEN=$(command -v spec-gen 2>/dev/null)
   if [ -n "$SPEC_GEN" ]; then
-    "$SPEC_GEN" decisions --consolidate --gate 2>&1
+    "$SPEC_GEN" decisions --gate 2>&1
     DECISIONS_EXIT=$?
   else
     DECISIONS_EXIT=0
@@ -505,7 +506,44 @@ Examples:
         return;
       }
 
-      // Human-facing recap
+      // Interactive TUI approval when running in a terminal
+      if (options.gate && process.stdin.isTTY && process.stdout.isTTY && verified.length > 0) {
+        const results = await runTuiApproval(verified);
+
+        let gateStore = updatedStore;
+        for (const [id, decision] of results) {
+          if (decision === 'approved' || decision === 'rejected') {
+            gateStore = patchDecision(gateStore, id, {
+              status: decision,
+              reviewedAt: new Date().toISOString(),
+            });
+          }
+        }
+        await saveDecisionStore(rootPath, gateStore);
+
+        const stillPending = verified.filter(
+          (d) => !results.has(d.id) || results.get(d.id) === 'skipped',
+        );
+        const approved = verified.filter((d) => results.get(d.id) === 'approved');
+        const rejected = verified.filter((d) => results.get(d.id) === 'rejected');
+
+        if (approved.length > 0) {
+          console.log(`\n${approved.length} decision(s) approved. Run "spec-gen decisions --sync" to write to spec.md.`);
+        }
+        if (rejected.length > 0) {
+          console.log(`${rejected.length} decision(s) rejected.`);
+        }
+        if (stillPending.length > 0) {
+          logger.warning(`${stillPending.length} decision(s) still pending — commit blocked.`);
+          process.exitCode = 1;
+        }
+
+        displayMissing(missing);
+        if (missing.length > 0) process.exitCode = 1;
+        return;
+      }
+
+      // Non-TTY fallback: plain text recap
       logger.section('Architectural Decisions — Review Required');
 
       if (verified.length > 0) {
@@ -529,6 +567,7 @@ Examples:
         process.exitCode = 1;
       } else if (options.gate && verified.length > 0) {
         logger.warning('\nDecisions verified — approve them before syncing: spec-gen decisions --approve <id>');
+        process.exitCode = 1;
       }
       return;
     }

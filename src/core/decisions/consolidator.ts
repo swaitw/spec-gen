@@ -24,17 +24,22 @@ Rules:
 - Merge related decisions about the same topic into one when they are complementary
 - Typically produce 1-3 consolidated decisions; never more than 5
 - Preserve the original rationale and consequences from the drafts
-- proposedRequirement should be a single sentence in imperative form, or null
+- proposedRequirement should be a single sentence starting with "The system SHALL", or null
 
-A decision is only worth keeping if it would add a meaningful new requirement to a spec file.
-Do NOT produce decisions for:
-- Restatements of the existing tech stack ("use TypeScript", "follow existing patterns")
-- Trivial implementation details ("add a helper function", "rename a variable")
-- Generic best practices not specific to this project ("write tests", "handle errors")
-- Anything already obvious from the language or framework choice
+Keep a decision if it describes ANY of:
+- A new feature, command, flag, or capability added to the system
+- A change to where responsibility lives (which module/command owns what)
+- A choice between two viable approaches (even if the choice seems obvious in hindsight)
+- A behaviour that would surprise a future developer reading the code
+- A constraint or limitation deliberately introduced
 
-Good examples: "Switch from REST to GraphQL for the client API", "Introduce Redis as session store", "Replace direct DB calls with a repository layer in the auth domain"
-Bad examples: "Use TypeScript interfaces for type safety", "Follow existing service pattern", "Add error handling"
+Only discard decisions that are ALL of:
+- Pure refactors with no behaviour change (rename, extract helper, fix types)
+- AND already obvious from the surrounding code without explanation
+- AND recorded no rationale beyond "follow existing patterns"
+
+Good examples: "Move hook installation from decisions to setup command", "Use system prompt injection instead of tool-output blocking for completion guard", "Prefer local dist/cli/index.js over global spec-gen in pre-commit hook"
+Bad examples: "Use TypeScript interfaces for type safety", "Add error handling", "Follow existing service pattern"
 
 Respond with a JSON array only. Each element:
 {
@@ -47,7 +52,7 @@ Respond with a JSON array only. Each element:
   "supersededIds": string[]
 }
 
-If there are no meaningful architectural decisions, return [].`;
+If there are genuinely no decisions worth keeping, return [].`;
 
 interface ConsolidatedRaw {
   title: string;
@@ -98,7 +103,7 @@ export async function consolidateDrafts(
   const consolidated = parseJSON<ConsolidatedRaw[]>(raw, []);
 
   if (consolidated.length === 0 && drafts.length > 0) {
-    logger.warning(`consolidation returned 0 decisions from ${drafts.length} drafts — LLM may have returned empty or malformed JSON`);
+    logger.warning(`consolidation returned 0 decisions from ${drafts.length} drafts — LLM response: ${raw.slice(0, 300)}`);
   }
 
   const now = new Date().toISOString();
