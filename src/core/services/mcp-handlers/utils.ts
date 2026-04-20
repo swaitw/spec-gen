@@ -30,11 +30,7 @@ export async function validateDirectoryImpl(directory: string, maxDepth?: number
 
   // Validate directory traversal depth if maxDepth is specified
   if (maxDepth !== undefined) {
-    const depth = calculateDirectoryDepth(absDir);
-    if (depth > maxDepth) {
-      logger.error(`Directory validation failed: Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-      throw new Error(`Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
-    }
+    validateDirectoryDepth(absDir, maxDepth);
   }
 
   let s: Awaited<ReturnType<typeof stat>>;
@@ -56,6 +52,14 @@ function calculateDirectoryDepth(path: string): number {
   const normalizedPath = path.replace(/^\\|\\$/g, '');
   const segments = normalizedPath.split(/[\\/]/);
   return segments.length;
+}
+
+export function validateDirectoryDepth(absDir: string, maxDepth: number): void {
+  const depth = calculateDirectoryDepth(absDir);
+  if (depth > maxDepth) {
+    logger.error(`Directory validation failed: Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
+    throw new Error(`Directory depth ${depth} exceeds maximum allowed depth of ${maxDepth}`);
+  }
 }
 
 /**
