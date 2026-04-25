@@ -150,7 +150,7 @@ const FINGERPRINT_SOURCE_EXTS = new Set([
 async function walkForFingerprint(
   dir: string,
   root: string,
-  out: Array<{ path: string; mtime: number }>
+  out: Array<{ path: string; mtime: number; size: number }>
 ): Promise<void> {
   let entries;
   try {
@@ -166,7 +166,7 @@ async function walkForFingerprint(
     } else if (entry.isFile() && FINGERPRINT_SOURCE_EXTS.has(extname(entry.name))) {
       try {
         const s = await stat(join(dir, entry.name));
-        out.push({ path: relative(root, join(dir, entry.name)), mtime: s.mtimeMs });
+        out.push({ path: relative(root, join(dir, entry.name)), mtime: s.mtimeMs, size: s.size });
       } catch {
         // skip unreadable
       }
@@ -174,12 +174,12 @@ async function walkForFingerprint(
   }
 }
 
-/** Compute a SHA-256 fingerprint of all source file mtimes under rootDir. */
+/** Compute a SHA-256 fingerprint of all source file mtimes+sizes under rootDir. */
 export async function computeProjectFingerprint(rootDir: string): Promise<string> {
-  const files: Array<{ path: string; mtime: number }> = [];
+  const files: Array<{ path: string; mtime: number; size: number }> = [];
   await walkForFingerprint(rootDir, rootDir, files);
   files.sort((a, b) => a.path.localeCompare(b.path));
-  const payload = files.map(f => `${f.path}:${f.mtime}`).join('\n');
+  const payload = files.map(f => `${f.path}:${f.mtime}:${f.size}`).join('\n');
   return createHash('sha256').update(payload).digest('hex');
 }
 

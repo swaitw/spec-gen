@@ -290,12 +290,15 @@ export async function handleGetSubgraph(
   const subNodes = Array.from(visitedIds)
     .map(id => nodeMap.get(id)!)
     .filter(Boolean)
+    // stdlib nodes (Array.isArray, t.slice, …) are noise — exclude unless they are a seed
+    .filter(n => !n.isExternal || n.externalKind !== 'stdlib' || seeds.some(s => s.id === n.id))
     .map(n => ({
       name: n.isExternal ? `[external] ${n.name}` : n.name,
       file: n.filePath,
       className: n.className,
       fanIn: n.fanIn, fanOut: n.fanOut, language: n.language,
       isExternal: n.isExternal ?? false,
+      externalKind: n.externalKind,
       isSeed: seeds.some(s => s.id === n.id),
     }));
 

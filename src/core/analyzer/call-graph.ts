@@ -39,7 +39,7 @@ export type EdgeKind = 'calls' | 'tested_by';
 export type CallType =
   | 'direct'       // foo()
   | 'method'       // obj.method()
-  | 'async'        // await foo() or await obj.method()
+  | 'awaited'      // await foo() or await obj.method()
   | 'constructor'; // new Foo()
 
 /** Internal raw edge before resolution */
@@ -72,7 +72,12 @@ export interface FunctionNode {
   signature?: string;
   /** True for synthetic nodes representing unresolved external/stdlib calls (e.g. fetch, https.request) */
   isExternal?: boolean;
+  /** Classification of external node — used to filter stdlib noise from views */
+  externalKind?: ExternalKind;
 }
+
+/** Broad category of an external (unresolved) call */
+export type ExternalKind = 'http' | 'database' | 'filesystem' | 'stdlib' | 'unknown';
 
 export interface CallEdge {
   callerId: string;
@@ -654,7 +659,7 @@ async function extractTSGraph(
     // Detect call type from AST parent context
     let callType: CallType = objectCapture ? 'method' : 'direct';
     const parentType = nodeCapture.node.parent?.type;
-    if (parentType === 'await_expression') callType = 'async';
+    if (parentType === 'await_expression') callType = 'awaited';
     else if (parentType === 'new_expression') callType = 'constructor';
 
     rawEdges.push({
@@ -789,7 +794,7 @@ async function extractPyGraph(
     if (!caller) continue;
 
     // In Python tree-sitter, `await expr` wraps the call: parent type is 'await'
-    const callType: CallType = nodeCapture.node.parent?.type === 'await' ? 'async' : 'direct';
+    const callType: CallType = nodeCapture.node.parent?.type === 'await' ? 'awaited' : 'direct';
     rawEdges.push({
       callerId: caller.id,
       calleeName,
@@ -812,7 +817,7 @@ async function extractPyGraph(
     const caller = findEnclosingFunction(nodes, callPos);
     if (!caller) continue;
 
-    const methodCallType: CallType = nodeCapture.node.parent?.type === 'await' ? 'async' : 'method';
+    const methodCallType: CallType = nodeCapture.node.parent?.type === 'await' ? 'awaited' : 'method';
     rawEdges.push({
       callerId: caller.id,
       calleeName,
@@ -1727,11 +1732,34 @@ function isTestFile(filePath: string): boolean {
   return TEST_FILE_PATTERNS.some(p => p.test(filePath));
 }
 
+const EXTERNAL_HTTP_RE = /^(fetch|axios|got|superagent|node-fetch|ky|request|https?|xmlhttprequest|grpc|undici)$/;
+const EXTERNAL_DB_RE = /^(pg|mysql|mysql2|sqlite|sqlite3|redis|ioredis|mongoose|mongo|mongodb|prisma|knex|sequelize|typeorm|drizzle|cassandra|dynamodb|firestore|supabase|neo4j|influxdb|clickhouse|kysely)$/;
+const EXTERNAL_FS_RE = /^(fs|fsp|readfile|writefile|readdir|stat|mkdir|unlink|rename|copyfile|createreadstream|createwritestream)$/;
+const EXTERNAL_STDLIB_BASES = new Set([
+  'array', 'object', 'string', 'number', 'math', 'json', 'date', 'regexp',
+  'promise', 'map', 'set', 'weakmap', 'weakset', 'symbol', 'reflect', 'proxy',
+  'console', 'error', 'buffer', 'process', 'int8array', 'uint8array',
+]);
+const EXTERNAL_NOISE_RECEIVERS = new Set([
+  'response', 'body', 't', 'err', 'error', 'buf', 'str', 'res', 'req', 'data', 'result',
+]);
+
+function classifyExternal(name: string): ExternalKind {
+  const base = name.split('.')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (EXTERNAL_HTTP_RE.test(base)) return 'http';
+  if (EXTERNAL_DB_RE.test(base)) return 'database';
+  if (EXTERNAL_FS_RE.test(base)) return 'filesystem';
+  if (EXTERNAL_STDLIB_BASES.has(base)) return 'stdlib';
+  if (name.includes('.') && EXTERNAL_NOISE_RECEIVERS.has(name.split('.')[0].toLowerCase())) return 'stdlib';
+  return 'unknown';
+}
+
 function getOrCreateExternalNode(name: string, nodes: Map<string, FunctionNode>): FunctionNode {
   const id = `external::${name}`;
   if (!nodes.has(id)) {
     nodes.set(id, {
       id, name, filePath: 'external', isExternal: true,
+      externalKind: classifyExternal(name),
       isAsync: false, language: 'external',
       startIndex: 0, endIndex: 0, fanIn: 0, fanOut: 0,
     });

@@ -228,9 +228,15 @@ export async function uninstallPreCommitHook(rootPath: string): Promise<void> {
 
 const ANALYZE_HOOK_MARKER = 'spec-gen analyze';
 const ANALYZE_HOOK_ENTRY = {
-  _comment: 'spec-gen: keep call graph fresh after every file edit',
+  _comment: 'spec-gen: keep call graph fresh after every file edit (debounced 10s)',
   type: 'command',
-  command: 'spec-gen analyze --output .spec-gen/analysis 2>/dev/null & true',
+  command: [
+    'LOCK=.spec-gen/.analyze.lock;',
+    'if [ ! -f "$LOCK" ] || [ $(( $(date +%s) - $(cat "$LOCK" 2>/dev/null || echo 0) )) -gt 10 ]; then',
+    '  echo $(date +%s) > "$LOCK";',
+    '  spec-gen analyze --output .spec-gen/analysis 2>/dev/null & true;',
+    'fi',
+  ].join(' '),
 };
 
 export async function installClaudeHook(rootPath: string): Promise<void> {
