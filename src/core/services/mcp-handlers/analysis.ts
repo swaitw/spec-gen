@@ -8,8 +8,7 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import {
   DEFAULT_MAX_FILES,
   DEFAULT_DRIFT_MAX_FILES,
@@ -1013,7 +1012,23 @@ export async function handleGetCluster(
 // detect_changes
 // ============================================================================
 
-const execFileAsync = promisify(execFile);
+/** Run git with explicit stdio pipes — safe inside MCP server (which owns stdin/stdout). */
+function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const PATH = (process.env.PATH ?? '') + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
+    const child = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PATH },
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+    child.on('close', code => { if (code === 0) resolve(out); else reject(new Error(err || `exit ${code}`)); });
+    child.on('error', reject);
+  });
+}
 
 /**
  * Detect recently changed functions and rank them by blast radius (fanIn of callers via BFS).
@@ -1027,17 +1042,12 @@ export async function handleDetectChanges(
   const ctx = await readCachedContext(absDir);
   if (!ctx?.callGraph) return { error: 'No call graph. Run analyze_codebase first.' };
 
-  // Get git diff — changed file paths and line ranges
   const ref = base ?? 'HEAD';
   let diffOutput: string;
-  const GIT = process.env.GIT_EXEC_PATH ? `${process.env.GIT_EXEC_PATH}/git` : 'git';
-  const execOpts = { cwd: absDir, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, PATH: process.env.PATH ?? '/usr/bin:/bin:/usr/local/bin' } };
   try {
-    const { stdout } = await execFileAsync(GIT, ['diff', '--unified=0', ref, '--', '.'], execOpts);
-    diffOutput = stdout;
+    diffOutput = await runGit(['diff', '--unified=0', ref, '--', '.'], absDir);
     if (!diffOutput.trim()) {
-      const { stdout: staged } = await execFileAsync(GIT, ['diff', '--unified=0', '--cached', '--', '.'], execOpts);
-      diffOutput = staged;
+      diffOutput = await runGit(['diff', '--unified=0', '--cached', '--', '.'], absDir);
     }
   } catch (err) {
     return { error: `git diff failed: ${(err as Error).message}` };
