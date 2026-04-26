@@ -8,7 +8,9 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   DEFAULT_MAX_FILES,
   DEFAULT_DRIFT_MAX_FILES,
@@ -1014,19 +1016,29 @@ export async function handleGetCluster(
 
 /** Run git with explicit stdio pipes — safe inside MCP server (which owns stdin/stdout). */
 function runGit(args: string[], cwd: string): Promise<string> {
+  // Use shell file-redirect to temp files instead of pipes — libuv pipe() calls
+  // fail with EBADF inside the MCP server because its FD 0/1 are the JSON-RPC
+  // protocol sockets; avoiding pipe creation altogether sidesteps the issue.
   return new Promise((resolve, reject) => {
     const PATH = (process.env.PATH ?? '') + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
-    const child = spawn('git', args, {
+    const tmp = mkdtempSync(join(tmpdir(), 'sg-git-'));
+    const outPath = join(tmp, 'o');
+    const errPath = join(tmp, 'e');
+    const escaped = args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+    const cmd = `/usr/bin/git ${escaped} >'${outPath}' 2>'${errPath}'`;
+    const r = spawnSync('/bin/sh', ['-c', cmd], {
       cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: 'ignore',
       env: { ...process.env, PATH },
     });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
-    child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
-    child.on('close', code => { if (code === 0) resolve(out); else reject(new Error(err || `exit ${code}`)); });
-    child.on('error', reject);
+    let stdout = '';
+    let stderr = '';
+    try { stdout = readFileSync(outPath, 'utf8'); } catch { /* no output */ }
+    try { stderr = readFileSync(errPath, 'utf8'); } catch { /* no output */ }
+    rmSync(tmp, { recursive: true, force: true });
+    if (r.error) { reject(r.error); return; }
+    if ((r.status ?? 1) !== 0) { reject(new Error(stderr || `git exit ${r.status}`)); return; }
+    resolve(stdout);
   });
 }
 

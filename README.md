@@ -119,6 +119,8 @@ Scans your codebase using pure static analysis:
 - Detects HTTP cross-language edges: matches `fetch`/`axios`/`ky`/`got` calls in JS/TS files to FastAPI/Flask/Django route definitions in Python files, creating cross-language dependency edges with `exact`, `path`, or `fuzzy` confidence
 - Resolves Python absolute imports (`from services.retriever import X`) to local files
 - Synthesizes cross-file dependency edges from call-graph data for languages without file-level imports (Swift, C++), so the dependency graph and viewer are meaningful even in single-module projects
+- Builds a full call graph with **`tested_by` edges** derived from import analysis: each test file's imports map to the production functions it covers, making coverage queries accurate even for mock-heavy suites where call edges don't reach the unit under test
+- Runs **label-propagation community detection** on the call graph to group tightly coupled functions into clusters regardless of directory — powering `get_cluster` and the community colours in the graph viewer
 - Clusters related files into structural business domains automatically
 - Extracts DB schema tables (Prisma, TypeORM, Drizzle, SQLAlchemy), HTTP routes (Express, NestJS, Next.js, FastAPI, Flask), UI components (React, Vue, Svelte, Angular), middleware chains, and environment variables — saved as structured JSON artifacts in `.spec-gen/analysis/`
 - Generates AI tool config files (`CLAUDE.md`, `.cursorrules`, `.clinerules/`, `.vibe/skills/`, etc.) with `--ai-configs`
@@ -1224,6 +1226,8 @@ Most tools run on **pure static analysis** — no LLM quota consumed. Exceptions
 | `search_code` | Natural-language semantic search over indexed functions. Returns the closest matches by meaning with similarity score, call-graph neighbourhood enrichment, and spec-linked peer functions. Falls back to BM25 keyword search when no embedding server is configured. | Yes (+ embedding) |
 | `suggest_insertion_points` | Semantic search over the vector index to find the best existing functions to extend or hook into when implementing a new feature. Returns ranked candidates with role and strategy. Falls back to BM25 keyword search when no embedding server is configured. | Yes (+ embedding) |
 | `get_subgraph` | Depth-limited subgraph centred on a function. Direction: `downstream` (what it calls), `upstream` (who calls it), or `both`. Output as JSON or Mermaid diagram. External leaf nodes (e.g. `fetch`, `psycopg2.execute`) appear as `[external]` with an `externalKind` field (`http`, `database`, `filesystem`, `stdlib`, `unknown`). Stdlib noise (`Array.isArray`, `os.path.join`, `std::string`) is filtered out automatically; only semantically meaningful externals are shown. | Yes |
+| `get_minimal_context` | Return the minimum context needed to safely modify a function: its body, direct callers (signatures only), direct callees (signatures only), and which test files cover it via `tested_by` edges. Use this instead of `orient` when you already know exactly which function to modify — typically 200–600 tokens vs `orient`'s 2 000+. | Yes |
+| `get_cluster` | Return all functions in the same community (label-propagation cluster) as the given function. Tightly coupled functions land in the same cluster regardless of directory. Use this to understand the blast-radius neighbourhood without manual graph traversal. | Yes |
 | `trace_execution_path` | Find all call-graph paths between two functions (DFS, configurable depth/max-paths). Use this when debugging: "how does request X reach function Y?" Returns shortest path, all paths sorted by hops, and a step-by-step chain per path. | Yes |
 | `get_function_body` | Return the exact source code of a named function in a file. | No |
 | `get_function_skeleton` | Noise-stripped view of a source file: logs, inline comments, and non-JSDoc block comments removed. Signatures, control flow, return/throw, and call expressions preserved. Returns reduction %. | No |
@@ -1239,6 +1243,12 @@ Most tools run on **pure static analysis** — no LLM quota consumed. Exceptions
 | `get_ui_components` | Detected UI components with framework, props, and source file. Supports React, Vue, Svelte, and Angular. | Yes |
 | `get_env_vars` | Env vars referenced in source code with `required` (no fallback) and `hasDefault` flags. Supports JS/TS, Python, Go, and Ruby. | Yes |
 | `get_middleware_inventory` | Detected middleware with type (auth/cors/rate-limit/validation/logging/error-handler) and framework. | Yes |
+
+**Change analysis**
+
+| Tool | Description | Requires prior analysis |
+|------|-------------|:---:|
+| `detect_changes` | Detect recently changed functions and rank them by blast radius. Runs `git diff` against a base ref, maps changed lines to call-graph nodes, scores each function by `fanIn + transitive callers` (highest = riskiest to break), and reports test coverage per changed function via `tested_by` edges. First tool to run on any code-review or pre-merge check. | Yes |
 
 **Code quality**
 
@@ -1378,6 +1388,25 @@ minFanIn   number   Minimum fan-in threshold to be considered a hub (default: 3)
 **`get_architecture_overview`**
 ```
 directory  string   Absolute path to the project directory
+```
+
+**`get_minimal_context`**
+```
+directory     string   Absolute path to the project directory
+functionName  string   Exact function or method name
+filePath      string   Optional: relative file path to disambiguate when multiple functions share the name
+```
+
+**`get_cluster`**
+```
+directory     string   Absolute path to the project directory
+functionName  string   Function name to look up the community for
+```
+
+**`detect_changes`**
+```
+directory  string   Absolute path to the project directory
+base       string   Git ref to diff against (default: HEAD). Use "HEAD~1" for last commit, "main" for branch diff.
 ```
 
 **`get_function_skeleton`**
@@ -1566,6 +1595,19 @@ dryRun     boolean   Preview changes without writing files (default: false)
 5. approve_decision({ directory, ids: ["<id>"] })
 6. sync_decisions({ directory, dryRun: true })   # preview
 7. sync_decisions({ directory })                  # write to specs and ADRs
+```
+
+**Scenario G -- Code review / pre-merge safety check**
+```
+1. detect_changes({ directory, base: "main" })
+   # Ranks all functions changed since main by blast radius (fanIn + callers)
+   # Surfaces test coverage gaps on the riskiest changed functions
+2. get_minimal_context({ directory, functionName: "<high-risk fn>" })
+   # Body + callers + callees + covering tests — ~300 tokens, one call
+3. analyze_impact({ directory, symbol: "<high-risk fn>", depth: 3 })
+   # Full upstream chain + risk score for the function that scored highest
+4. get_cluster({ directory, functionName: "<high-risk fn>" })
+   # All functions in the same tightly-coupled community — review these too
 ```
 
 ---
