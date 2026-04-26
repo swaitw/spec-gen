@@ -79,6 +79,8 @@ export interface FunctionNode {
   isTest?: boolean;
   /** 1-based line number of the function start (computed from startIndex at build time) */
   startLine?: number;
+  /** 1-based line number of the function end (computed from endIndex at build time) */
+  endLine?: number;
   /** Label-propagation community ID (canonical node id of the community representative) */
   communityId?: string;
   /** Human-readable community label (name of the hub function in the community) */
@@ -1870,6 +1872,7 @@ export class CallGraphBuilder {
         };
         for (const node of result.nodes) {
           node.startLine = byteToLine(node.startIndex);
+          node.endLine = byteToLine(node.endIndex);
           allNodes.set(node.id, node);
         }
         allRawEdges.push(...result.rawEdges);

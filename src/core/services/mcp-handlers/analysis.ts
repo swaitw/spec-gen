@@ -984,9 +984,20 @@ export async function handleGetCluster(
 
   // Internal edges within community
   const memberIds = new Set(members.map(n => n.id));
-  const internalEdges = cg.edges
-    .filter(e => (!e.kind || e.kind === 'calls') && memberIds.has(e.callerId) && memberIds.has(e.calleeId))
-    .length;
+  const nameById = new Map(members.map(n => [n.id, n.name]));
+  const rawInternal = cg.edges
+    .filter(e => (!e.kind || e.kind === 'calls') && memberIds.has(e.callerId) && memberIds.has(e.calleeId));
+
+  // Deduplicate and take top 15 by callee fanIn (most structurally important edges first)
+  const seen = new Set<string>();
+  const callEdges: string[] = [];
+  for (const e of rawInternal) {
+    const key = `${e.callerId}→${e.calleeId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    callEdges.push(`${nameById.get(e.callerId)} → ${nameById.get(e.calleeId)}`);
+    if (callEdges.length >= 15) break;
+  }
 
   // Files the community spans
   const files = [...new Set(members.map(n => relative(absDir, n.filePath)))].sort();
@@ -997,9 +1008,11 @@ export async function handleGetCluster(
     stats: {
       members: members.length,
       files: files.length,
-      internalEdges,
+      internalEdges: rawInternal.length,
     },
     files,
+    // Internal call edges show WHY these functions cluster together
+    internalCallGraph: callEdges,
     functions: members.map(n => ({
       name: n.name,
       file: relative(absDir, n.filePath),
@@ -1091,8 +1104,10 @@ export async function handleDetectChanges(
   for (const [filePath, ranges] of changedLines) {
     const fileNodes = cg.nodes.filter(n => n.filePath === filePath && !n.isExternal && !n.isTest && n.startLine);
     for (const node of fileNodes) {
+      const fnEnd = node.endLine ?? node.startLine!;
       for (const [start, end] of ranges) {
-        if (node.startLine! <= end && (node.startLine! >= start || node.fanOut > 0)) {
+        // True overlap: changed range [start,end] intersects function [startLine,endLine]
+        if (node.startLine! <= end && fnEnd >= start) {
           changedFnIds.add(node.id);
         }
       }
@@ -1134,9 +1149,10 @@ export async function handleDetectChanges(
       name: n.name,
       file: relative(absDir, n.filePath),
       startLine: n.startLine ?? null,
+      endLine: n.endLine ?? null,
       fanIn: n.fanIn,
       blastRadius: radius,
-      riskScore: n.fanIn + radius * 2, // callers here + transitive callers weighted more
+      riskScore: n.fanIn + radius * 2,
       testedBy: cg.edges
         .filter(e => e.kind === 'tested_by' && e.callerId === id)
         .map(e => e.calleeName)
