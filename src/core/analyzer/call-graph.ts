@@ -12,6 +12,7 @@
  *  - Layer violations — cross-layer calls in the wrong direction
  */
 
+import { dirname, resolve as resolvePath } from 'node:path';
 import Parser from 'tree-sitter';
 import { FunctionRegistryTrie } from './function-registry-trie.js';
 import type { ImportMap } from './import-resolver-bridge.js';
@@ -2016,13 +2017,18 @@ export class CallGraphBuilder {
     }
 
     // Pass 3b: Derive tested_by edges — reverse edges from production fn ← test fn
+    // Source 1: call edges where the caller is a test function
     const callsEdges = edges.filter(e => !e.kind || e.kind === 'calls');
+    const testedByPairs = new Set<string>(); // deduplicate across sources
     for (const edge of callsEdges) {
       const caller = allNodes.get(edge.callerId);
       if (!caller || !isTestFile(caller.filePath)) continue;
       const callee = allNodes.get(edge.calleeId);
       // Only emit tested_by when the production fn is internal (not external, not a test helper)
       if (!callee || callee.isExternal || callee.isTest) continue;
+      const pairKey = `${edge.calleeId}\0${caller.filePath}`;
+      if (testedByPairs.has(pairKey)) continue;
+      testedByPairs.add(pairKey);
       edges.push({
         kind: 'tested_by',
         callerId: edge.calleeId,
@@ -2031,6 +2037,84 @@ export class CallGraphBuilder {
         confidence: edge.confidence,
         callType: undefined,
       });
+    }
+
+    // Source 2: import-based — every name imported by a test file from a production file.
+    // Catches mocked functions that are imported but never directly called in the test.
+    // Build a lightweight import map from file content (only test files, TS/JS).
+    const allFilePaths = files.map(f => f.path);
+    const NAMED_IMPORT_RE = /^\s*import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"](\.[^'"]+)['"]/gm;
+    const DEFAULT_IMPORT_RE = /^\s*import\s+(?:type\s+)?(\w+)\s+from\s+['"](\.[^'"]+)['"]/gm;
+    for (const file of files) {
+      if (!isTestFile(file.path)) continue;
+      if (file.language !== 'TypeScript' && file.language !== 'JavaScript') continue;
+      const dir = dirname(file.path);
+      const resolveSource = (rel: string): string | undefined => {
+        // Strip .js extension: TS ESM imports use './foo.js' to refer to './foo.ts'
+        const stripped = rel.replace(/\.js$/, '');
+        const base = resolvePath(dir, stripped);
+        return allFilePaths.find(p =>
+          p === base || p === `${base}.ts` || p === `${base}.tsx` ||
+          p === `${base}.js` || p === `${base}.jsx` || p === `${base}/index.ts`,
+        );
+      };
+      const testLabel = file.path.split('/').pop()!.replace(/\.[tj]sx?$/, '');
+      const emitEdge = (name: string, sourceFile: string) => {
+        const candidates = trie.findBySimpleName(name)
+          .filter(n => n.filePath === sourceFile && !n.isTest && !n.isExternal);
+        for (const callee of candidates) {
+          const pairKey = `${callee.id}\0${file.path}`;
+          if (testedByPairs.has(pairKey)) continue;
+          testedByPairs.add(pairKey);
+          edges.push({
+            kind: 'tested_by',
+            callerId: callee.id,
+            calleeId: `${file.path}::*`,
+            calleeName: testLabel,
+            confidence: 'import',
+            callType: undefined,
+          });
+        }
+      };
+      // Named imports: import { foo, bar as baz } from './module'
+      for (const m of file.content.matchAll(NAMED_IMPORT_RE)) {
+        const sourceFile = resolveSource(m[2]);
+        if (!sourceFile) continue;
+        for (const part of m[1].split(',')) {
+          const name = (part.match(/\bas\s+(\w+)/) ?? part.match(/(\w+)/))?.[1]?.trim();
+          if (name) emitEdge(name, sourceFile);
+        }
+      }
+      // Default imports: import foo from './module'
+      for (const m of file.content.matchAll(DEFAULT_IMPORT_RE)) {
+        const sourceFile = resolveSource(m[2]);
+        if (!sourceFile) continue;
+        emitEdge(m[1], sourceFile);
+      }
+    }
+
+    // Also apply caller-provided importMap if present (cross-language coverage)
+    if (importMap) {
+      for (const [testFilePath, imports] of importMap) {
+        if (!isTestFile(testFilePath)) continue;
+        for (const [importedName, sourceFile] of imports) {
+          const candidates = trie.findBySimpleName(importedName)
+            .filter(n => n.filePath === sourceFile && !n.isTest && !n.isExternal);
+          for (const callee of candidates) {
+            const pairKey = `${callee.id}\0${testFilePath}`;
+            if (testedByPairs.has(pairKey)) continue;
+            testedByPairs.add(pairKey);
+            edges.push({
+              kind: 'tested_by',
+              callerId: callee.id,
+              calleeId: `${testFilePath}::*`,
+              calleeName: testFilePath.split('/').pop()!.replace(/\.[tj]sx?$/, ''),
+              confidence: 'import',
+              callType: undefined,
+            });
+          }
+        }
+      }
     }
 
     // Pass 4: Derive hub functions, entry points, layer violations
