@@ -2009,6 +2009,12 @@ export class CallGraphBuilder {
       if (callee) callee.fanIn++;
     }
 
+    // Pass 4 (prep): Mark test-file nodes before tested_by derivation
+    const nodes = Array.from(allNodes.values());
+    for (const n of nodes) {
+      if (!n.isExternal && isTestFile(n.filePath)) n.isTest = true;
+    }
+
     // Pass 3b: Derive tested_by edges — reverse edges from production fn ← test fn
     const callsEdges = edges.filter(e => !e.kind || e.kind === 'calls');
     for (const edge of callsEdges) {
@@ -2029,11 +2035,6 @@ export class CallGraphBuilder {
 
     // Pass 4: Derive hub functions, entry points, layer violations
     // External and test nodes are excluded from structural stats
-    const nodes = Array.from(allNodes.values());
-    // Mark test-file nodes so consumers can filter them
-    for (const n of nodes) {
-      if (!n.isExternal && isTestFile(n.filePath)) n.isTest = true;
-    }
     const internalNodes = nodes.filter(n => !n.isExternal && !n.isTest);
 
     const hubFunctions = internalNodes
