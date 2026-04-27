@@ -287,23 +287,26 @@ export async function handleGetSubgraph(
   }
 
   const nodeMap = new Map(cg.nodes.map(n => [n.id, n]));
-  const subNodes = Array.from(visitedIds)
+  const visibleNodes = Array.from(visitedIds)
     .map(id => nodeMap.get(id)!)
     .filter(Boolean)
     // stdlib nodes (Array.isArray, t.slice, …) are noise — exclude unless they are a seed
-    .filter(n => !n.isExternal || n.externalKind !== 'stdlib' || seeds.some(s => s.id === n.id))
-    .map(n => ({
-      name: n.isExternal ? `[external] ${n.name}` : n.name,
-      file: n.filePath,
-      className: n.className,
-      fanIn: n.fanIn, fanOut: n.fanOut, language: n.language,
-      isExternal: n.isExternal ?? false,
-      externalKind: n.externalKind,
-      isSeed: seeds.some(s => s.id === n.id),
-    }));
+    .filter(n => !n.isExternal || n.externalKind !== 'stdlib' || seeds.some(s => s.id === n.id));
+
+  const visibleIds = new Set(visibleNodes.map(n => n.id));
+
+  const subNodes = visibleNodes.map(n => ({
+    name: n.isExternal ? `[external] ${n.name}` : n.name,
+    file: n.filePath,
+    className: n.className,
+    fanIn: n.fanIn, fanOut: n.fanOut, language: n.language,
+    isExternal: n.isExternal ?? false,
+    externalKind: n.externalKind,
+    isSeed: seeds.some(s => s.id === n.id),
+  }));
 
   const subEdges = cg.edges
-    .filter(e => e.calleeId && visitedIds.has(e.callerId) && visitedIds.has(e.calleeId))
+    .filter(e => e.calleeId && visibleIds.has(e.callerId) && visibleIds.has(e.calleeId))
     .map(e => ({
       caller: nodeMap.get(e.callerId)?.name ?? e.callerId,
       callee: nodeMap.get(e.calleeId)?.isExternal
@@ -501,7 +504,7 @@ export async function handleGetLeafFunctions(
 
   const cg = ctx.callGraph as SerializedCallGraph;
   const hasOutgoing = new Set(cg.edges.filter(e => e.calleeId).map(e => e.callerId));
-  let leaves = cg.nodes.filter(n => !n.isExternal && !hasOutgoing.has(n.id));
+  let leaves = cg.nodes.filter(n => !n.isExternal && !n.isTest && !hasOutgoing.has(n.id));
 
   if (filePattern) leaves = leaves.filter(n => n.filePath.includes(filePattern));
 
@@ -551,7 +554,7 @@ export async function handleGetCriticalHubs(
   );
 
   const hubs = cg.nodes
-    .filter(n => !n.isExternal && (n.fanIn ?? 0) >= minFanIn)
+    .filter(n => !n.isExternal && !n.isTest && (n.fanIn ?? 0) >= minFanIn)
     .map(n => {
       const fanIn        = n.fanIn  ?? 0;
       const fanOut       = n.fanOut ?? 0;
@@ -592,7 +595,7 @@ export async function handleGetCriticalHubs(
     .slice(0, limit);
 
   return {
-    totalHubs: cg.nodes.filter(n => !n.isExternal && (n.fanIn ?? 0) >= minFanIn).length,
+    totalHubs: cg.nodes.filter(n => !n.isExternal && !n.isTest && (n.fanIn ?? 0) >= minFanIn).length,
     returned: hubs.length, minFanIn, hubs,
     guidance: 'Start with hubs that have the highest stabilityScore (easiest wins). Defer hubs with stabilityScore < 30 until their dependencies are cleaner.',
   };
@@ -617,7 +620,7 @@ export async function handleGetGodFunctions(
   if (filePath) {
     candidates = getFileGodFunctions(cg, filePath, fanOutThreshold);
   } else {
-    candidates = cg.nodes.filter(n => !n.isExternal && n.fanOut >= fanOutThreshold);
+    candidates = cg.nodes.filter(n => !n.isExternal && !n.isTest && n.fanOut >= fanOutThreshold);
   }
 
   if (candidates.length === 0) {
