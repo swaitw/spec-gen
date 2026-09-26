@@ -1,0 +1,206 @@
+/**
+ * Streaming JSON artifact writer (change: bulletproof-background-index).
+ *
+ * The output must be byte-identical to `JSON.stringify(value, null, 2)`. That is not a stylistic
+ * preference: the traversal index is invalidated by a digest OF THESE BYTES, so one differing space
+ * would orphan it on every read — silently, and forever, since the digest can never match again.
+ *
+ * So every test here is a differential oracle against `JSON.stringify` itself, run at a split
+ * threshold low enough that nearly everything takes the split path. Which subtrees get split is a
+ * memory decision that cannot change the output, and the last test pins that: the same value split
+ * aggressively and split not at all must produce the same bytes.
+ */
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { readFile, rm, mkdtemp } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  stringifyStreamingForTesting as streamed,
+  writeJsonAtomicStreaming,
+  _setSplitMinArrayItemsForTesting,
+} from './json-stream.js';
+
+let restore = 0;
+beforeEach(() => { restore = _setSplitMinArrayItemsForTesting(1); });
+afterEach(() => { _setSplitMinArrayItemsForTesting(restore); });
+
+const same = (v: unknown, label: string): void => {
+  expect(streamed(v), label).toBe(JSON.stringify(v, null, 2));
+};
+
+describe('streaming JSON — identical to JSON.stringify(value, null, 2)', () => {
+  it('scalars and null', () => {
+    for (const v of [null, true, false, 0, -0, 1, -1, 1.5, 1e21, 1e-7, '', 'x']) {
+      same(v, `scalar ${String(v)}`);
+    }
+  });
+
+  it('non-finite numbers become null', () => {
+    same({ a: NaN, b: Infinity, c: -Infinity }, 'non-finite');
+  });
+
+  it('empty containers', () => {
+    same({}, 'empty object');
+    same([], 'empty array');
+    same({ a: {}, b: [], c: [[]], d: { e: {} } }, 'nested empties');
+  });
+
+  it('an object value that is undefined is OMITTED', () => {
+    same({ a: 1, b: undefined, c: 3 }, 'undefined value');
+    same({ a: undefined }, 'only undefined values');
+    same({ a: undefined, b: 2 }, 'leading undefined');
+    same({ a: 1, b: undefined }, 'trailing undefined — comma placement');
+  });
+
+  it('functions and symbols are dropped from objects', () => {
+    same({ a: 1, f: () => 1, s: Symbol('x'), b: 2 }, 'function/symbol values');
+  });
+
+  it('an ARRAY hole is null, not omitted — positions must not shift', () => {
+    same([1, undefined, 3], 'undefined in array');
+    same([1, () => 1, 3], 'function in array');
+    // eslint-disable-next-line no-sparse-arrays
+    same([1, , 3], 'sparse array');
+  });
+
+  it('keys needing escapes, and unicode', () => {
+    same({ 'a b': 1, 'q"uote': 2, 'new\nline': 3, 'tab\t': 4, '🎉': 5 }, 'escaped keys');
+    same({ v: 'quote " backslash \\ newline \n emoji 🎉 nul \0' }, 'escaped values');
+  });
+
+  it('toJSON is honored', () => {
+    same({ d: new Date('2026-07-31T12:00:00.000Z') }, 'Date toJSON');
+    same({ x: { toJSON: () => ({ replaced: [1, 2, 3] }) } }, 'custom toJSON');
+    same([{ toJSON: () => 'scalar' }], 'toJSON returning a scalar');
+    same({ x: { toJSON: () => undefined } }, 'toJSON returning undefined');
+  });
+
+  it('deep nesting past the split depth', () => {
+    let v: unknown = { leaf: [1, 2, 3] };
+    for (let i = 0; i < 8; i++) v = { [`level${i}`]: [v, v] };
+    same(v, 'deep nesting');
+  });
+
+  it('an artifact-shaped object', () => {
+    same({
+      version: 2,
+      generatedAt: '2026-07-31T00:00:00.000Z',
+      cfgs: undefined,
+      callGraph: {
+        nodes: Array.from({ length: 60 }, (_, i) => ({
+          id: `src/f${i}.ts::fn${i}`,
+          name: `fn${i}`,
+          filePath: `src/f${i}.ts`,
+          isAsync: i % 3 === 0,
+          fanIn: i,
+          fanOut: 60 - i,
+          docstring: i % 5 === 0 ? 'Does "the" thing.\nOn two lines.' : undefined,
+        })),
+        edges: Array.from({ length: 80 }, (_, i) => ({ from: `a${i}`, to: `b${i}`, kind: 'call' })),
+      },
+      statistics: { total: 60, empty: {}, none: null },
+    }, 'artifact shape');
+  });
+
+  it('agrees on randomized structures', () => {
+    let seed = 0xa11ce;
+    const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+
+    const gen = (depth: number): unknown => {
+      const r = rnd();
+      if (depth > 4 || r < 0.3) {
+        const leafPick = rnd();
+        if (leafPick < 0.15) return null;
+        if (leafPick < 0.3) return Math.floor(rnd() * 1000) - 500;
+        if (leafPick < 0.4) return rnd() < 0.5;
+        if (leafPick < 0.5) return undefined;
+        if (leafPick < 0.55) return NaN;
+        return `s${Math.floor(rnd() * 1e6)}${rnd() < 0.2 ? '"\n\t🎉' : ''}`;
+      }
+      if (r < 0.65) return Array.from({ length: Math.floor(rnd() * 6) }, () => gen(depth + 1));
+      const o: Record<string, unknown> = {};
+      for (let i = 0; i < Math.floor(rnd() * 6); i++) o[`k${i}${rnd() < 0.2 ? ' "x"' : ''}`] = gen(depth + 1);
+      return o;
+    };
+
+    for (let t = 0; t < 400; t++) {
+      const v = gen(0);
+      expect(streamed(v), `trial ${t}: ${JSON.stringify(v)?.slice(0, 200)}`)
+        .toBe(JSON.stringify(v, null, 2));
+    }
+  });
+
+  it('splitting aggressively and not at all produce the same bytes', () => {
+    // The split rule is a memory decision only. If it could change output, the digest of a
+    // large artifact would differ from that of a small one for no reason the user could see.
+    const value = {
+      nodes: Array.from({ length: 200 }, (_, i) => ({ id: i, tags: ['a', 'b'], meta: { x: i } })),
+      nested: { deep: { deeper: { deepest: Array.from({ length: 50 }, (_, i) => i) } } },
+    };
+    _setSplitMinArrayItemsForTesting(1);
+    const aggressive = streamed(value);
+    _setSplitMinArrayItemsForTesting(1_000_000);
+    const never = streamed(value);
+    expect(aggressive).toBe(never);
+    expect(aggressive).toBe(JSON.stringify(value, null, 2));
+  });
+});
+
+describe('writeJsonAtomicStreaming', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'ol-jsonstream-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('writes the same bytes JSON.stringify would, and returns their digest', async () => {
+    const value = {
+      nodes: Array.from({ length: 500 }, (_, i) => ({ id: `n${i}`, body: 'x'.repeat(64) })),
+      meta: { ok: true },
+    };
+    const path = join(dir, 'artifact.json');
+    const digest = await writeJsonAtomicStreaming(path, value);
+
+    const onDisk = await readFile(path, 'utf-8');
+    expect(onDisk).toBe(JSON.stringify(value, null, 2));
+
+    // The digest must be over exactly those bytes — the traversal index is keyed on it.
+    expect(digest).toBe(createHash('sha256').update(Buffer.from(onDisk, 'utf-8')).digest('hex'));
+  });
+
+  it('spans many flush buffers without corrupting a boundary', async () => {
+    // The buffer flushes at 4 MB; a fixture below that never exercises the boundary at all.
+    const value = Array.from({ length: 120_000 }, (_, i) => ({ i, s: `value-${i}-🎉` }));
+    const path = join(dir, 'big.json');
+    const digest = await writeJsonAtomicStreaming(path, value);
+    const onDisk = await readFile(path, 'utf-8');
+    expect(onDisk.length).toBeGreaterThan(4 * 1024 * 1024);
+    expect(onDisk).toBe(JSON.stringify(value, null, 2));
+    expect(digest).toBe(createHash('sha256').update(Buffer.from(onDisk, 'utf-8')).digest('hex'));
+  });
+
+  it('multi-byte characters survive a flush boundary intact', async () => {
+    // Buffering is by CHARACTER and the flush converts to UTF-8, so a boundary must not be able to
+    // split a surrogate pair. Fill with 4-byte emoji so boundaries land inside them often.
+    const value = { s: Array.from({ length: 400_000 }, () => '🎉').join('') };
+    const path = join(dir, 'emoji.json');
+    await writeJsonAtomicStreaming(path, value);
+    const onDisk = await readFile(path, 'utf-8');
+    expect(onDisk).toBe(JSON.stringify(value, null, 2));
+    expect(onDisk).not.toContain('�'); // no replacement characters from a torn pair
+  });
+
+  it('leaves no temp file behind, and the previous artifact survives a failure', async () => {
+    const path = join(dir, 'a.json');
+    await writeJsonAtomicStreaming(path, { first: true });
+    const before = await readFile(path, 'utf-8');
+
+    const circular: Record<string, unknown> = { a: 1 };
+    circular.self = circular;
+    await expect(writeJsonAtomicStreaming(path, circular)).rejects.toThrow();
+
+    expect(await readFile(path, 'utf-8'), 'a failed write clobbered the committed artifact').toBe(before);
+    const { readdir } = await import('node:fs/promises');
+    expect((await readdir(dir)).filter(f => f.includes('.tmp-'))).toEqual([]);
+  });
+});

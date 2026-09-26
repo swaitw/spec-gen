@@ -135,6 +135,39 @@ export async function POST(request: Request) {
     // path should be derived from directory
     expect(routes[0].path).toBe('/users');
   });
+
+  // Regression: the analyze pipeline passes REPO-RELATIVE paths that START with the
+  // `app/` segment (e.g. `app/api/posts/route.ts`, no leading slash).
+  // `lastIndexOf('/app/')` missed that leading segment and collapsed the route to
+  // `/`, silently breaking the route inventory and the cross-service edge for every
+  // Next.js App Router repo. Reproduced by reading via a path relative to the app dir.
+  it('derives the route path from a path that starts with the app/ segment', async () => {
+    await createFile(tmpDir, 'app/api/posts/route.ts', `
+export async function GET(request: Request) { return Response.json([]); }
+`);
+    const cwd = process.cwd();
+    try {
+      process.chdir(tmpDir);
+      const routes = await extractTsRouteDefinitions('app/api/posts/route.ts');
+      expect(routes.map(r => r.path)).toEqual(['/api/posts']);
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  it('derives a dynamic-segment route path from an app/-leading relative path', async () => {
+    await createFile(tmpDir, 'app/users/[id]/route.ts', `
+export async function GET(request: Request) { return Response.json({}); }
+`);
+    const cwd = process.cwd();
+    try {
+      process.chdir(tmpDir);
+      const routes = await extractTsRouteDefinitions('app/users/[id]/route.ts');
+      expect(routes[0].path).toBe('/users/:id');
+    } finally {
+      process.chdir(cwd);
+    }
+  });
 });
 
 describe('extractTsRouteDefinitions – Express prefix accumulation', () => {
@@ -322,6 +355,60 @@ router.get('/ping', (req, res) => {
     expect(get).toBeDefined();
     expect(get!.contractSource).toBe('none');
     expect(get!.requestBodyType).toBeUndefined();
+  });
+});
+
+// Regression (fix-route-anchor-fidelity): route lines were computed against a
+// SHRUNKEN skeleton (comment/log/blank lines removed) but consumed against the
+// ORIGINAL file bytes, so any comment/log preamble above a route drifted its
+// reported line — silently dropping or mis-attributing the synthesized
+// route-handler edge and surfacing live handlers as false dead-code. The mask is
+// now length-preserving, so `route.line` is exact by construction.
+describe('extractTsRouteDefinitions — line fidelity under a comment/log preamble', () => {
+  let tmpDir: string;
+  beforeEach(async () => { tmpDir = await createTempDir(); });
+  afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
+
+  it('reports the TRUE line for a route beneath a copyright block, a comment, and a log line', async () => {
+    const content = [
+      '/*',                                            // 1
+      ' * Copyright 2026 Example Corp.',               // 2
+      ' * All rights reserved.',                       // 3
+      ' */',                                           // 4
+      '// Route wiring module.',                       // 5
+      "console.log('booting route module');",          // 6
+      '',                                              // 7
+      'function listUsers(req, res) { res.send([]); }', // 8
+      '',                                              // 9
+      'function setup(app) {',                         // 10
+      "  app.get('/users', listUsers);",               // 11  <- the true line
+      '}',                                             // 12
+    ].join('\n');
+    const fp = await createFile(tmpDir, 'server.ts', content);
+    const routes = await extractTsRouteDefinitions(fp);
+    const route = routes.find(r => r.path === '/users');
+    expect(route).toBeDefined();
+    // Exact: not the drifted skeleton line (which lands above `setup`, dropping the edge).
+    expect(route!.line).toBe(11);
+    // The registration line the handler-name lookup reads is the real one.
+    expect(route!.handlerName).toBe('listUsers');
+  });
+
+  it('still suppresses a route pattern that appears only inside a comment (no false route)', async () => {
+    const content = [
+      "import express from 'express';",
+      'const app = express();',
+      "// app.get('/example', exampleHandler);  a doc example, not a real route",
+      "app.get('/real', realHandler); /* app.post('/inline', h) is only a comment */",
+    ].join('\n');
+    const fp = await createFile(tmpDir, 'app.ts', content);
+    const routes = await extractTsRouteDefinitions(fp);
+    const paths = routes.map(r => r.path);
+    expect(paths).toContain('/real');
+    expect(paths).not.toContain('/example');
+    expect(paths).not.toContain('/inline');
+    // And the surviving real route keeps its exact line (4).
+    expect(routes.find(r => r.path === '/real')!.line).toBe(4);
   });
 });
 

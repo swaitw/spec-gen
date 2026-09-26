@@ -12,6 +12,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { toRepositoryPath } from '../analyzer/file-walker.js';
 import { fileExists } from '../../utils/command-helpers.js';
 import type { ParsedScenario, GeneratedTestFile, TestFramework, FunctionRef } from '../../types/test-generator.js';
 import type { LLMService } from '../services/llm-service.js';
@@ -19,8 +20,9 @@ import { matchThenClauses } from './then-matchers.js';
 import type { ThenMatch } from './then-matchers.js';
 import { renderTests } from './renderers/index.js';
 import { toKebabCase } from './scenario-parser.js';
-import { toSnakeCase } from './renderers/shared.js';
+import { toSnakeCase, toPascalCase } from './renderers/shared.js';
 import { FRAMEWORK_EXTENSIONS } from '../../types/test-generator.js';
+import { protectPrompt } from '../../utils/prompt-boundary.js';
 
 // ============================================================================
 // TYPES
@@ -90,6 +92,8 @@ async function enrichWithLlm(
     pytest: 'pytest (Python) — use assert statements',
     gtest: 'Google Test (C++) — use EXPECT_EQ, EXPECT_TRUE, EXPECT_EQ etc.',
     catch2: 'Catch2 (C++) — use REQUIRE, CHECK macros',
+    junit: 'JUnit 5 (Java) — use assertEquals, assertTrue, assertNotNull, assertThrows (static imports)',
+    gotest: 'Go testing (standard library) — use t.Errorf / t.Fatal with if-condition checks, no assert library',
   };
 
   const systemPrompt =
@@ -97,7 +101,7 @@ async function enrichWithLlm(
     `Framework: ${frameworkHint[framework]}. ` +
     `Return ONLY valid assertion lines, one per line, no prose, no backticks.`;
 
-  const userPrompt =
+  const untrustedContent =
     `Scenario: ${scenario.domain} / ${scenario.requirement} / ${scenario.scenarioName}\n\n` +
     `GIVEN:\n${scenario.given.map((g) => `  - ${g}`).join('\n')}\n\n` +
     `WHEN:\n${scenario.when.map((w) => `  - ${w}`).join('\n')}\n\n` +
@@ -106,11 +110,11 @@ async function enrichWithLlm(
     (snippets
       ? `\n\nRelated implementation:\n\`\`\`\n${snippets}\n\`\`\``
       : '');
+  const prompts = protectPrompt(systemPrompt, untrustedContent);
 
   try {
     const response = await llm.complete({
-      systemPrompt,
-      userPrompt,
+      ...prompts,
       maxTokens: 512,
     });
 
@@ -162,6 +166,15 @@ function outputFilename(
   }
   if (framework === 'gtest' || framework === 'catch2') {
     return `${toSnakeCase(domain)}/${toSnakeCase(requirement)}_test.cpp`;
+  }
+  if (framework === 'gotest') {
+    return `${toSnakeCase(domain)}/${toSnakeCase(requirement)}_test.go`;
+  }
+  if (framework === 'junit') {
+    // Java requires the public class name to match the file basename; the
+    // junit renderer emits `class <Requirement>Test`, so the file must be
+    // `<Requirement>Test.java` (PascalCase, no kebab/snake separators).
+    return `${toPascalCase(domain)}/${toPascalCase(requirement)}Test.java`;
   }
   return `${toKebabCase(domain)}/${toKebabCase(requirement)}${ext}`;
 }
@@ -229,7 +242,11 @@ export async function generateTests(
     );
 
     const relPath = outputFilename(domain, requirement, framework);
-    const outputPath = join(outputDir, relPath);
+    // Repository-relative and POSIX-separated on every platform: the descriptor is
+    // printed, compared, and re-resolved against the root, so a generated plan must not
+    // differ between a Windows and a POSIX run of the same repository. `resolve()`
+    // accepts `/` on Windows, so the write target is unchanged.
+    const outputPath = toRepositoryPath(join(outputDir, relPath));
 
     files.push({
       outputPath,

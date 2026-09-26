@@ -27,7 +27,7 @@ vi.mock('../../core/drift/index.js', () => ({
 }));
 
 vi.mock('../../core/services/config-manager.js', () => ({
-  readSpecGenConfig: vi.fn(),
+  readOpenLoreConfig: vi.fn(),
 }));
 
 vi.mock('../../core/analyzer/vector-index.js', () => ({
@@ -45,7 +45,7 @@ vi.mock('../../core/analyzer/embedding-service.js', () => ({
   },
 }));
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EdgeStore } from '../../core/services/edge-store.js';
 import {
@@ -63,11 +63,12 @@ import {
   handleGetCriticalHubs,
   handleCheckSpecDrift,
   handleSuggestInsertionPoints,
+  selectActiveTools,
+  TOOL_DEFINITIONS,
 } from './mcp.js';
 import { VectorIndex } from '../../core/analyzer/vector-index.js';
 import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
 import type { SerializedCallGraph, FunctionNode } from '../../core/analyzer/call-graph.js';
-import type { MappingArtifact } from '../../core/generator/mapping-generator.js';
 import type { FileSignatureMap } from '../../core/analyzer/signature-extractor.js';
 import type { DriftResult } from '../../types/index.js';
 import {
@@ -77,7 +78,39 @@ import {
   buildADRMap,
   detectDrift,
 } from '../../core/drift/index.js';
-import { readSpecGenConfig } from '../../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../../core/services/config-manager.js';
+
+/**
+ * Remove a fixture directory, tolerating a handle Windows will not let us delete around.
+ *
+ * POSIX unlinks an open file happily; Windows refuses with EBUSY/EPERM until the last
+ * handle closes. These fixtures contain call-graph.db, and the handlers under test keep a
+ * cached store open by design (that cache is the point of the serving hot path), so a
+ * plain rm raced it and 58 tests in this file failed in teardown rather than on an
+ * assertion — the failure said EBUSY and named a temp path, which reads as nothing to do
+ * with the behaviour being tested.
+ *
+ * Deletion is not what any test here asserts, so it retries briefly and then gives up
+ * quietly: a leftover temp directory is the OS's problem, a failing afterEach is ours.
+ * SQLite's -shm/-wal siblings clear the same way once the connection goes.
+ */
+async function removeFixture(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { await rm(dir, { recursive: true, force: true }); return; }
+    catch { await new Promise((r) => setTimeout(r, 100)); }
+  }
+}
+
+describe('spec workflow composite presets', () => {
+  it('exposes both composites by default and in full, but not in navigation-only', () => {
+    const names = (preset?: string) => selectActiveTools(TOOL_DEFINITIONS, preset ? { preset } : {}).map(tool => tool.name);
+    for (const name of ['prepare_spec_generation', 'prepare_spec_repair']) {
+      expect(names()).toContain(name);
+      expect(names('full')).toContain(name);
+      expect(names('navigation')).not.toContain(name);
+    }
+  });
+});
 
 // ============================================================================
 // Fixture helpers
@@ -135,7 +168,7 @@ async function writeCacheFixture(
   callGraph: object,
   signatures: FileSignatureMap[] = []
 ) {
-  const analysisDir = join(dir, '.spec-gen', 'analysis');
+  const analysisDir = join(dir, '.openlore', 'analysis');
   await mkdir(analysisDir, { recursive: true });
   await writeFile(
     join(analysisDir, 'llm-context.json'),
@@ -154,36 +187,32 @@ async function writeCacheFixture(
   }
 }
 
-async function writeMappingFixture(dir: string, mapping: MappingArtifact) {
-  const analysisDir = join(dir, '.spec-gen', 'analysis');
+/**
+ * Seed the INPUTS the deterministic link index derives from: the current graph
+ * plus specs carrying exact `name::path` anchors. `mapping.json` is a cache, so
+ * no fixture writes it.
+ */
+async function writeLinkIndexFixture(dir: string) {
+  const analysisDir = join(dir, '.openlore', 'analysis');
   await mkdir(analysisDir, { recursive: true });
-  await writeFile(join(analysisDir, 'mapping.json'), JSON.stringify(mapping), 'utf-8');
-}
+  await writeFile(join(analysisDir, 'dependency-graph.json'), JSON.stringify({
+    nodes: [
+      { file: { path: 'src/auth/auth.ts' }, exports: [{ name: 'authenticate', kind: 'function', line: 10, isType: false }] },
+      { file: { path: 'src/orders/service.ts' }, exports: [{ name: 'placeOrder', kind: 'function', line: 50, isType: false }] },
+      { file: { path: 'src/utils/legacy.ts' }, exports: [{ name: 'oldHelper', kind: 'function', line: 5, isType: false }] },
+    ],
+    edges: [], clusters: [], structuralClusters: [], rankings: {}, cycles: [], statistics: {},
+  }), 'utf-8');
 
-function makeMapping(): MappingArtifact {
-  return {
-    generatedAt: '2026-01-01T00:00:00Z',
-    mappings: [
-      {
-        requirement: 'Authenticate User',
-        service: 'AuthService',
-        domain: 'auth',
-        specFile: 'openspec/specs/auth/spec.md',
-        functions: [{ name: 'authenticate', file: 'src/auth/auth.ts', line: 10, kind: 'function', confidence: 'llm' }],
-      },
-      {
-        requirement: 'Place Order',
-        service: 'OrderService',
-        domain: 'orders',
-        specFile: 'openspec/specs/orders/spec.md',
-        functions: [{ name: 'placeOrder', file: 'src/orders/service.ts', line: 50, kind: 'function', confidence: 'heuristic' }],
-      },
-    ],
-    orphanFunctions: [
-      { name: 'oldHelper', file: 'src/utils/legacy.ts', line: 5, kind: 'function', confidence: 'heuristic' },
-    ],
-    stats: { totalRequirements: 2, mappedRequirements: 2, totalExportedFunctions: 10, orphanCount: 1 },
-  };
+  const spec = (name: string, anchor: string) =>
+    `### Requirement: ${name}\n\nThe system SHALL work.\n- **Implementation**: \`${anchor}\`\n\n`;
+  for (const [domain, content] of Object.entries({
+    auth: `# Auth\n\n${spec('Authenticate User', 'authenticate::src/auth/auth.ts')}`,
+    orders: `# Orders\n\n${spec('Place Order', 'placeOrder::src/orders/service.ts')}`,
+  })) {
+    await mkdir(join(dir, 'openspec', 'specs', domain), { recursive: true });
+    await writeFile(join(dir, 'openspec', 'specs', domain, 'spec.md'), content, 'utf-8');
+  }
 }
 
 function makeSignatures(): FileSignatureMap[] {
@@ -214,12 +243,12 @@ describe('validateDirectory', () => {
   let testDir: string;
 
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-mcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-mcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
 
   afterEach(async () => {
-    await rm(testDir, { recursive: true, force: true });
+    await removeFixture(testDir);
   });
 
   it('returns the resolved absolute path for a valid directory', async () => {
@@ -229,7 +258,9 @@ describe('validateDirectory', () => {
 
   it('resolves relative paths to absolute', async () => {
     const result = await validateDirectory('.');
-    expect(result).toMatch(/^\//);
+    // isAbsolute(), not /^\//: an absolute path on Windows starts with a drive letter, so the
+    // POSIX-shaped regex asserted the separator rather than the property in the test's title.
+    expect(isAbsolute(result)).toBe(true);
   });
 
   it('throws when the path does not exist', async () => {
@@ -248,7 +279,12 @@ describe('validateDirectory', () => {
   });
 
   it('blocks path traversal that resolves to a file (e.g. /etc/hosts)', async () => {
-    await expect(validateDirectory('/etc/hosts')).rejects.toThrow('Not a directory');
+    // The property is that an existing FILE is refused, so the fixture must be a file that
+    // exists. '/etc/hosts' is not one on Windows — it resolves to C:\etc\hosts, which is
+    // absent, so the guard answered "Directory not found" and the test proved nothing.
+    const file = join(await mkdtemp(join(tmpdir(), 'mcp-notadir-')), 'a-file.txt');
+    await writeFile(file, 'x', 'utf-8');
+    await expect(validateDirectory(file)).rejects.toThrow('Not a directory');
   });
 });
 
@@ -310,10 +346,10 @@ describe('sanitizeMcpError', () => {
 describe('handleGetRefactorReport', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-refactor-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-refactor-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetRefactorReport(testDir) as { error: string };
@@ -321,7 +357,7 @@ describe('handleGetRefactorReport', () => {
   });
 
   it('returns error when callGraph is missing from cache', async () => {
-    const analysisDir = join(testDir, '.spec-gen', 'analysis');
+    const analysisDir = join(testDir, '.openlore', 'analysis');
     await mkdir(analysisDir, { recursive: true });
     await writeFile(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }));
     const r = await handleGetRefactorReport(testDir) as { error: string };
@@ -353,10 +389,10 @@ describe('handleGetRefactorReport', () => {
 describe('handleGetCallGraph', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-cg-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-cg-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetCallGraph(testDir) as { error: string };
@@ -364,7 +400,7 @@ describe('handleGetCallGraph', () => {
   });
 
   it('returns error when callGraph is missing from cache', async () => {
-    const analysisDir = join(testDir, '.spec-gen', 'analysis');
+    const analysisDir = join(testDir, '.openlore', 'analysis');
     await mkdir(analysisDir, { recursive: true });
     await writeFile(join(analysisDir, 'llm-context.json'), JSON.stringify({ signatures: [] }));
     const r = await handleGetCallGraph(testDir) as { error: string };
@@ -411,10 +447,10 @@ describe('handleGetCallGraph', () => {
 describe('handleGetSignatures', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-sigs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-sigs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error string when no cache exists', async () => {
     const r = await handleGetSignatures(testDir);
@@ -464,38 +500,41 @@ describe('handleGetSignatures', () => {
 describe('handleGetMapping', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-map-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-map-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as never);
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
-  it('returns error when no mapping.json exists', async () => {
-    const r = await handleGetMapping(testDir) as { error: string };
-    expect(r.error).toMatch(/spec-gen generate first/);
+  it('reports the missing input rather than a missing cache', async () => {
+    const r = await handleGetMapping(testDir) as { error: string; reason: string };
+    expect(r.reason).toBe('analysis-unavailable');
+    expect(r.error).toMatch(/openlore analyze/);
   });
 
-  it('returns full mapping when no filters applied', async () => {
-    await writeMappingFixture(testDir, makeMapping());
-    const r = await handleGetMapping(testDir) as { mappings: unknown[]; orphanFunctions: unknown[] };
+  it('derives the full link index with no mapping.json present', async () => {
+    await writeLinkIndexFixture(testDir);
+    const r = await handleGetMapping(testDir) as { source: string; mappings: unknown[]; orphanFunctions: unknown[] };
+    expect(r.source).toBe('derived');
     expect(r.mappings).toHaveLength(2);
     expect(r.orphanFunctions).toHaveLength(1);
   });
 
-  it('filters mappings by domain', async () => {
-    await writeMappingFixture(testDir, makeMapping());
+  it('filters links by domain', async () => {
+    await writeLinkIndexFixture(testDir);
     const r = await handleGetMapping(testDir, 'auth') as { mappings: Array<{ domain: string }> };
     expect(r.mappings).toHaveLength(1);
     expect(r.mappings[0].domain).toBe('auth');
   });
 
   it('domain filter returns empty orphanFunctions', async () => {
-    await writeMappingFixture(testDir, makeMapping());
+    await writeLinkIndexFixture(testDir);
     const r = await handleGetMapping(testDir, 'auth') as { orphanFunctions: unknown[] };
     expect(r.orphanFunctions).toHaveLength(0);
   });
 
   it('orphansOnly returns only orphan functions', async () => {
-    await writeMappingFixture(testDir, makeMapping());
+    await writeLinkIndexFixture(testDir);
     const r = await handleGetMapping(testDir, undefined, true) as { orphanFunctions: Array<{ name: string }> };
     expect(r).toHaveProperty('orphanFunctions');
     expect(r.orphanFunctions[0].name).toBe('oldHelper');
@@ -503,14 +542,14 @@ describe('handleGetMapping', () => {
   });
 
   it('orphansOnly with domain filters orphans by file path containing domain', async () => {
-    await writeMappingFixture(testDir, makeMapping());
+    await writeLinkIndexFixture(testDir);
     const r = await handleGetMapping(testDir, 'legacy', true) as { orphanFunctions: Array<{ name: string }> };
     expect(r.orphanFunctions).toHaveLength(1);
     expect(r.orphanFunctions[0].name).toBe('oldHelper');
   });
 
   it('orphansOnly with non-matching domain returns empty list', async () => {
-    await writeMappingFixture(testDir, makeMapping());
+    await writeLinkIndexFixture(testDir);
     const r = await handleGetMapping(testDir, 'payments', true) as { orphanFunctions: unknown[] };
     expect(r.orphanFunctions).toHaveLength(0);
   });
@@ -523,10 +562,10 @@ describe('handleGetMapping', () => {
 describe('handleGetSubgraph', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-subgraph-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-subgraph-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetSubgraph(testDir, 'hub') as { error: string };
@@ -617,10 +656,10 @@ describe('handleGetSubgraph', () => {
 describe('handleAnalyzeImpact', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-impact-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-impact-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleAnalyzeImpact(testDir, 'hub') as { error: string };
@@ -725,10 +764,10 @@ describe('handleAnalyzeImpact', () => {
 describe('handleGetLowRiskRefactorCandidates', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-lowrisk-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-lowrisk-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetLowRiskRefactorCandidates(testDir) as { error: string };
@@ -810,10 +849,10 @@ describe('handleGetLowRiskRefactorCandidates', () => {
 describe('handleGetLeafFunctions', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-leaves-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-leaves-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetLeafFunctions(testDir) as { error: string };
@@ -905,10 +944,10 @@ describe('handleGetLeafFunctions', () => {
 describe('handleGetCriticalHubs', () => {
   let testDir: string;
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-hubs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-hubs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
-  afterEach(async () => { await rm(testDir, { recursive: true, force: true }); });
+  afterEach(async () => { await removeFixture(testDir); });
 
   it('returns error when no cache exists', async () => {
     const r = await handleGetCriticalHubs(testDir) as { error: string };
@@ -1019,9 +1058,11 @@ function makeDriftResult(overrides: Partial<DriftResult> = {}): DriftResult {
     timestamp: '2026-01-01T00:00:00Z',
     baseRef: 'main',
     totalChangedFiles: 1,
+    analyzedFiles: 1,
+    filesOmitted: 0,
     specRelevantFiles: 1,
     issues: [],
-    summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, total: 0 },
+    summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, memoryDrifted: 0, memoryOrphaned: 0, memoryOutOfScope: 0, total: 0 },
     hasDrift: false,
     duration: 42,
     mode: 'static',
@@ -1036,7 +1077,7 @@ describe('handleCheckSpecDrift', () => {
     driftDir = join(tmpdir(), `mcp-drift-${Date.now()}`);
     await mkdir(driftDir, { recursive: true });
     vi.mocked(isGitRepository).mockReset();
-    vi.mocked(readSpecGenConfig).mockReset();
+    vi.mocked(readOpenLoreConfig).mockReset();
     vi.mocked(getChangedFiles).mockReset();
     vi.mocked(buildSpecMap).mockReset();
     vi.mocked(buildADRMap).mockReset();
@@ -1044,7 +1085,7 @@ describe('handleCheckSpecDrift', () => {
   });
 
   afterEach(async () => {
-    await rm(driftDir, { recursive: true, force: true });
+    await removeFixture(driftDir);
     vi.clearAllMocks();
   });
 
@@ -1059,27 +1100,27 @@ describe('handleCheckSpecDrift', () => {
     expect(result).toMatchObject({ error: expect.stringContaining('git') });
   });
 
-  it('returns error when no spec-gen config found', async () => {
+  it('returns error when no openlore config found', async () => {
     vi.mocked(isGitRepository).mockResolvedValue(true);
-    vi.mocked(readSpecGenConfig).mockResolvedValue(null);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue(null);
     const result = await handleCheckSpecDrift(driftDir);
-    expect(result).toMatchObject({ error: expect.stringContaining('spec-gen init') });
+    expect(result).toMatchObject({ error: expect.stringContaining('openlore init') });
   });
 
   it('returns error when no specs directory exists', async () => {
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     // openspec/specs does NOT exist in driftDir → stat throws
     const result = await handleCheckSpecDrift(driftDir);
-    expect(result).toMatchObject({ error: expect.stringContaining('spec-gen generate') });
+    expect(result).toMatchObject({ error: expect.stringContaining('openlore generate') });
   });
 
   it('returns empty DriftResult when no files changed', async () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     vi.mocked(getChangedFiles).mockResolvedValue(
       { files: [], resolvedBase: 'main', currentBranch: 'feature' } as any  
     );
@@ -1094,7 +1135,7 @@ describe('handleCheckSpecDrift', () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     vi.mocked(getChangedFiles).mockResolvedValue(
       { files: [{ path: 'src/auth.ts', status: 'modified', additions: 5, deletions: 1, isTest: false }], resolvedBase: 'main', currentBranch: 'feature' } as any  
     );
@@ -1110,7 +1151,7 @@ describe('handleCheckSpecDrift', () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     vi.mocked(getChangedFiles).mockResolvedValue(
       { files: [{ path: 'src/auth.ts', status: 'modified', additions: 20, deletions: 5, isTest: false }], resolvedBase: 'main', currentBranch: 'feature' } as any  
     );
@@ -1125,7 +1166,7 @@ describe('handleCheckSpecDrift', () => {
         changedLines: { added: 20, removed: 5 },
         suggestion: 'Update the auth spec to reflect these changes',
       }],
-      summary: { gaps: 1, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, total: 1 },
+      summary: { gaps: 1, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, memoryDrifted: 0, memoryOrphaned: 0, memoryOutOfScope: 0, total: 1 },
       totalChangedFiles: 1,
     }));
     const result = await handleCheckSpecDrift(driftDir) as DriftResult;
@@ -1140,7 +1181,7 @@ describe('handleCheckSpecDrift', () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     vi.mocked(getChangedFiles).mockResolvedValue(
       { files: [{ path: 'src/orders.ts', status: 'modified', additions: 1, deletions: 0, isTest: false }], resolvedBase: 'develop', currentBranch: 'feature' } as any  
     );
@@ -1160,7 +1201,7 @@ describe('handleCheckSpecDrift', () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     const manyFiles = Array.from({ length: 10 }, (_, i) => ({
       path: `src/file${i}.ts`, status: 'modified', additions: 1, deletions: 0, isTest: false,
     }));
@@ -1171,16 +1212,23 @@ describe('handleCheckSpecDrift', () => {
     vi.mocked(buildADRMap).mockResolvedValue(null);
     vi.mocked(detectDrift).mockResolvedValue(makeDriftResult({ totalChangedFiles: 10 }));
     // maxFiles = 3 → detectDrift receives only 3 files
-    await handleCheckSpecDrift(driftDir, 'auto', [], [], 'warning', 3);
+    const result = await handleCheckSpecDrift(driftDir, 'auto', [], [], 'warning', 3) as DriftResult;
     const callArg = vi.mocked(detectDrift).mock.calls[0][0];
     expect(callArg.changedFiles).toHaveLength(3);
+    expect(result).toMatchObject({ totalChangedFiles: 10, analyzedFiles: 3, filesOmitted: 7 });
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])('rejects invalid maxFiles %s before reading git', async (maxFiles) => {
+    const result = await handleCheckSpecDrift(driftDir, 'auto', [], [], 'warning', maxFiles);
+    expect(result).toEqual({ error: 'maxFiles must be a positive integer.' });
+    expect(vi.mocked(getChangedFiles)).not.toHaveBeenCalled();
   });
 
   it('sets totalChangedFiles to actual count (before truncation)', async () => {
     await mkdir(join(driftDir, 'openspec', 'specs'), { recursive: true });
     vi.mocked(isGitRepository).mockResolvedValue(true);
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ openspecPath: 'openspec' } as any);
     const manyFiles = Array.from({ length: 5 }, (_, i) => ({
       path: `src/file${i}.ts`, status: 'modified', additions: 1, deletions: 0, isTest: false,
     }));
@@ -1193,6 +1241,8 @@ describe('handleCheckSpecDrift', () => {
     const result = await handleCheckSpecDrift(driftDir, 'auto', [], [], 'warning', 2) as DriftResult;
     // totalChangedFiles should reflect the original 5, not the truncated 2
     expect(result.totalChangedFiles).toBe(5);
+    expect(result.analyzedFiles).toBe(2);
+    expect(result.filesOmitted).toBe(3);
   });
 });
 
@@ -1238,7 +1288,7 @@ describe('handleSuggestInsertionPoints', () => {
   });
 
   afterEach(async () => {
-    await rm(testDir, { recursive: true, force: true });
+    await removeFixture(testDir);
     vi.clearAllMocks();
   });
 
@@ -1250,14 +1300,18 @@ describe('handleSuggestInsertionPoints', () => {
   it('returns error when no vector index exists', async () => {
     vi.mocked(VectorIndex.exists).mockReturnValue(false);
     const result = await handleSuggestInsertionPoints(testDir, 'add retry') as { error: string };
-    expect(result.error).toMatch(/spec-gen analyze --embed/);
+    expect(result.error).toMatch(/No search index found/);
   });
 
-  it('returns error when embedding config not found', async () => {
+  it('falls back to BM25 (no error) when embedding config not found', async () => {
     vi.mocked(EmbeddingService.fromEnv).mockImplementation(() => { throw new Error('no env'); });
-    vi.mocked(readSpecGenConfig).mockResolvedValue(null);
-    const result = await handleSuggestInsertionPoints(testDir, 'add retry') as { error: string };
-    expect(result.error).toMatch(/embedding/i);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue(null);
+    vi.mocked(VectorIndex.search).mockResolvedValue([]);
+    const result = await handleSuggestInsertionPoints(testDir, 'add retry') as { error?: string; candidates: unknown[] };
+    expect(result.error).toBeUndefined();
+    expect(Array.isArray(result.candidates)).toBe(true);
+    // embedSvc resolved to null → search called with a null embedder (BM25 path)
+    expect(VectorIndex.search).toHaveBeenCalledWith(expect.any(String), 'add retry', null, expect.anything());
   });
 
   it('returns empty candidates when search returns no results', async () => {
@@ -1337,7 +1391,7 @@ describe('handleSuggestInsertionPoints', () => {
   it('falls back to fromConfig when fromEnv throws', async () => {
     vi.mocked(EmbeddingService.fromEnv).mockImplementation(() => { throw new Error('no env'); });
      
-    vi.mocked(readSpecGenConfig).mockResolvedValue({ embedding: { baseUrl: 'http://x', model: 'm' } } as any);
+    vi.mocked(readOpenLoreConfig).mockResolvedValue({ embedding: { baseUrl: 'http://x', model: 'm' } } as any);
     vi.mocked(EmbeddingService.fromConfig).mockReturnValue(mockEmbedSvc as never);
     vi.mocked(VectorIndex.search).mockResolvedValue([makeFakeResult('fn', 0.1)]);
     const result = await handleSuggestInsertionPoints(testDir, 'feature') as { count: number };
@@ -1383,11 +1437,11 @@ describe('handleGetArchitectureOverview', () => {
 
   beforeEach(async () => {
     testDir = await mkdtemp(join(tmpdir(), 'mcp-arch-test-'));
-    await mkdir(join(testDir, '.spec-gen', 'analysis'), { recursive: true });
+    await mkdir(join(testDir, '.openlore', 'analysis'), { recursive: true });
   });
 
   afterEach(async () => {
-    await rm(testDir, { recursive: true, force: true });
+    await removeFixture(testDir);
   });
 
   it('throws McpError when directory does not exist', async () => {
@@ -1401,7 +1455,7 @@ describe('handleGetArchitectureOverview', () => {
 
   it('returns summary stats from dep-graph', async () => {
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      join(testDir, '.openlore', 'analysis', 'dependency-graph.json'),
       JSON.stringify(makeDepGraph()),
       'utf-8'
     );
@@ -1415,12 +1469,12 @@ describe('handleGetArchitectureOverview', () => {
 
   it('identifies entry_layer role for cluster containing entry points', async () => {
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      join(testDir, '.openlore', 'analysis', 'dependency-graph.json'),
       JSON.stringify(makeDepGraph()),
       'utf-8'
     );
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      join(testDir, '.openlore', 'analysis', 'llm-context.json'),
       JSON.stringify(makeCtx()),
       'utf-8'
     );
@@ -1441,7 +1495,7 @@ describe('handleGetArchitectureOverview', () => {
       ],
     });
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      join(testDir, '.openlore', 'analysis', 'dependency-graph.json'),
       JSON.stringify(depGraph),
       'utf-8'
     );
@@ -1453,7 +1507,7 @@ describe('handleGetArchitectureOverview', () => {
       },
     });
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      join(testDir, '.openlore', 'analysis', 'llm-context.json'),
       JSON.stringify(ctx),
       'utf-8'
     );
@@ -1477,7 +1531,7 @@ describe('handleGetArchitectureOverview', () => {
       ],
     });
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      join(testDir, '.openlore', 'analysis', 'dependency-graph.json'),
       JSON.stringify(depGraph),
       'utf-8'
     );
@@ -1492,7 +1546,7 @@ describe('handleGetArchitectureOverview', () => {
 
   it('works with only llm-context (no dep-graph)', async () => {
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'llm-context.json'),
+      join(testDir, '.openlore', 'analysis', 'llm-context.json'),
       JSON.stringify(makeCtx()),
       'utf-8'
     );
@@ -1516,7 +1570,7 @@ describe('handleGetArchitectureOverview', () => {
       statistics: { nodeCount: 4, edgeCount: 0 },
     });
     await writeFile(
-      join(testDir, '.spec-gen', 'analysis', 'dependency-graph.json'),
+      join(testDir, '.openlore', 'analysis', 'dependency-graph.json'),
       JSON.stringify(depGraph),
       'utf-8'
     );

@@ -6,8 +6,8 @@
  *   - isCacheFresh
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, mkdir, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { vi } from 'vitest';
@@ -17,17 +17,25 @@ import {
   safeJoin,
   readCachedContext,
   isCacheFresh,
+  isAnalysisCacheFresh,
+  computeProjectFingerprint,
+  fingerprintBudgetExceededMessage,
+  largestCorpusPaths,
+  fingerprintHashOfConfiguration,
   loadMappingIndex,
   clearMappingCache,
   specsForFile,
   functionsForDomain,
+  notReadyResult,
 } from './utils.js';
 import { EdgeStore } from '../edge-store.js';
 import { logger } from '../../../utils/logger.js';
+import { publishGeneration, REQUIRED_ANALYSIS_ARTIFACTS } from '../../runtime/analysis-generation.js';
 import {
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_LLM_CONTEXT,
+  ARTIFACT_FINGERPRINT,
   ANALYSIS_STALE_THRESHOLD_MS,
 } from '../../../constants.js';
 
@@ -180,9 +188,21 @@ describe('sanitizeMcpError', () => {
 // ============================================================================
 
 describe('safeJoin', () => {
+  // A REAL directory, because safeJoin's contract is a validated (existing) root and
+  // it now fails closed when the root cannot be canonically resolved — "we could not
+  // verify" is not "inside the root". The traversal cases below still use a fictional
+  // root: those reject lexically, before any filesystem call.
+  let realRoot: string;
+  beforeAll(async () => {
+    const { mkdtemp, mkdir } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    realRoot = await mkdtemp(join(tmpdir(), 'openlore-safejoin-'));
+    await mkdir(join(realRoot, 'src', 'core', 'services', 'mcp-handlers'), { recursive: true });
+  });
+
   it('resolves a relative path within the project root', () => {
-    const result = safeJoin('/projects/myapp', 'src/auth.ts');
-    expect(result).toBe('/projects/myapp/src/auth.ts');
+    expect(safeJoin(realRoot, 'src/auth.ts')).toBe(join(realRoot, 'src/auth.ts'));
   });
 
   it('throws on path traversal via ../', () => {
@@ -194,8 +214,8 @@ describe('safeJoin', () => {
   });
 
   it('allows nested paths within project root', () => {
-    const result = safeJoin('/projects/myapp', 'src/core/services/mcp-handlers/utils.ts');
-    expect(result).toBe('/projects/myapp/src/core/services/mcp-handlers/utils.ts');
+    expect(safeJoin(realRoot, 'src/core/services/mcp-handlers/utils.ts'))
+      .toBe(join(realRoot, 'src/core/services/mcp-handlers/utils.ts'));
   });
 
   it('blocks traversal that starts within root but escapes', () => {
@@ -220,7 +240,7 @@ describe('readCachedContext', () => {
   });
 
   it('returns null when llm-context.json is malformed', async () => {
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), 'not-json', 'utf-8');
     const result = await readCachedContext(tmpDir);
@@ -233,15 +253,29 @@ describe('readCachedContext', () => {
       phase2_deep: { purpose: 'deep', files: [], totalTokens: 0 },
       phase3_validation: { purpose: 'validation', files: [], totalTokens: 0 },
     };
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
     const result = await readCachedContext(tmpDir);
     expect(result).toMatchObject({ phase1_survey: { purpose: 'survey' } });
   });
 
+  it('never serves artifact bytes written before their generation is committed', async () => {
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    for (const name of REQUIRED_ANALYSIS_ARTIFACTS) {
+      await writeFile(join(dir, name), name === ARTIFACT_LLM_CONTEXT
+        ? JSON.stringify({ marker: 'committed' })
+        : '{}');
+    }
+    await publishGeneration(dir, [...REQUIRED_ANALYSIS_ARTIFACTS]);
+    expect(await readCachedContext(tmpDir)).toMatchObject({ marker: 'committed' });
+    await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify({ marker: 'uncommitted' }));
+    expect(await readCachedContext(tmpDir)).toBeNull();
+  });
+
   it('attaches EdgeStore when call-graph.db is present', async () => {
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     const ctx = { phase1_survey: { purpose: '', files: [], totalTokens: 0 }, phase2_deep: { purpose: '', files: [], totalTokens: 0 }, phase3_validation: { purpose: '', files: [], totalTokens: 0 } };
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
@@ -256,7 +290,7 @@ describe('readCachedContext', () => {
   });
 
   it('edgeStore is absent when call-graph.db does not exist', async () => {
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     const ctx = { phase1_survey: { purpose: '', files: [], totalTokens: 0 }, phase2_deep: { purpose: '', files: [], totalTokens: 0 }, phase3_validation: { purpose: '', files: [], totalTokens: 0 } };
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
@@ -265,6 +299,75 @@ describe('readCachedContext', () => {
     const result = await readCachedContext(tmpDir);
     expect(result).not.toBeNull();
     expect(result!.edgeStore).toBeUndefined();
+  });
+
+  it('refuses to attach an EMPTY edge store when the JSON has production nodes (schema-bump guard)', async () => {
+    // Reproduces the upgrade footgun: the JSON analysis still has graph nodes, but the
+    // edge store DB was wiped by a SCHEMA_VERSION bump. Serving the empty store would
+    // give silent empty results from analyze_impact/get_subgraph/get_change_coupling;
+    // instead it must be withheld so those tools say "re-run analyze_codebase".
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    const ctx = {
+      phase1_survey: { purpose: '', files: [], totalTokens: 0 },
+      phase2_deep: { purpose: '', files: [], totalTokens: 0 },
+      phase3_validation: { purpose: '', files: [], totalTokens: 0 },
+      callGraph: {
+        nodes: [{ id: 'src/a.ts::foo', name: 'foo', filePath: 'src/a.ts', isExternal: false, isTest: false }],
+        edges: [], classes: [], inheritanceEdges: [], hubFunctions: [], entryPoints: [], layerViolations: [],
+        stats: { totalNodes: 1, totalEdges: 0, avgFanIn: 0, avgFanOut: 0 },
+      },
+    };
+    await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
+    EdgeStore.open(EdgeStore.dbPath(dir)).close(); // empty (current-version) store
+
+    const result = await readCachedContext(tmpDir);
+    expect(result).not.toBeNull();
+    expect(result!.edgeStore).toBeUndefined(); // withheld: empty store + JSON has prod nodes
+  });
+
+  it('normalizes missing callGraph nodes/edges to [] so graph handlers degrade, not throw', async () => {
+    // A truncated/hand-edited artifact with `callGraph: {}` passes the handlers'
+    // `!ctx.callGraph` guard and then throws on `cg.nodes.map(...)`. Normalize the
+    // missing arrays to [] (preserving any other fields) so handlers return empty
+    // rather than crashing.
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    const ctx = {
+      phase1_survey: { purpose: '', files: [], totalTokens: 0 },
+      phase2_deep: { purpose: '', files: [], totalTokens: 0 },
+      phase3_validation: { purpose: '', files: [], totalTokens: 0 },
+      signatures: [{ path: 'a.ts', language: 'TypeScript', signatures: [] }],
+      // Minimal callGraph carrying only entryPoints (a shape architecture-overview
+      // reads) and NO nodes/edges arrays.
+      callGraph: { entryPoints: [{ name: 'main' }] },
+    };
+    await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
+
+    const result = await readCachedContext(tmpDir);
+    expect(result).not.toBeNull();
+    expect(result!.callGraph).toBeDefined();             // graph preserved (not dropped)
+    expect(Array.isArray(result!.callGraph!.nodes)).toBe(true);  // missing nodes → []
+    expect(result!.callGraph!.nodes).toHaveLength(0);
+    expect(Array.isArray(result!.callGraph!.edges)).toBe(true);  // missing edges → []
+    expect((result!.callGraph as { entryPoints?: unknown[] }).entryPoints).toHaveLength(1); // other fields kept
+    expect(result!.signatures).toHaveLength(1);
+  });
+
+  it('drops a callGraph that is not even an object (scalar/array)', async () => {
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(dir, { recursive: true });
+    const ctx = {
+      phase1_survey: { purpose: '', files: [], totalTokens: 0 },
+      phase2_deep: { purpose: '', files: [], totalTokens: 0 },
+      phase3_validation: { purpose: '', files: [], totalTokens: 0 },
+      callGraph: 'corrupt-scalar',
+    };
+    await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), JSON.stringify(ctx), 'utf-8');
+
+    const result = await readCachedContext(tmpDir);
+    expect(result).not.toBeNull();
+    expect(result!.callGraph).toBeUndefined();
   });
 });
 
@@ -285,7 +388,7 @@ describe('isCacheFresh', () => {
   });
 
   it('returns true when llm-context.json was just written', async () => {
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, ARTIFACT_LLM_CONTEXT), '{}', 'utf-8');
     const result = await isCacheFresh(tmpDir);
@@ -293,7 +396,7 @@ describe('isCacheFresh', () => {
   });
 
   it('returns false when cache is older than ANALYSIS_STALE_THRESHOLD_MS', async () => {
-    const dir = join(tmpDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+    const dir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     await mkdir(dir, { recursive: true });
     const filePath = join(dir, ARTIFACT_LLM_CONTEXT);
     await writeFile(filePath, '{}', 'utf-8');
@@ -306,11 +409,240 @@ describe('isCacheFresh', () => {
     const result = await isCacheFresh(tmpDir);
     expect(result).toBe(false);
   });
+
+  it('stays fresh when only OpenLore-managed dirs (.openlore-live-cache) churn', async () => {
+    // Regression: the fingerprint must exclude OpenLore's own scratch/fixture
+    // caches. Refreshing a cloned fixture must not flap the content hash, or
+    // isCacheFresh forces a needless re-analysis every time the live-data tools run.
+    const userSrc = join(tmpDir, 'src');
+    await mkdir(userSrc, { recursive: true });
+    await writeFile(join(userSrc, 'app.ts'), 'export const x = 1;\n', 'utf-8');
+    const analysisDir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(join(analysisDir, ARTIFACT_LLM_CONTEXT), '{}', 'utf-8');
+
+    // Pin the fingerprint as analyze would, then refresh a live-cache fixture.
+    const before = await computeProjectFingerprint(tmpDir);
+    await writeFile(join(analysisDir, ARTIFACT_FINGERPRINT), JSON.stringify({ hash: before }), 'utf-8');
+    const liveCache = join(tmpDir, '.openlore-live-cache', 'go-pkg-errors@abc');
+    await mkdir(liveCache, { recursive: true });
+    await writeFile(join(liveCache, 'errors.go'), 'package errors\nfunc New() {}\n', 'utf-8');
+
+    expect(await computeProjectFingerprint(tmpDir)).toBe(before);
+    expect(await isCacheFresh(tmpDir)).toBe(true);
+
+    // Sanity: a real user-source change DOES flap the hash AND invalidate the cache —
+    // the exclusion suppresses only OpenLore's own churn, never the user's edits.
+    await writeFile(join(userSrc, 'app.ts'), 'export const x = 2;\nexport const y = 3;\n', 'utf-8');
+    expect(await computeProjectFingerprint(tmpDir)).not.toBe(before);
+    expect(await isCacheFresh(tmpDir)).toBe(false);
+  });
+
+  it('treats a corrupt fingerprint as stale even when llm-context is TTL-fresh', async () => {
+    const analysisDir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(join(analysisDir, ARTIFACT_LLM_CONTEXT), '{}', 'utf-8');
+    await writeFile(join(analysisDir, ARTIFACT_FINGERPRINT), '{broken', 'utf-8');
+    expect(await isCacheFresh(tmpDir)).toBe(false);
+  });
+
+  it('detects same-size source changes even when mtime is restored', async () => {
+    const source = join(tmpDir, 'same-size.ts');
+    const analysisDir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(source, 'export const x = 1;\n', 'utf-8');
+    const originalTimes = await stat(source);
+    const hash = await computeProjectFingerprint(tmpDir);
+    await writeFile(join(analysisDir, ARTIFACT_FINGERPRINT), JSON.stringify({ hash }), 'utf-8');
+    await writeFile(source, 'export const x = 2;\n', 'utf-8');
+    await utimes(source, originalTimes.atime, originalTimes.mtime);
+    expect(await isCacheFresh(tmpDir)).toBe(false);
+  });
+
+  it('fingerprints analyzed files outside the former source-extension allowlist', async () => {
+    const source = join(tmpDir, 'schema.sql');
+    await writeFile(source, 'CREATE TABLE users (id INTEGER);\n', 'utf-8');
+    const before = await computeProjectFingerprint(tmpDir);
+    await writeFile(source, 'CREATE TABLE users (id BIGINT);\n', 'utf-8');
+    expect(await computeProjectFingerprint(tmpDir)).not.toBe(before);
+  });
+
+  it('fingerprints explicit includes inside normally skipped directories', async () => {
+    await mkdir(join(tmpDir, 'vendor'), { recursive: true });
+    const source = join(tmpDir, 'vendor', 'included.ts');
+    await writeFile(source, 'export const included = 1;\n');
+    const configuration = { includePatterns: ['vendor/included.ts'], excludePatterns: [], maxFiles: 100 };
+    const before = await computeProjectFingerprint(tmpDir, { configuration });
+    await writeFile(source, 'export const included = 2;\n');
+    expect(await computeProjectFingerprint(tmpDir, { configuration })).not.toBe(before);
+  });
+
+  it('never fingerprints protected generated output even under a broad include', async () => {
+    const output = join(tmpDir, 'generated-analysis');
+    await mkdir(output, { recursive: true });
+    await writeFile(join(tmpDir, 'source.ts'), 'export const source = 1;\n');
+    await writeFile(join(output, 'artifact.ts'), 'export const generated = 1;\n');
+    const configuration = {
+      includePatterns: ['**/*.ts'], excludePatterns: [], protectedExcludePatterns: ['generated-analysis/**'], maxFiles: 100,
+    };
+    const before = await computeProjectFingerprint(tmpDir, { configuration });
+    await writeFile(join(output, 'artifact.ts'), 'export const generated = 2;\n');
+    expect(await computeProjectFingerprint(tmpDir, { configuration })).toBe(before);
+  });
+
+  it('fails closed when the explicit fingerprint byte budget is exceeded', async () => {
+    await writeFile(join(tmpDir, 'source.ts'), 'export const value = 1;\n', 'utf-8');
+    await expect(computeProjectFingerprint(tmpDir, { maxBytes: 4 }))
+      .rejects.toThrow(/fingerprint byte budget/i);
+  });
+
+  it('invalidates freshness when only the effective analysis configuration changes', async () => {
+    const analysisDir = join(tmpDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(join(tmpDir, 'source.ts'), 'export const value = 1;\n');
+    const initial = { includePatterns: [], excludePatterns: ['legacy/**'], maxFiles: 100_000 };
+    const changed = { includePatterns: [], excludePatterns: [], maxFiles: 100_000 };
+    const hash = await computeProjectFingerprint(tmpDir, { configuration: initial });
+    await writeFile(join(analysisDir, ARTIFACT_FINGERPRINT), JSON.stringify({
+      hash,
+      analysisConfigHash: fingerprintHashOfConfiguration(initial),
+    }));
+    expect(await isAnalysisCacheFresh(tmpDir, analysisDir, initial)).toBe(true);
+    expect(await isAnalysisCacheFresh(tmpDir, analysisDir, changed)).toBe(false);
+  });
 });
 
 // ============================================================================
 // loadMappingIndex
 // ============================================================================
+
+describe('fingerprint byte budget diagnostics', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'mcp-budget-test-'));
+  });
+
+  /**
+   * The question a user could not answer from the old message: which paths filled the budget.
+   * A tight cap over a tree whose weight sits in one subdirectory must come back naming that
+   * subdirectory, and saying what to do about it.
+   */
+  it('names the heaviest path and the way out when the budget is exceeded', async () => {
+    await mkdir(join(tmpDir, 'data', 'vectors'), { recursive: true });
+    await writeFile(join(tmpDir, 'app.ts'), 'export const app = 1;\n');
+    await writeFile(join(tmpDir, 'data', 'vectors', 'part-1.ts'), `// ${'x'.repeat(20_000)}\n`);
+    await writeFile(join(tmpDir, 'data', 'vectors', 'part-2.ts'), `// ${'x'.repeat(20_000)}\n`);
+
+    const failure = await computeProjectFingerprint(tmpDir, { maxBytes: 1024 }).catch((error: Error) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toMatch(/fingerprint byte budget/i);
+    expect(message).toContain('Largest contributors:');
+    expect(message).toContain('data/vectors');
+    expect(message).toContain('1024 bytes');
+    expect(message).toContain('excludePatterns');
+  });
+
+  /** The same tree under a cap it fits: no failure, and so no diagnostic to read. */
+  it('emits no diagnostic when the corpus fits the budget', async () => {
+    await mkdir(join(tmpDir, 'data', 'vectors'), { recursive: true });
+    await writeFile(join(tmpDir, 'app.ts'), 'export const app = 1;\n');
+    await writeFile(join(tmpDir, 'data', 'vectors', 'part-1.ts'), `// ${'x'.repeat(20_000)}\n`);
+    await writeFile(join(tmpDir, 'data', 'vectors', 'part-2.ts'), `// ${'x'.repeat(20_000)}\n`);
+
+    const fingerprint = await computeProjectFingerprint(tmpDir, { maxBytes: 10 * 1024 * 1024 });
+
+    expect(fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(fingerprint).not.toContain('Largest contributors');
+  });
+
+  it('discloses a truncated walk only when the walk was truncated', () => {
+    const files = [{ path: 'data/big.ts', size: 4096 }];
+
+    expect(fingerprintBudgetExceededMessage(1024, files, true)).toContain('maxFiles cap');
+    expect(fingerprintBudgetExceededMessage(1024, files, false)).not.toContain('maxFiles cap');
+  });
+
+  it('names the config key the walker actually reads', () => {
+    const message = fingerprintBudgetExceededMessage(1024, [{ path: 'data/big.ts', size: 4096 }]);
+
+    expect(message).toContain('analysis.excludePatterns');
+  });
+
+  /**
+   * The paths are repository-controlled and the message keeps its own newlines when logged, so a
+   * file name carrying a newline or an escape sequence could forge an extra line in the output.
+   */
+  it('strips control characters from repository paths so a file name cannot forge a line', () => {
+    const files = [{ path: 'data/evil\nAll clear: nothing to exclude[2J.ts', size: 4096 }];
+
+    const message = fingerprintBudgetExceededMessage(1024, files);
+
+    expect(message).not.toContain('\nAll clear');
+    expect(message).not.toContain('');
+    expect(message).toContain('data/evilAll clear: nothing to exclude[2J.ts');
+  });
+});
+
+describe('largestCorpusPaths', () => {
+  it('names the deepest path that accounts for the bytes, not a parent that merely contains it', () => {
+    const files = [
+      { path: 'data/vectors/part-1.ts', size: 400 },
+      { path: 'data/vectors/part-2.ts', size: 400 },
+      { path: 'src/app.ts', size: 10 },
+    ];
+
+    expect(largestCorpusPaths(files, 1)).toEqual([{ path: 'data/vectors', bytes: 800 }]);
+  });
+
+  it('names a single heavy file rather than the directory holding it', () => {
+    const files = [
+      { path: 'assets/demo.ts', size: 900 },
+      { path: 'src/app.ts', size: 10 },
+    ];
+
+    expect(largestCorpusPaths(files, 1)[0]?.path).toBe('assets/demo.ts');
+  });
+
+  it('never returns a path that contains another, so each line is its own bytes', () => {
+    const files = [
+      { path: 'a/b/c/one.ts', size: 100 },
+      { path: 'a/b/c/two.ts', size: 100 },
+      { path: 'z/other.ts', size: 5 },
+    ];
+
+    const paths = largestCorpusPaths(files, 5).map(entry => entry.path);
+
+    for (const outer of paths) {
+      for (const inner of paths) {
+        if (outer !== inner) expect(inner.startsWith(`${outer}/`)).toBe(false);
+      }
+    }
+  });
+
+  it('never names the repository root', () => {
+    const files = [{ path: 'only.ts', size: 10 }];
+
+    expect(largestCorpusPaths(files, 5).map(entry => entry.path)).toEqual(['only.ts']);
+  });
+
+  it('does not name a path holding less than 1% of the corpus', () => {
+    const files = [
+      { path: 'docs/graph_vectors/index.bin', size: 1_300_000 },
+      { path: 'src/a.ts', size: 17 },
+    ];
+
+    expect(largestCorpusPaths(files, 5).map(entry => entry.path)).toEqual(['docs/graph_vectors/index.bin']);
+  });
+
+  it('returns at most the requested number of paths', () => {
+    const files = Array.from({ length: 20 }, (_, index) => ({ path: `d${index}/f.ts`, size: 100 - index }));
+
+    expect(largestCorpusPaths(files, 3)).toHaveLength(3);
+  });
+});
 
 describe('loadMappingIndex', () => {
   let tmpDir: string;
@@ -325,7 +657,7 @@ describe('loadMappingIndex', () => {
   });
 
   it('returns indexed MappingIndex when mapping.json is valid', async () => {
-    const dir = join(tmpDir, '.spec-gen', 'analysis');
+    const dir = join(tmpDir, '.openlore', 'analysis');
     await mkdir(dir, { recursive: true });
     const mappingData = {
       mappings: [
@@ -350,7 +682,7 @@ describe('loadMappingIndex', () => {
   });
 
   it('returns null when mapping.json is malformed JSON', async () => {
-    const dir = join(tmpDir, '.spec-gen', 'analysis');
+    const dir = join(tmpDir, '.openlore', 'analysis');
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, 'mapping.json'), 'not valid json', 'utf-8');
     const result = await loadMappingIndex(tmpDir);
@@ -358,7 +690,7 @@ describe('loadMappingIndex', () => {
   });
 
   it('caches results and returns cached value on subsequent calls', async () => {
-    const dir = join(tmpDir, '.spec-gen', 'analysis');
+    const dir = join(tmpDir, '.openlore', 'analysis');
     await mkdir(dir, { recursive: true });
     const mappingData = {
       mappings: [
@@ -387,7 +719,7 @@ describe('loadMappingIndex', () => {
   });
 
   it('caches different directories separately', async () => {
-    const dir1 = join(tmpDir, '.spec-gen', 'analysis');
+    const dir1 = join(tmpDir, '.openlore', 'analysis');
     await mkdir(dir1, { recursive: true });
     const mappingData1 = {
       mappings: [
@@ -403,7 +735,7 @@ describe('loadMappingIndex', () => {
     };
     await writeFile(join(dir1, 'mapping.json'), JSON.stringify(mappingData1), 'utf-8');
 
-    const dir2 = join(tmpDir, 'other', '.spec-gen', 'analysis');
+    const dir2 = join(tmpDir, 'other', '.openlore', 'analysis');
     await mkdir(dir2, { recursive: true });
     const mappingData2 = {
       mappings: [
@@ -450,7 +782,7 @@ describe('clearMappingCache', () => {
   });
 
   it('clears the mapping cache', async () => {
-    const dir = join(tmpDir, '.spec-gen', 'analysis');
+    const dir = join(tmpDir, '.openlore', 'analysis');
     await mkdir(dir, { recursive: true });
     const mappingData = {
       mappings: [
@@ -542,5 +874,22 @@ describe('functionsForDomain', () => {
     expect(fns).toHaveLength(1);
     expect(fns[0].name).toBe('login');
     expect(fns[0].requirement).toBe('Auth flow');
+  });
+});
+
+describe('notReadyResult (ReadyOrHonestFirstUse)', () => {
+  it('builds a structured, ready-or-honest result preserving the human message', () => {
+    const r = notReadyResult('No analysis found. Run "openlore analyze" first.', 'index-absent');
+    expect(r.error).toContain('No analysis found');
+    expect(r.notReady).toBe(true);
+    expect(r.reason).toBe('index-absent');
+    expect(r.remedy).toBe('openlore analyze');
+  });
+
+  it('carries the graph-unavailable reason distinctly from index-absent', () => {
+    const r = notReadyResult('Call graph not available. Re-run analyze_codebase.', 'graph-unavailable');
+    expect(r.notReady).toBe(true);
+    expect(r.reason).toBe('graph-unavailable');
+    expect(r.remedy).toBe('openlore analyze');
   });
 });

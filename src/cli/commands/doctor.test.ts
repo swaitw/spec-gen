@@ -1,9 +1,9 @@
 /**
- * Tests for spec-gen doctor command
+ * Tests for openlore doctor command
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { doctorCommand } from './doctor.js';
+import { doctorCommand, checkParseHealth } from './doctor.js';
 
 // ============================================================================
 // MOCKS
@@ -22,7 +22,10 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return {
     ...actual,
     access: vi.fn().mockResolvedValue(undefined),
-    stat: vi.fn().mockResolvedValue({ mtime: new Date() }),
+    stat: vi.fn().mockResolvedValue({ mtime: new Date(), isDirectory: () => true }),
+    // checkMcpWiring reads .claude/settings.json + .mcp.json; default to "absent"
+    // so the suite is independent of the repo's own dogfood files.
+    readFile: vi.fn().mockRejectedValue(new Error('ENOENT')),
   };
 });
 
@@ -30,20 +33,37 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 // function created at import time references our controllable vi.fn().
 vi.mock('node:child_process', () => ({ execFile: vi.fn() }));
 
-vi.mock('../../core/services/config-manager.js', () => ({
-  readSpecGenConfig: vi.fn().mockResolvedValue({
-    projectType: 'nodejs',
-    createdAt: '2024-01-01T00:00:00Z',
-    openspecPath: './openspec',
-    maxFiles: 500,
-  }),
-}));
+// fs/promises is mocked above, so a real corpus walk would see fake stats. The corpus
+// check has its own unmocked tests (doctor-corpus.test.ts); here it sees an empty corpus.
+vi.mock('../../core/services/mcp-handlers/utils.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../core/services/mcp-handlers/utils.js')>();
+  return { ...actual, walkFingerprintCorpus: vi.fn().mockResolvedValue({ files: [], summary: {} }) };
+});
+
+vi.mock('../../core/services/config-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../core/services/config-manager.js')>();
+  return {
+    ...actual,
+    readOpenLoreConfig: vi.fn().mockResolvedValue({
+      projectType: 'nodejs',
+      createdAt: '2024-01-01T00:00:00Z',
+      openspecPath: './openspec',
+      maxFiles: 500,
+    }),
+    // Default resolution: <root>/.openlore/config.json (no --config override in tests).
+    resolveOpenLoreConfigPath: (rootPath: string) => `${rootPath}/.openlore/config.json`,
+  };
+});
 
 vi.mock('../../core/services/llm-service.js', () => ({
   createLLMService: vi.fn().mockReturnValue({
     complete: vi.fn().mockResolvedValue({ model: 'claude-opus-4-6', content: 'pong' }),
     saveLogs: vi.fn().mockResolvedValue(undefined),
   }),
+}));
+
+vi.mock('../../core/decisions/corpus-integrity.js', () => ({
+  detectCorpusIntegrity: vi.fn().mockResolvedValue([]),
 }));
 
 // ============================================================================
@@ -66,12 +86,24 @@ async function runDoctorJson(): Promise<Array<{ name: string; status: string; de
   const outputs: string[] = [];
   const spy = vi.spyOn(console, 'log').mockImplementation((msg: string) => { outputs.push(msg); });
   try {
-    await doctorCommand.parseAsync(['node', 'doctor', '--json'], { from: 'user' });
+    await doctorCommand.parseAsync(['--json'], { from: 'user' });
   } finally {
     spy.mockRestore();
   }
   const jsonLine = outputs.find(o => { try { JSON.parse(o); return true; } catch { return false; } });
   return JSON.parse(jsonLine!);
+}
+
+async function runDoctorText(): Promise<string> {
+  doctorCommand.setOptionValue('json', false);
+  const outputs: string[] = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((msg: string) => { outputs.push(String(msg)); });
+  try {
+    await doctorCommand.parseAsync([], { from: 'user' });
+  } finally {
+    spy.mockRestore();
+  }
+  return outputs.join('\n');
 }
 
 // ============================================================================
@@ -87,6 +119,11 @@ describe('doctor command', () => {
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     mockExecSuccess();
+    // Restore readFile's documented default ("absent") — clearAllMocks resets call
+    // history but NOT implementations, so a test that pointed readFile at a config
+    // would otherwise leak that resolution into later tests (Config schema check).
+    const { readFile } = await import('node:fs/promises');
+    vi.mocked(readFile).mockRejectedValue(new Error('ENOENT'));
     // Restore default LLM mock after clearAllMocks
     const llmService = await import('../../core/services/llm-service.js');
     vi.mocked(llmService.createLLMService).mockReturnValue({
@@ -123,9 +160,35 @@ describe('doctor command', () => {
       expect(Array.isArray(checks)).toBe(true);
     });
 
-    it('should include exactly 7 checks', async () => {
+    it('should include the retrieval check among the default checks', async () => {
       const checks = await runDoctorJson();
-      expect(checks).toHaveLength(7);
+      expect(checks).toHaveLength(15);
+      expect(checks.find(c => c.name === 'Retrieval mode')).toBeDefined();
+    });
+
+    it('should include a governance corpus integrity check', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'Corpus integrity')).toBeDefined();
+    });
+
+    it('should include a Git hook reachability check', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'Git hook reachability')).toBeDefined();
+    });
+
+    it('should include a Config schema check', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'Config schema')).toBeDefined();
+    });
+
+    it('should include a Parse health check', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'Parse health')).toBeDefined();
+    });
+
+    it('should include a Graph store check', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'Graph store')).toBeDefined();
     });
 
     it('each check should have name, status, and detail fields', async () => {
@@ -151,9 +214,9 @@ describe('doctor command', () => {
       expect(gitCheck).toBeDefined();
     });
 
-    it('should include a spec-gen config check', async () => {
+    it('should include a openlore config check', async () => {
       const checks = await runDoctorJson();
-      const configCheck = checks.find(c => c.name === 'spec-gen config');
+      const configCheck = checks.find(c => c.name === 'openlore config');
       expect(configCheck).toBeDefined();
     });
 
@@ -193,7 +256,14 @@ describe('doctor command', () => {
 
   // --------------------------------------------------------------------------
   describe('LLM connection check', () => {
-    const keyVars = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENAI_COMPAT_API_KEY'];
+    const keyVars = [
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'GEMINI_API_KEY',
+      'GOOGLE_API_KEY',
+      'OPENAI_COMPAT_API_KEY',
+      'OPENAI_COMPAT_BASE_URL',
+    ];
 
     function clearLLMKeys(): Record<string, string | undefined> {
       const saved: Record<string, string | undefined> = {};
@@ -237,7 +307,80 @@ describe('doctor command', () => {
       }
     });
 
-    it('should fail when createLLMService throws (missing API key)', async () => {
+    it('refuses a repository-selected remote OpenAI-compatible endpoint', async () => {
+      const saved = clearLLMKeys();
+      const configManager = await import('../../core/services/config-manager.js');
+      const llmService = await import('../../core/services/llm-service.js');
+      process.env.OPENAI_COMPAT_API_KEY = 'operator-secret';
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec',
+        maxFiles: 500,
+        generation: { provider: 'openai-compat', openaiCompatBaseUrl: 'https://attacker.invalid/v1' },
+      } as never);
+
+      try {
+        await runDoctorJson();
+        expect(vi.mocked(llmService.createLLMService)).toHaveBeenCalledWith(
+          expect.objectContaining({ openaiCompatBaseUrl: undefined }),
+        );
+      } finally {
+        restoreLLMKeys(saved);
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    it('prefers an operator-selected compatibility endpoint over repository config', async () => {
+      const saved = clearLLMKeys();
+      const configManager = await import('../../core/services/config-manager.js');
+      const llmService = await import('../../core/services/llm-service.js');
+      process.env.OPENAI_COMPAT_API_KEY = 'operator-secret';
+      process.env.OPENAI_COMPAT_BASE_URL = 'https://operator.example/v1';
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec',
+        maxFiles: 500,
+        generation: { provider: 'openai-compat', openaiCompatBaseUrl: 'https://attacker.invalid/v1' },
+      } as never);
+
+      try {
+        await runDoctorJson();
+        expect(vi.mocked(llmService.createLLMService)).toHaveBeenCalledWith(
+          expect.objectContaining({ openaiCompatBaseUrl: 'https://operator.example/v1' }),
+        );
+      } finally {
+        restoreLLMKeys(saved);
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    it.each([
+      ['codex-cli', 'CODEX_CLI', '/opt/openlore/codex'],
+      ['antigravity-cli', 'ANTIGRAVITY_CLI', '/opt/openlore/agy'],
+      ['cursor-agent', 'CURSOR_AGENT_CLI', '/opt/openlore/cursor-agent'],
+    ])('checks the configured binary for %s', async (provider, envName, binary) => {
+      const saved = process.env[envName];
+      const configManager = await import('../../core/services/config-manager.js');
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec',
+        maxFiles: 500, generation: { provider },
+      } as never);
+      process.env[envName] = binary;
+      try {
+        await runDoctorJson();
+        expect(vi.mocked(execFileMock).mock.calls.some((call) => call[0] === binary)).toBe(true);
+      } finally {
+        if (saved === undefined) delete process.env[envName];
+        else process.env[envName] = saved;
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    it('warns (not fails) when createLLMService throws (missing API key) — LLM is optional', async () => {
       const saved = clearLLMKeys();
       const llmService = await import('../../core/services/llm-service.js');
       vi.mocked(llmService.createLLMService).mockImplementationOnce(() => {
@@ -246,15 +389,15 @@ describe('doctor command', () => {
       try {
         const checks = await runDoctorJson();
         const llmCheck = checks.find(c => c.name === 'LLM connection')!;
-        expect(llmCheck.status).toBe('fail');
+        expect(llmCheck.status).toBe('warn');
         expect(llmCheck.fix).toBeDefined();
-        expect(llmCheck.fix).toContain('API key');
+        expect(llmCheck.fix).toContain('Optional');
       } finally {
         restoreLLMKeys(saved);
       }
     });
 
-    it('should fail when complete() rejects (network error)', async () => {
+    it('warns (not fails) when complete() rejects (network error)', async () => {
       const saved = clearLLMKeys();
       process.env.ANTHROPIC_API_KEY = 'sk-test-anthropic';
       const llmService = await import('../../core/services/llm-service.js');
@@ -265,14 +408,36 @@ describe('doctor command', () => {
       try {
         const checks = await runDoctorJson();
         const llmCheck = checks.find(c => c.name === 'LLM connection')!;
-        expect(llmCheck.status).toBe('fail');
-        expect(llmCheck.fix).toContain('API key');
+        expect(llmCheck.status).toBe('warn');
+        expect(llmCheck.fix).toContain('Optional');
       } finally {
         restoreLLMKeys(saved);
       }
     });
 
-    it('should include a fix suggestion when failing', async () => {
+    it.each([
+      ['JSON', runDoctorJson],
+      ['human-readable', runDoctorText],
+    ])('redacts an exact echoed LLM credential from %s results', async (_format, runDoctor) => {
+      const saved = clearLLMKeys();
+      const credential = 'local-llm-value';
+      process.env.ANTHROPIC_API_KEY = credential;
+      const llmService = await import('../../core/services/llm-service.js');
+      vi.mocked(llmService.createLLMService).mockReturnValueOnce({
+        complete: vi.fn().mockRejectedValue(new Error(`provider reflected ${credential}`)),
+        saveLogs: vi.fn().mockResolvedValue(undefined),
+      } as never);
+      try {
+        const output = JSON.stringify(await runDoctor());
+        expect(output).not.toContain(credential);
+        expect(output).toContain('[REDACTED:api-key]');
+        expect(output).toContain('anthropic');
+      } finally {
+        restoreLLMKeys(saved);
+      }
+    });
+
+    it('should include a fix suggestion when degraded', async () => {
       const saved = clearLLMKeys();
       const llmService = await import('../../core/services/llm-service.js');
       vi.mocked(llmService.createLLMService).mockImplementationOnce(() => {
@@ -288,11 +453,186 @@ describe('doctor command', () => {
     });
   });
 
+  describe('embedding connection check', () => {
+    it('skips a repository-selected remote endpoint instead of sending the operator key', async () => {
+      const configManager = await import('../../core/services/config-manager.js');
+      const savedKey = process.env.EMBED_API_KEY;
+      const savedBase = process.env.EMBED_BASE_URL;
+      delete process.env.EMBED_BASE_URL;
+      process.env.EMBED_API_KEY = 'operator-embedding-secret';
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec',
+        maxFiles: 500,
+        embedding: { baseUrl: 'https://attacker.invalid/v1', model: 'hostile-model' },
+      } as never);
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+
+      try {
+        const checks = await runDoctorJson();
+        expect(checks.find(c => c.name === 'Embedding connection')).toBeUndefined();
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+        if (savedKey === undefined) delete process.env.EMBED_API_KEY;
+        else process.env.EMBED_API_KEY = savedKey;
+        if (savedBase === undefined) delete process.env.EMBED_BASE_URL;
+        else process.env.EMBED_BASE_URL = savedBase;
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    /**
+     * Covers spec `operator-tls-trust` / DiagnosticsReflectTheOptOutTheRealPathUses.
+     *
+     * The relaxation MECHANISM is proven against a real handshake in `tls-scope.test.ts`.
+     * What is asserted here is doctor's DECISION: that it hands `withRelaxedTls` an
+     * enabled scope, observable as NODE_TLS_REJECT_UNAUTHORIZED being '0' at the moment
+     * the request is issued. Before this change doctor passed nothing, so a self-signed
+     * endpoint that `analyze` reaches was reported as a certificate failure.
+     */
+    it('honours the operator embedding opt-out, so a self-signed endpoint is not a false failure', async () => {
+      const configManager = await import('../../core/services/config-manager.js');
+      const saved = { base: process.env.EMBED_BASE_URL, model: process.env.EMBED_MODEL, skip: process.env.EMBED_SKIP_SSL_VERIFY };
+      process.env.EMBED_BASE_URL = 'https://embeddings.internal:8443/v1';
+      process.env.EMBED_MODEL = 'nomic-embed-text';
+      process.env.EMBED_SKIP_SSL_VERIFY = '1';
+
+      let relaxedAtCallTime: string | undefined = 'unset';
+      const fetchSpy = vi.fn().mockImplementation(async () => {
+        relaxedAtCallTime = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+        return { ok: true, json: vi.fn().mockResolvedValue({ data: [{ embedding: [0, 1, 2] }] }) };
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      try {
+        const checks = await runDoctorJson();
+        const check = checks.find(c => c.name === 'Embedding connection')!;
+        expect(check.status).toBe('ok');
+        // The request really was issued inside a relaxed scope...
+        expect(relaxedAtCallTime).toBe('0');
+        // ...and the scope closed again afterwards.
+        expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined();
+      } finally {
+        vi.unstubAllGlobals();
+        for (const [k, v] of [['EMBED_BASE_URL', saved.base], ['EMBED_MODEL', saved.model], ['EMBED_SKIP_SSL_VERIFY', saved.skip]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    it('does not relax the scope when the operator set no opt-out', async () => {
+      const saved = { base: process.env.EMBED_BASE_URL, model: process.env.EMBED_MODEL, skip: process.env.EMBED_SKIP_SSL_VERIFY };
+      delete process.env.EMBED_SKIP_SSL_VERIFY;
+      process.env.EMBED_BASE_URL = 'https://embeddings.internal:8443/v1';
+      process.env.EMBED_MODEL = 'nomic-embed-text';
+
+      let relaxedAtCallTime: string | undefined = 'unset';
+      const fetchSpy = vi.fn().mockImplementation(async () => {
+        relaxedAtCallTime = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+        return { ok: true, json: vi.fn().mockResolvedValue({ data: [{ embedding: [0] }] }) };
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+      try {
+        await runDoctorJson();
+        expect(relaxedAtCallTime).toBeUndefined();
+      } finally {
+        vi.unstubAllGlobals();
+        for (const [k, v] of [['EMBED_BASE_URL', saved.base], ['EMBED_MODEL', saved.model], ['EMBED_SKIP_SSL_VERIFY', saved.skip]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+
+    /**
+     * Covers spec `operator-tls-trust` / "Doctor reports on the settings actually in
+     * effect". When EMBED_BASE_URL is set the real path is `fromEnv`, which never reads
+     * the config — so a doctor that preferred config values described a setup nobody runs.
+     */
+    it('exercises the environment model, not the config model, when the endpoint came from the environment', async () => {
+      const configManager = await import('../../core/services/config-manager.js');
+      const saved = { base: process.env.EMBED_BASE_URL, model: process.env.EMBED_MODEL };
+      process.env.EMBED_BASE_URL = 'https://embeddings.internal:8443/v1';
+      process.env.EMBED_MODEL = 'env-model';
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        embedding: { model: 'config-model', apiKey: 'config-key' },
+      } as never);
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: true, json: vi.fn().mockResolvedValue({ data: [{ embedding: [0] }] }),
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      try {
+        await runDoctorJson();
+        const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body);
+        expect(body.model).toBe('env-model');
+        expect(body.model).not.toBe('config-model');
+        const headers = (fetchSpy.mock.calls[0][1] as { headers: Record<string, string> }).headers;
+        expect(headers.Authorization).not.toContain('config-key');
+      } finally {
+        vi.unstubAllGlobals();
+        for (const [k, v] of [['EMBED_BASE_URL', saved.base], ['EMBED_MODEL', saved.model]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+
+    it.each([
+      ['JSON', runDoctorJson],
+      ['human-readable', runDoctorText],
+    ])('redacts an exact echoed embedding credential from %s results', async (_format, runDoctor) => {
+      const configManager = await import('../../core/services/config-manager.js');
+      const savedKey = process.env.EMBED_API_KEY;
+      const savedBase = process.env.EMBED_BASE_URL;
+      const credential = 'local-embedding-value';
+      process.env.EMBED_API_KEY = credential;
+      process.env.EMBED_BASE_URL = 'https://localhost:11434/v1';
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        embedding: { model: 'local-embedding-model' },
+      } as never);
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        text: vi.fn().mockResolvedValue(`provider reflected ${credential}`),
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      try {
+        const output = JSON.stringify(await runDoctor());
+        expect(output).not.toContain(credential);
+        expect(output).toContain('[REDACTED:api-key]');
+        expect(fetchSpy).toHaveBeenCalledWith(
+          'https://localhost:11434/v1/embeddings',
+          expect.any(Object),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+        if (savedKey === undefined) delete process.env.EMBED_API_KEY;
+        else process.env.EMBED_API_KEY = savedKey;
+        if (savedBase === undefined) delete process.env.EMBED_BASE_URL;
+        else process.env.EMBED_BASE_URL = savedBase;
+        vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+          projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+        } as never);
+      }
+    });
+  });
+
   // --------------------------------------------------------------------------
   describe('config check', () => {
     it('should show ok when config exists and parses', async () => {
       const checks = await runDoctorJson();
-      const configCheck = checks.find(c => c.name === 'spec-gen config')!;
+      const configCheck = checks.find(c => c.name === 'openlore config')!;
       expect(configCheck.status).toBe('ok');
       expect(configCheck.detail).toContain('nodejs');
     });
@@ -302,9 +642,11 @@ describe('doctor command', () => {
       vi.mocked(access).mockRejectedValue(new Error('ENOENT'));
 
       const checks = await runDoctorJson();
-      const configCheck = checks.find(c => c.name === 'spec-gen config')!;
+      const configCheck = checks.find(c => c.name === 'openlore config')!;
       expect(configCheck.status).toBe('warn');
-      expect(configCheck.fix).toContain('spec-gen init');
+      expect(configCheck.fix).toContain('openlore init');
+      // Onboarding: an un-set-up repo is steered to the one-command path first.
+      expect(configCheck.fix).toContain('openlore install');
     });
 
     it('should show fail when config file exists but cannot be parsed', async () => {
@@ -312,12 +654,113 @@ describe('doctor command', () => {
       vi.mocked(access).mockResolvedValue(undefined);
 
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.readSpecGenConfig).mockResolvedValue(null);
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue(null);
 
       const checks = await runDoctorJson();
-      const configCheck = checks.find(c => c.name === 'spec-gen config')!;
+      const configCheck = checks.find(c => c.name === 'openlore config')!;
       expect(configCheck.status).toBe('fail');
-      expect(configCheck.fix).toContain('spec-gen init');
+      expect(configCheck.fix).toContain('openlore init');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('config schema check (add-config-schema-validation)', () => {
+    it('shows ok when there is no config file to validate', async () => {
+      // Default readFile mock rejects (ENOENT) — nothing to validate.
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+      expect(schemaCheck.status).toBe('ok');
+    });
+
+    it('shows ok for a config with only known, well-typed keys', async () => {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockResolvedValue(
+        JSON.stringify({
+          version: '1.0.0',
+          projectType: 'nodejs',
+          openspecPath: 'openspec',
+          analysis: { maxFiles: 1, includePatterns: [], excludePatterns: [] },
+          generation: { domains: 'auto' },
+          createdAt: '2026-01-01T00:00:00Z',
+          lastRun: null,
+        }) as never
+      );
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+      expect(schemaCheck.status).toBe('ok');
+      expect(schemaCheck.detail).toContain('required fields present');
+    });
+
+    it('reports missing required sections instead of blessing an empty config', async () => {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockResolvedValue('{}' as never);
+
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+
+      expect(schemaCheck.status).toBe('warn');
+      expect(schemaCheck.detail).toContain('analysis');
+      expect(schemaCheck.detail).toContain('openlore init');
+      expect(schemaCheck.detail).not.toContain('all keys known and well-typed');
+    });
+
+    it('reports an in-memory compatibility default without recommending init', async () => {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockResolvedValue(
+        JSON.stringify({
+          version: '1.0.0', projectType: 'nodejs', openspecPath: 'openspec',
+          analysis: { maxFiles: 1, includePatterns: [], excludePatterns: ['dist/**'] },
+          generation: { model: 'custom-model' },
+          createdAt: '2026-01-01T00:00:00Z', lastRun: null,
+        }) as never
+      );
+
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+
+      expect(schemaCheck.status).toBe('warn');
+      expect(schemaCheck.detail).toContain('generation.domains');
+      expect(schemaCheck.detail).toContain('"auto"');
+      expect(schemaCheck.detail).toContain('compatibility defaults');
+      expect(schemaCheck.fix).not.toContain('openlore init');
+    });
+
+    it('reports nested type mismatches', async () => {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockResolvedValue(
+        JSON.stringify({
+          version: '1.0.0', projectType: 'nodejs', openspecPath: 'openspec',
+          analysis: { maxFiles: 'lots', includePatterns: [], excludePatterns: [] },
+          generation: { domains: 'auto' }, createdAt: '2026-01-01T00:00:00Z', lastRun: null,
+        }) as never
+      );
+
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+      expect(schemaCheck.status).toBe('warn');
+      expect(schemaCheck.detail).toContain('analysis.maxFiles');
+    });
+
+    it('warns and names an unknown (typo\'d) key with a suggestion', async () => {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockResolvedValue(
+        JSON.stringify({
+          version: '1.0.0',
+          projectType: 'nodejs',
+          openspecPath: 'openspec',
+          analysis: { maxFiles: 1, includePatterns: [], excludePatterns: [] },
+          generation: { domains: 'auto' },
+          createdAt: '2026-01-01T00:00:00Z',
+          lastRun: null,
+          pancResponse: { mode: 'off' },
+        }) as never
+      );
+      const checks = await runDoctorJson();
+      const schemaCheck = checks.find(c => c.name === 'Config schema')!;
+      expect(schemaCheck.status).toBe('warn');
+      expect(schemaCheck.detail).toContain('pancResponse');
+      expect(schemaCheck.detail).toContain('panicResponse');
+      expect(schemaCheck.fix).toContain('openlore init');
     });
   });
 
@@ -325,7 +768,10 @@ describe('doctor command', () => {
   describe('analysis artifacts check', () => {
     it('should show ok for fresh analysis (< warning threshold)', async () => {
       const { stat } = await import('node:fs/promises');
-      vi.mocked(stat).mockResolvedValue({ mtime: new Date() } as ReturnType<typeof stat> extends Promise<infer T> ? T : never);
+      vi.mocked(stat).mockResolvedValue({
+        mtime: new Date(),
+        isDirectory: () => true,
+      } as ReturnType<typeof stat> extends Promise<infer T> ? T : never);
 
       const checks = await runDoctorJson();
       const artifactCheck = checks.find(c => c.name === 'Analysis artifacts')!;
@@ -340,7 +786,7 @@ describe('doctor command', () => {
       const checks = await runDoctorJson();
       const artifactCheck = checks.find(c => c.name === 'Analysis artifacts')!;
       expect(artifactCheck.status).toBe('warn');
-      expect(artifactCheck.fix).toContain('spec-gen analyze');
+      expect(artifactCheck.fix).toContain('openlore analyze');
     });
 
     it('should show warn when no analysis exists', async () => {
@@ -350,13 +796,110 @@ describe('doctor command', () => {
       const checks = await runDoctorJson();
       const artifactCheck = checks.find(c => c.name === 'Analysis artifacts')!;
       expect(artifactCheck.status).toBe('warn');
+      // Onboarding: steer to the one-command setup before the manual analyze.
+      expect(artifactCheck.fix).toContain('openlore install');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('Parse health check (memory-degradation disclosure)', () => {
+    async function withParseHealth(report: unknown): Promise<Awaited<ReturnType<typeof checkParseHealth>>> {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockImplementation(async (p: any) =>
+        String(p).endsWith('parse-health.json')
+          ? JSON.stringify(report)
+          : Promise.reject(new Error('ENOENT')),
+      );
+      return checkParseHealth('/repo');
+    }
+
+    it('warns and names the reduction when only a memoryDegradation is present', async () => {
+      const result = await withParseHealth({
+        totalDegradedFiles: 0,
+        files: [],
+        byLanguage: [],
+        memoryDegradation: {
+          tier: 'shed-overlay',
+          shed: ['cfg-overlay'],
+          estimatedBytes: 3_100_000_000,
+          availableHeapBytes: 2_000_000_000,
+        },
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toContain('Reduced under memory pressure');
+      expect(result.detail).toContain('CFG/def-use overlay');
+      expect(result.fix).toContain('OPENLORE_HEAP_MB');
+      expect(result.fix).toContain('OPENLORE_FORCE_MEMORY_TIER=full');
+    });
+
+    it('stays ok for a clean report (no degradation, no exclusions)', async () => {
+      const result = await withParseHealth({ totalDegradedFiles: 0, files: [], byLanguage: [] });
+      expect(result.status).toBe('ok');
+      expect(result.detail).toBe('no files parsed with errors');
+    });
+
+    it('warns when script containers retain unanalyzed framework semantics', async () => {
+      const result = await withParseHealth({
+        totalDegradedFiles: 0, files: [], byLanguage: [],
+        scriptContainers: [{
+          format: 'Vue', extension: '.vue', fileCount: 2, scriptBlockCount: 3,
+          extractedScriptBlockCount: 3,
+          limitations: ['template expressions', 'framework macros', 'Svelte reactive statements'],
+          files: [],
+        }],
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toContain('script-container boundary');
+      expect(result.detail).toContain('2 .vue files');
+      expect(result.detail).toContain('template expressions');
+    });
+
+    it('warns mentioning both per-file errors and the memory reduction when both apply', async () => {
+      const result = await withParseHealth({
+        totalDegradedFiles: 2,
+        files: [],
+        byLanguage: [{ language: 'typescript', degradedFiles: 2 }],
+        memoryDegradation: {
+          tier: 'shed-overlay-and-deep-analysis',
+          shed: ['cfg-overlay', 'deep-analysis-breadth'],
+          estimatedBytes: 5_000_000_000,
+          availableHeapBytes: 2_000_000_000,
+        },
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toContain('parsed with errors');
+      expect(result.detail).toContain('Reduced under memory pressure');
+      // Both remedies are offered: the grammar-bump path and the larger-heap path.
+      expect(result.fix).toContain('tree-sitter-*');
+      expect(result.fix).toContain('OPENLORE_HEAP_MB');
     });
   });
 
   // --------------------------------------------------------------------------
   describe('exit code', () => {
-    it('should set exitCode=1 when any check fails (JSON mode confirms fail status)', async () => {
+    it('should report a fail when a deterministic check fails (unparseable config)', async () => {
       consoleSpy.mockImplementation(() => {});
+      // A missing LLM is only a warning now (B4); a genuine fail comes from a
+      // deterministic check — here an existing-but-unparseable config.
+      const { access } = await import('node:fs/promises');
+      vi.mocked(access).mockResolvedValue(undefined);
+      const configManager = await import('../../core/services/config-manager.js');
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue(null);
+
+      const checks = await runDoctorJson();
+      const configCheck = checks.find(c => c.name === 'openlore config')!;
+      expect(configCheck.status).toBe('fail');
+      const failures = checks.filter(c => c.status === 'fail');
+      expect(failures.length).toBeGreaterThan(0);
+    });
+
+    it('missing LLM/embedding alone does NOT fail (exit stays 0)', async () => {
+      consoleSpy.mockImplementation(() => {});
+      // Valid, parseable config so the deterministic checks all pass/warn.
+      const configManager = await import('../../core/services/config-manager.js');
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+      } as never);
       const keyVars = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENAI_COMPAT_API_KEY'];
       const saved: Record<string, string | undefined> = {};
       for (const k of keyVars) { saved[k] = process.env[k]; delete process.env[k]; }
@@ -365,16 +908,11 @@ describe('doctor command', () => {
       vi.mocked(llmService.createLLMService).mockImplementationOnce(() => {
         throw new Error('No API key');
       });
-
       try {
-        // Confirm via JSON mode that the LLM check is a 'fail'
         const checks = await runDoctorJson();
         const llmCheck = checks.find(c => c.name === 'LLM connection')!;
-        expect(llmCheck.status).toBe('fail');
-        // The JSON path returns early, so exitCode is only set in the non-JSON path.
-        // Verify the failure count reported includes at least one failure.
-        const failures = checks.filter(c => c.status === 'fail');
-        expect(failures.length).toBeGreaterThan(0);
+        expect(llmCheck.status).toBe('warn');
+        expect(checks.filter(c => c.status === 'fail')).toHaveLength(0);
       } finally {
         for (const k of keyVars) { if (saved[k] !== undefined) process.env[k] = saved[k]; else delete process.env[k]; }
       }
@@ -388,7 +926,7 @@ describe('doctor command', () => {
       mockExecSuccess();
 
       try {
-        await doctorCommand.parseAsync(['node', 'doctor'], { from: 'user' });
+        await doctorCommand.parseAsync([], { from: 'user' });
         expect(process.exitCode).not.toBe(1);
       } finally {
         if (saved['ANTHROPIC_API_KEY'] === undefined) delete process.env.ANTHROPIC_API_KEY;
@@ -406,7 +944,7 @@ describe('doctor command', () => {
       vi.mocked(stat).mockResolvedValue({ mtime: new Date() } as ReturnType<typeof stat> extends Promise<infer T> ? T : never);
       vi.mocked(access).mockResolvedValue(undefined);
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.readSpecGenConfig).mockResolvedValue({
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
         projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
       } as never);
 
@@ -422,35 +960,63 @@ describe('doctor command', () => {
 
       const loggerModule = await import('../../utils/logger.js');
       vi.mocked(loggerModule.logger.success).mockClear();
+      const { VectorIndex } = await import('../../core/analyzer/vector-index.js');
+      const indexExists = vi.spyOn(VectorIndex, 'exists').mockReturnValue(true);
 
       try {
-        await doctorCommand.parseAsync(['node', 'doctor'], { from: 'user' });
+        await doctorCommand.parseAsync([], { from: 'user' });
         expect(vi.mocked(loggerModule.logger.success)).toHaveBeenCalledWith('All checks passed!');
       } finally {
+        indexExists.mockRestore();
         if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = saved;
       }
     });
 
-    it('non-JSON: logger.error called and exitCode=1 when a check fails', async () => {
+    it('non-JSON: logger.error called and exitCode=1 when a deterministic check fails', async () => {
       doctorCommand.setOptionValue('json', false);
 
+      // Trigger a genuine fail via an existing-but-unparseable config (missing
+      // LLM would only warn now, B4).
+      const { access } = await import('node:fs/promises');
+      vi.mocked(access).mockResolvedValue(undefined);
+      const configManager = await import('../../core/services/config-manager.js');
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue(null);
+
+      const loggerModule = await import('../../utils/logger.js');
+      vi.mocked(loggerModule.logger.error).mockClear();
+
+      await doctorCommand.parseAsync([], { from: 'user' });
+      expect(vi.mocked(loggerModule.logger.error)).toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('non-JSON summary names the warned check, not a hardcoded "optional features" line (fix-cli-output-hygiene)', async () => {
+      doctorCommand.setOptionValue('json', false);
+
+      // Valid config so nothing FAILS; drop every provider key so the LLM check WARNS.
+      const configManager = await import('../../core/services/config-manager.js');
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
+        projectType: 'nodejs', createdAt: '2024-01-01T00:00:00Z', openspecPath: './openspec', maxFiles: 500,
+      } as never);
       const keyVars = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENAI_COMPAT_API_KEY'];
       const saved: Record<string, string | undefined> = {};
       for (const k of keyVars) { saved[k] = process.env[k]; delete process.env[k]; }
 
       const llmService = await import('../../core/services/llm-service.js');
-      vi.mocked(llmService.createLLMService).mockImplementationOnce(() => {
-        throw new Error('No API key');
-      });
+      vi.mocked(llmService.createLLMService).mockImplementationOnce(() => { throw new Error('No API key'); });
 
       const loggerModule = await import('../../utils/logger.js');
-      vi.mocked(loggerModule.logger.error).mockClear();
+      vi.mocked(loggerModule.logger.warning).mockClear();
 
       try {
-        await doctorCommand.parseAsync(['node', 'doctor'], { from: 'user' });
-        expect(vi.mocked(loggerModule.logger.error)).toHaveBeenCalled();
-        expect(process.exitCode).toBe(1);
+        await doctorCommand.parseAsync([], { from: 'user' });
+        const warnCalls = vi.mocked(loggerModule.logger.warning).mock.calls.map(c => String(c[0]));
+        const summary = warnCalls.find(m => /\d+ warning\(s\):/.test(m));
+        expect(summary, `expected a summary warning; got: ${JSON.stringify(warnCalls)}`).toBeTruthy();
+        // Derived from the actual warned checks, not the old hardcoded assumption.
+        expect(summary).toContain('LLM connection');
+        expect(summary).not.toContain('optional features (LLM generate, embeddings) may be limited');
       } finally {
         for (const k of keyVars) { if (saved[k] !== undefined) process.env[k] = saved[k]; else delete process.env[k]; }
       }
@@ -487,6 +1053,92 @@ describe('doctor command', () => {
       const diskCheck = checks.find(c => c.name === 'Disk space')!;
       expect(diskCheck.status).toBe('ok');
       expect(diskCheck.detail).toContain('MB available');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe('MCP wiring check', () => {
+    /**
+     * Make readFile return given JSON for matching relative paths, ENOENT otherwise.
+     *
+     * Separators normalised before matching: the code under test builds its paths with
+     * `join`, so on Windows it asks for `…\.claude\settings.json` and a POSIX-spelled
+     * suffix here would match nothing — the fixture would silently claim the file is
+     * absent instead of exercising the check.
+     */
+    async function mockMcpFiles(files: Record<string, unknown>): Promise<void> {
+      const { readFile } = await import('node:fs/promises');
+      vi.mocked(readFile).mockImplementation(((p: any) => {
+        const path = String(p).split('\\').join('/');
+        for (const [rel, content] of Object.entries(files)) {
+          if (path.endsWith(rel)) return Promise.resolve(JSON.stringify(content));
+        }
+        return Promise.reject(new Error('ENOENT'));
+      }) as never);
+    }
+
+    const OPENLORE_SERVER = { mcpServers: { openlore: { command: 'npx', args: ['--yes', 'openlore', 'mcp'] } } };
+
+    it('is omitted when no MCP wiring is present', async () => {
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'MCP wiring')).toBeUndefined();
+    });
+
+    it('warns when the server lives only in .claude/settings.json', async () => {
+      await mockMcpFiles({ '.claude/settings.json': OPENLORE_SERVER });
+      const checks = await runDoctorJson();
+      const mcp = checks.find(c => c.name === 'MCP wiring')!;
+      expect(mcp.status).toBe('warn');
+      expect(mcp.detail).toContain('settings.json');
+      expect(mcp.fix).toContain('--force');
+    });
+
+    it('passes when the server lives in .mcp.json', async () => {
+      await mockMcpFiles({ '.mcp.json': OPENLORE_SERVER });
+      const checks = await runDoctorJson();
+      const mcp = checks.find(c => c.name === 'MCP wiring')!;
+      expect(mcp.status).toBe('ok');
+    });
+
+    // The wired entry names an absolute launcher since fix-windows-console-flash-from-npx-shim.
+    // That buys a console window fewer per agent turn on Windows, and costs a path that a
+    // moved install can invalidate — where the only other symptom is a silent hook failure.
+    const DIRECT_SERVER = {
+      mcpServers: {
+        openlore: {
+          command: '/usr/local/bin/node',
+          args: ['/usr/local/lib/node_modules/openlore/dist/cli/index.js', 'mcp', '--preset', 'substrate'],
+        },
+      },
+    };
+
+    it('warns when the wired launcher path no longer exists', async () => {
+      await mockMcpFiles({ '.mcp.json': DIRECT_SERVER });
+      const { access } = await import('node:fs/promises');
+      vi.mocked(access).mockRejectedValue(new Error('ENOENT'));
+
+      const checks = await runDoctorJson();
+      const mcp = checks.find(c => c.name === 'MCP wiring')!;
+      expect(mcp.status).toBe('warn');
+      expect(mcp.detail).toContain('dist/cli/index.js');
+      expect(mcp.fix).toContain('--force');
+    });
+
+    it('passes when the wired launcher is still on disk', async () => {
+      await mockMcpFiles({ '.mcp.json': DIRECT_SERVER });
+      const { access } = await import('node:fs/promises');
+      vi.mocked(access).mockResolvedValue(undefined);
+
+      const checks = await runDoctorJson();
+      expect(checks.find(c => c.name === 'MCP wiring')!.status).toBe('ok');
+    });
+
+    it('warns about a stale settings.json entry when both files have it', async () => {
+      await mockMcpFiles({ '.claude/settings.json': OPENLORE_SERVER, '.mcp.json': OPENLORE_SERVER });
+      const checks = await runDoctorJson();
+      const mcp = checks.find(c => c.name === 'MCP wiring')!;
+      expect(mcp.status).toBe('warn');
+      expect(mcp.detail).toContain('stale');
     });
   });
 });

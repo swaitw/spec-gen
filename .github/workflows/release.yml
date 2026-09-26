@@ -1,23 +1,108 @@
 name: Release
 
+# Publishes `openlore` to npm with provenance using npm Trusted Publishing
+# (OIDC) — no long-lived NPM_TOKEN required. See docs/publishing.md for the
+# one-time setup steps on the npmjs.com side.
+#
+# Triggers (any of these runs validate/build/pack → [create GitHub Release] → publish):
+#   - push of a `v*` tag  — the normal path. Pushing the tag auto-creates the
+#     GitHub Release (with generated notes) and publishes to npm in one run.
+#   - a GitHub Release published manually in the UI — the create-release job is
+#     skipped (the Release already exists) and publish runs.
+#   - workflow_dispatch — manual re-publish of an existing tag if a prior run
+#     failed mid-way.
+#
+# Note on the no-double-run: a Release created by this workflow with the default
+# GITHUB_TOKEN does NOT emit a `release: published` event, so the tag-push path
+# does not re-trigger itself via the release trigger.
+
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v2.0.2). Must already exist on origin.'
+        required: true
+        type: string
+
+# Workflow-level floor. Individual jobs widen this only where they must:
+# `create-release` needs `contents: write`, `publish` needs `id-token: write`.
+# Without a floor here, every job inherits the repo-wide default — a setting that
+# can be changed outside this file, so the least-privilege guarantee would not be
+# visible in (or enforced by) the workflow itself.
+permissions:
+  contents: read
 
 jobs:
   validate:
     name: Validate Release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          # workflow_dispatch → the explicitly-named tag.
+          # push (tag) and release events → github.ref already points at the tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
           cache: 'npm'
 
       - run: npm ci
+
+      # Fail fast and loud if the tag doesn't match package.json's version.
+      # Without this, a tag pushed without the matching `chore(release)` bump
+      # sails through validate and dies late in `npm publish` with the cryptic
+      # "cannot publish over the previously published version" (this is exactly
+      # how the first v2.0.6 publish failed). Catch it here with a clear message.
+      #
+      # The tag reaches the shell via `env:`, never inline `${{ }}`: interpolation is
+      # substituted into the script text before bash parses it, so a tag name carrying
+      # shell metacharacters would execute rather than compare. Pushing a tag takes
+      # write access, so this hardens a latent pattern rather than closing an external
+      # hole — but it is the pattern that gets copied into the next workflow, where
+      # the input may not be trusted.
+      - name: Verify tag matches package.json version
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          TAG="$RELEASE_TAG"
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Release tag '$TAG' does not match package.json version '$PKG'. Bump package.json + package-lock.json in a chore(release) commit, retag at that commit, and re-run."
+            exit 1
+          fi
+          echo "Tag '$TAG' matches package.json version '$PKG'."
+
+      # A tag is not a reviewed release boundary by itself: a collaborator could tag
+      # an off-main commit and bypass branch protection. Require both a real tag at
+      # this checkout and ancestry from the protected default branch.
+      - name: Verify release commit is reachable from main
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          TAG_REF="refs/tags/$RELEASE_TAG^{commit}"
+          TAG_COMMIT="$(git rev-parse --verify "$TAG_REF")"
+          CHECKED_OUT_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$CHECKED_OUT_COMMIT" ]; then
+            echo "::error::Checked-out commit $CHECKED_OUT_COMMIT does not match tag $RELEASE_TAG ($TAG_COMMIT)."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+            echo "::error::Release tag $RELEASE_TAG points to a commit that is not reachable from origin/main."
+            exit 1
+          fi
 
       - name: Run linting
         run: npm run lint
@@ -25,41 +110,171 @@ jobs:
       - name: Run type check
         run: npm run typecheck
 
-      - name: Run tests
-        run: npm run test:run
-
+      # Hook-installation tests exercise the real installation-derived launcher.
+      # Build it before the test suite, just as the required CI unit lane does.
       - name: Build
         run: npm run build
 
-  release:
-    name: Publish to npm
+      # Same split the CI unit job uses, and it must cover the same FILES that
+      # `test:run` did: `test:unit` excludes both the equivalence set and the budget
+      # set, so each needs its own step or a release would silently test less than CI.
+      - name: Certify derived-artifact answer equivalence
+        run: npm run test:equivalence
+
+      # Wall-clock ceilings on hostile inputs: run without file parallelism so runner
+      # contention cannot fail a release over a timing bound rather than a real defect.
+      - name: Certify extractor cost budgets
+        run: npm run test:budgets
+
+      - name: Run tests
+        run: npm run test:unit
+
+      - name: Run deterministic integration tests
+        run: npm run test:integration:ci
+
+      - name: Audit dependencies
+        run: npm run audit:gate
+
+      # The required CI lane checks both of these; a release must not be the weaker
+      # path. `prepublishOnly` nominally covers them, but it never executes here --
+      # the tarball is built with `npm pack` and published with `--ignore-scripts`.
+      - name: Check lockfile integrity digests
+        run: npm run lock:integrity:check
+
+      - name: Audit for unreferenced dependencies
+        run: npm run audit:deps
+
+      - name: Verify published API consumer contract
+        run: npm run test:api-consumer
+
+      - name: Verify the published tarball contents
+        run: npm run audit:packlist
+
+      # Build the exact immutable input consumed by the OIDC job. Dependency
+      # installation, tests, builds, and package scripts stay in this read-only job.
+      - name: Pack the npm release artifact
+        run: |
+          npm pack --json
+          shopt -s nullglob
+          packages=(openlore-*.tgz)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one npm tarball, found ${#packages[@]}."
+            exit 1
+          fi
+          sha256sum "${packages[0]}" > openlore-package.sha256
+
+      - name: Upload the npm release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package
+          path: |
+            openlore-*.tgz
+            openlore-package.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  create-release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: validate
+    # Only the tag-push path creates the Release. On `release: published` the
+    # Release already exists; on workflow_dispatch we re-publish an existing tag.
+    if: github.event_name == 'push'
+    timeout-minutes: 10
     permissions:
       contents: write
-      id-token: write
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
-          cache: 'npm'
+          ref: ${{ github.ref }}
+          # `gh release create` authenticates with GH_TOKEN from the env, not with git
+          # credentials, so nothing here needs the token written into .git/config.
+          persist-credentials: false
+
+      # Create the Release for this tag, unless one already exists (idempotent —
+      # safe to re-run). Created with GITHUB_TOKEN, so it deliberately does NOT
+      # fire another `release: published` run.
+      #
+      # Notes source: prefer the hand-written CHANGELOG.md section for this
+      # version (the tasteful, user-facing notes), and fall back to GitHub's
+      # auto-generated notes only if that section is missing or empty — so a
+      # forgotten changelog entry degrades to a PR list rather than blocking.
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping creation."
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          NOTES_FILE="$(mktemp)"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md > "$NOTES_FILE"
+          if [ -s "$NOTES_FILE" ]; then
+            echo "Using CHANGELOG.md section for $VERSION as release notes."
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" --verify-tag
+          else
+            echo "No CHANGELOG.md section for $VERSION — falling back to auto-generated notes."
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [validate, create-release]
+    # Run after validate succeeds and create-release either succeeded (tag-push)
+    # or was skipped (release / workflow_dispatch paths).
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    # `id-token: write` is required for npm Trusted Publishing (OIDC) and for
+    # `npm publish --provenance` to mint an attestation.
+    permissions:
+      contents: read
+      id-token: write
+    # Scopes the OIDC token to a named environment so npm's Trusted Publisher
+    # config can require it. Create this environment under repo
+    # Settings → Environments before enabling Trusted Publishing.
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/openlore
+    timeout-minutes: 20
+    steps:
+      # This job deliberately has no checkout, dependency install, build, or package
+      # lifecycle execution. Only the tarball produced by the no-OIDC validation job
+      # crosses into the trusted-publishing boundary.
+      - name: Download the npm release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: release-artifact
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - run: npm ci
+      - name: Verify the npm release artifact
+        working-directory: release-artifact
+        run: sha256sum --check openlore-package.sha256
 
-      - name: Build
-        run: npm run build
-
+      # No NODE_AUTH_TOKEN — npm picks up the OIDC token automatically when
+      # `id-token: write` is set and the package is configured for Trusted
+      # Publishing on npmjs.com. --provenance attaches a signed attestation
+      # linking this build to this repo + this workflow run.
       - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: release-artifact
+        run: |
+          shopt -s nullglob
+          packages=(openlore-*.tgz)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one npm tarball, found ${#packages[@]}."
+            exit 1
+          fi
+          npm publish "${packages[0]}" --ignore-scripts --provenance --access public

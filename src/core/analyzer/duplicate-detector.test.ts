@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { detectDuplicates } from './duplicate-detector.js';
+import { detectDuplicates, findClones } from './duplicate-detector.js';
 import type { DuplicateDetectionResult } from './duplicate-detector.js';
 import type { CallGraphResult, FunctionNode } from './call-graph.js';
 
@@ -543,5 +543,393 @@ describe('detectDuplicates — C++ functions', () => {
 
     expect(result.cloneGroups).toHaveLength(1);
     expect(result.cloneGroups[0].type).toBe('structural');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findClones — one-vs-all clone query
+// ---------------------------------------------------------------------------
+
+describe('findClones — one-vs-all query', () => {
+  const queryBody = `function computeTotal(items) {
+  let sum = 0;
+  for (const item of items) {
+    sum += item.price;
+  }
+  return sum;
+}`;
+
+  // An exact clone (only comments/whitespace differ), a structural clone (renamed),
+  // and an unrelated function.
+  const exactVariant = `function computeTotal(items) {
+  /* recalc */
+  let  sum = 0;
+  for (const item of items) {
+    sum += item.price;
+  }
+  return sum;
+}`;
+  const structuralVariant = `function addUp(values) {
+  let acc = 0;
+  for (const value of values) {
+    acc += value.cost;
+  }
+  return acc;
+}`;
+  const unrelated = `function greet(name) {
+  const msg = 'hello ' + name;
+  console.log(msg);
+  console.log(msg);
+  return msg;
+}`;
+
+  function fixture() {
+    const fExact = buildFile([exactVariant]);
+    const fStruct = buildFile([structuralVariant]);
+    const fOther = buildFile([unrelated]);
+    const fSelf = buildFile([queryBody]);
+    const files = [
+      { path: '/exact.ts', content: fExact.content },
+      { path: '/struct.ts', content: fStruct.content },
+      { path: '/other.ts', content: fOther.content },
+      { path: '/self.ts', content: fSelf.content },
+    ];
+    const nodes: FunctionNode[] = [
+      makeNode({ id: 'e', name: 'computeTotal', filePath: '/exact.ts', startIndex: fExact.offsets[0].start, endIndex: fExact.offsets[0].end }),
+      makeNode({ id: 's', name: 'addUp', filePath: '/struct.ts', startIndex: fStruct.offsets[0].start, endIndex: fStruct.offsets[0].end }),
+      makeNode({ id: 'o', name: 'greet', filePath: '/other.ts', startIndex: fOther.offsets[0].start, endIndex: fOther.offsets[0].end }),
+      makeNode({ id: 'self', name: 'computeTotal', filePath: '/self.ts', startIndex: fSelf.offsets[0].start, endIndex: fSelf.offsets[0].end }),
+    ];
+    return { files, nodes, fSelf };
+  }
+
+  it('classifies exact, structural, and near matches and ranks exact first', () => {
+    const { files, nodes } = fixture();
+    const res = findClones(queryBody, 7, files, nodes);
+    const exact = res.matches.filter(m => m.type === 'exact');
+    const structural = res.matches.filter(m => m.type === 'structural');
+    expect(exact.map(m => m.file)).toContain('/exact.ts');
+    expect(structural.map(m => m.file)).toContain('/struct.ts');
+    // Unrelated function must not appear.
+    expect(res.matches.map(m => m.file)).not.toContain('/other.ts');
+    // exact ranks before structural.
+    expect(res.matches[0].type).toBe('exact');
+    expect(res.belowThreshold).toBe(false);
+  });
+
+  it('excludes the query\'s own instance (symbol mode) by byte range', () => {
+    const { files, nodes, fSelf } = fixture();
+    const res = findClones(queryBody, 7, files, nodes, {
+      exclude: { filePath: '/self.ts', startIndex: fSelf.offsets[0].start, endIndex: fSelf.offsets[0].end },
+    });
+    expect(res.matches.map(m => m.file)).not.toContain('/self.ts');
+    // The /self.ts node would otherwise be an exact self-match; only /exact.ts remains exact.
+    expect(res.matches.filter(m => m.type === 'exact').map(m => m.file)).toEqual(['/exact.ts']);
+  });
+
+  it('coerces a non-finite similarity floor to the default (NaN-safe)', () => {
+    const { files, nodes } = fixture();
+    // A NaN floor must NOT silently drop every near match or report a NaN/null floor.
+    const nan = findClones(queryBody, 7, files, nodes, { minSimilarity: NaN });
+    expect(nan.similarityFloor).toBe(0.7);
+    expect(Number.isFinite(nan.similarityFloor)).toBe(true);
+    // Infinity is also non-finite → falls back to the default floor (not clamped to 1).
+    const inf = findClones(queryBody, 7, files, nodes, { minSimilarity: Infinity });
+    expect(inf.similarityFloor).toBe(0.7);
+    // The default-floor result still finds the structural clone.
+    expect(nan.matches.some(m => m.type === 'structural')).toBe(true);
+  });
+
+  it('tie-break is fully deterministic for distinct matches on the same line', () => {
+    // Two structurally-identical functions sharing a startLine (different files) must order by file,
+    // not by input iteration order.
+    const body = `function alpha(items) {
+  let acc = 0;
+  for (const it of items) {
+    acc += it.v;
+  }
+  return acc;
+}`;
+    const fa = buildFile([body]);
+    const fb = buildFile([body]);
+    const files = [
+      { path: '/z.ts', content: fb.content },
+      { path: '/a.ts', content: fa.content },
+    ];
+    const fwd: FunctionNode[] = [
+      makeNode({ id: 'z', name: 'beta', filePath: '/z.ts', startIndex: fb.offsets[0].start, endIndex: fb.offsets[0].end }),
+      makeNode({ id: 'a', name: 'gamma', filePath: '/a.ts', startIndex: fa.offsets[0].start, endIndex: fa.offsets[0].end }),
+    ];
+    const rev: FunctionNode[] = [...fwd].reverse();
+    const r1 = findClones(body, 7, files, fwd);
+    const r2 = findClones(body, 7, files, rev);
+    expect(r1.matches.map(m => m.file)).toEqual(['/a.ts', '/z.ts']);
+    expect(JSON.stringify(r1.matches)).toBe(JSON.stringify(r2.matches));
+  });
+
+  it('reports belowThreshold for a too-small query without comparing', () => {
+    const { files, nodes } = fixture();
+    const tiny = `function t(x) {\n  return x;\n}`;
+    const res = findClones(tiny, 3, files, nodes);
+    expect(res.belowThreshold).toBe(true);
+    expect(res.matches).toHaveLength(0);
+    expect(res.comparedAgainst).toBe(0);
+  });
+
+  it('is deterministic — byte-identical across runs', () => {
+    const { files, nodes } = fixture();
+    const a = findClones(queryBody, 7, files, nodes);
+    const b = findClones(queryBody, 7, files, nodes);
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+
+  it('honors the similarity floor and reports it', () => {
+    const { files, nodes } = fixture();
+    const high = findClones(queryBody, 7, files, nodes, { minSimilarity: 0.99 });
+    expect(high.similarityFloor).toBe(0.99);
+    // exact/structural still included regardless of the near floor.
+    expect(high.matches.some(m => m.type === 'exact')).toBe(true);
+    // A floor above 1 is clamped to 1; below 0.1 is clamped to 0.1.
+    expect(findClones(queryBody, 7, files, nodes, { minSimilarity: 5 }).similarityFloor).toBe(1);
+    expect(findClones(queryBody, 7, files, nodes, { minSimilarity: 0 }).similarityFloor).toBe(0.1);
+  });
+
+  it('respects the limit', () => {
+    const { files, nodes } = fixture();
+    const res = findClones(queryBody, 7, files, nodes, { limit: 1 });
+    expect(res.matches).toHaveLength(1);
+  });
+
+  it('carries each match\'s source language (so cross-language matches are visible)', () => {
+    const { files, nodes } = fixture();
+    const res = findClones(queryBody, 7, files, nodes);
+    expect(res.matches.length).toBeGreaterThan(0);
+    expect(res.matches.every(m => m.language === 'TypeScript')).toBe(true);
+  });
+
+  it('surfaces a cross-language clone with its OWN language (query TS, clone C++)', () => {
+    // A C-family body that is byte-identical in TypeScript and C++ — a real cross-language clone the
+    // language-agnostic normalization will match. The match must report C++, not the query's language.
+    const body = `function process(items) {
+  let total = 0;
+  for (const item of items) {
+    total += item.value;
+  }
+  return total;
+}`;
+    const fts = buildFile([body]);
+    const fcpp = buildFile([body]);
+    const files = [
+      { path: '/a.ts', content: fts.content },
+      { path: '/b.cpp', content: fcpp.content },
+    ];
+    const nodes: FunctionNode[] = [
+      makeNode({ id: 'ts', name: 'process', filePath: '/a.ts', language: 'TypeScript', startIndex: fts.offsets[0].start, endIndex: fts.offsets[0].end }),
+      makeNode({ id: 'cpp', name: 'process', filePath: '/b.cpp', language: 'C++', startIndex: fcpp.offsets[0].start, endIndex: fcpp.offsets[0].end }),
+    ];
+    // Query is the TS function; exclude its own instance. The C++ clone must surface, labeled C++.
+    const res = findClones(body, 7, files, nodes, {
+      exclude: { filePath: '/a.ts', startIndex: fts.offsets[0].start, endIndex: fts.offsets[0].end },
+    });
+    const cpp = res.matches.find(m => m.file === '/b.cpp');
+    expect(cpp).toBeDefined();
+    expect(cpp!.language).toBe('C++');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// String-literal-safe normalization (fix-clone-string-normalization)
+//
+// Comment stripping used to run string-blind, so a comment marker INSIDE a
+// literal (`//` in a URL, `#` in a hex color / anchor, Ruby `#{...}`) truncated
+// the literal — two bodies differing only there normalized identical and were
+// reported as clones at 1.0. These pin that the literal contents now survive.
+// ---------------------------------------------------------------------------
+
+describe('detectDuplicates — string-literal-safe normalization', () => {
+  /** Detect duplicates for a two-function fixture, one function per file. */
+  function pair(bodyA: string, bodyB: string, language = 'TypeScript') {
+    const fa = buildFile([bodyA]);
+    const fb = buildFile([bodyB]);
+    const nodes: FunctionNode[] = [
+      makeNode({ id: 'a', name: 'fa', filePath: '/a.ts', language, startIndex: fa.offsets[0].start, endIndex: fa.offsets[0].end }),
+      makeNode({ id: 'b', name: 'fb', filePath: '/b.ts', language, startIndex: fb.offsets[0].start, endIndex: fb.offsets[0].end }),
+    ];
+    return detectDuplicates(
+      [{ path: '/a.ts', content: fa.content }, { path: '/b.ts', content: fb.content }],
+      makeCallGraph(nodes),
+    );
+  }
+
+  it('two TS functions differing only in a URL inside a string are NOT exact/structural clones', () => {
+    // The `//` in the URL used to truncate both to `const url = "https:` → false exact clone.
+    const a = `function fetchUsers(client) {
+  const url = "https://api.example.com/users";
+  const res = client.get(url);
+  const parsed = parse(res.body);
+  return parsed.items;
+}`;
+    const b = `function fetchUsers(client) {
+  const url = "https://cdn.other.org/v2/data/records";
+  const res = client.get(url);
+  const parsed = parse(res.body);
+  return parsed.items;
+}`;
+    const result = pair(a, b);
+    expect(result.cloneGroups.filter(g => g.type === 'exact')).toHaveLength(0);
+    expect(result.cloneGroups.filter(g => g.type === 'structural')).toHaveLength(0);
+    // Any similarity that IS reported reflects the literal difference — strictly below 1.0.
+    for (const g of result.cloneGroups) expect(g.similarity).toBeLessThan(1.0);
+  });
+
+  it('two Python functions differing only in a hex-color string are NOT exact/structural clones', () => {
+    // The `#` in `"#ff0000"` used to truncate both to `color = "` → false exact clone.
+    const a = `def make_style():
+    color = "#ff0000"
+    border = solid(color)
+    fill = shade(color)
+    theme = build(border, fill)
+    return theme`;
+    const b = `def make_style():
+    color = "#00ff00"
+    border = solid(color)
+    fill = shade(color)
+    theme = build(border, fill)
+    return theme`;
+    const result = pair(a, b, 'Python');
+    expect(result.cloneGroups.filter(g => g.type === 'exact')).toHaveLength(0);
+    expect(result.cloneGroups.filter(g => g.type === 'structural')).toHaveLength(0);
+  });
+
+  it('the `#` rule is language-selected: a `#` inside a TS string literal survives', () => {
+    // TS: `#` is not a comment. The literal content after `#` (digits) must survive so the two
+    // bodies stay distinguishable (they would both collapse to `const a = "col` if `#` truncated).
+    const a = `function tag() {
+  const a = "col#100";
+  const b = combine(a);
+  const c = refine(b);
+  const d = finalize(c);
+  return d;
+}`;
+    const b = `function tag() {
+  const a = "col#200";
+  const b = combine(a);
+  const c = refine(b);
+  const d = finalize(c);
+  return d;
+}`;
+    const result = pair(a, b);
+    expect(result.cloneGroups.filter(g => g.type === 'exact')).toHaveLength(0);
+    expect(result.cloneGroups.filter(g => g.type === 'structural')).toHaveLength(0);
+  });
+
+  it('the `#` rule is language-selected: a TS `#private` field is not stripped', () => {
+    // Outside a string too: `this.#alpha` vs `this.#beta` used to both strip to `const v = this.`
+    // → false exact clone. TS `#` is code, so the field content must survive (not exact).
+    const a = `function read() {
+  const v = this.#alpha;
+  const w = wrap(v);
+  const x = scale(w);
+  const y = clamp(x);
+  return y;
+}`;
+    const b = `function read() {
+  const v = this.#beta;
+  const w = wrap(v);
+  const x = scale(w);
+  const y = clamp(x);
+  return y;
+}`;
+    const result = pair(a, b);
+    expect(result.cloneGroups.filter(g => g.type === 'exact')).toHaveLength(0);
+  });
+
+  it('Ruby `#{...}` interpolation does not truncate its line', () => {
+    // Ruby IS a `#`-comment language, but `#{...}` inside a string must be protected. Differing
+    // only in the digits after the interpolation, the pair must stay distinguishable (not exact).
+    const a = `def build(key)
+  value = "id-#{key}-100"
+  a = wrap(value)
+  b = scale(a)
+  c = clamp(b)
+  return c
+end`;
+    const b = `def build(key)
+  value = "id-#{key}-200"
+  a = wrap(value)
+  b = scale(a)
+  c = clamp(b)
+  return c
+end`;
+    const result = pair(a, b, 'Ruby');
+    expect(result.cloneGroups.filter(g => g.type === 'exact')).toHaveLength(0);
+    expect(result.cloneGroups.filter(g => g.type === 'structural')).toHaveLength(0);
+  });
+
+  it('true clones are still detected: identical Python bodies differing only in `#` comments', () => {
+    // The `#` rule STILL removes genuine Python comments, so a real copy-paste is still exact.
+    const a = `def total(items):
+    # sum the prices
+    s = 0
+    for it in items:
+        s = s + it.price
+    return s`;
+    const b = `def total(items):
+    # recompute total
+    s = 0
+    for it in items:
+        s = s + it.price
+    return s`;
+    const result = pair(a, b, 'Python');
+    const exact = result.cloneGroups.filter(g => g.type === 'exact');
+    expect(exact).toHaveLength(1);
+    expect(exact[0].similarity).toBe(1.0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Near-group similarity honesty (fix-clone-string-normalization)
+//
+// A near group's reported similarity is the ALL-PAIRS minimum, not seed-vs-member —
+// so two members far apart from each other cannot be presented as a tight group.
+// ---------------------------------------------------------------------------
+
+describe('detectDuplicates — near-group similarity is the all-pairs floor', () => {
+  // A shared 14-statement core plus three DIFFERENTLY-SHAPED tails (so Type 2 does not collapse
+  // them): the seed is closer to each member than the two members are to each other.
+  const core = Array.from({ length: 14 }, (_, i) => `  const s${i} = op${i}(s${i > 0 ? i - 1 : 0});`).join('\n');
+  const seed = `function seed() {\n${core}\n  return s13;\n}`;
+  const bee = `function bee() {\n${core}\n  if (s13 > 0) { log(s13); }\n  return s13;\n}`;
+  const cee = `function cee() {\n${core}\n  for (const q of s13) { emit(q); trace(q); }\n  return s13;\n}`;
+
+  function nearSim(bodies: Array<{ name: string; body: string }>): { sim: number; members: string[] } {
+    const files = bodies.map(b => ({ path: `/${b.name}.ts`, content: b.body + '\n\n' }));
+    const nodes: FunctionNode[] = bodies.map(b =>
+      makeNode({ id: b.name, name: b.name, filePath: `/${b.name}.ts`, startIndex: 0, endIndex: b.body.length }),
+    );
+    const groups = detectDuplicates(files, makeCallGraph(nodes)).cloneGroups.filter(g => g.type === 'near');
+    expect(groups).toHaveLength(1);
+    return { sim: groups[0].similarity, members: groups[0].instances.map(i => i.functionName).sort() };
+  }
+
+  it('reports the minimum over ALL member pairs, including non-seed pairs', () => {
+    const S = { name: 'seed', body: seed };
+    const B = { name: 'bee', body: bee };
+    const C = { name: 'cee', body: cee };
+
+    // Each pairwise near-similarity, computed independently from a two-function run.
+    const seedBee = nearSim([S, B]).sim;
+    const seedCee = nearSim([S, C]).sim;
+    const beeCee = nearSim([B, C]).sim;
+
+    const combined = nearSim([S, B, C]);
+    expect(combined.members).toEqual(['bee', 'cee', 'seed']);
+
+    // The group score equals the all-pairs minimum — which here is the bee↔cee pair, NOT a
+    // seed-relative pair. A seed-relative floor would have reported min(seedBee, seedCee) instead.
+    const allPairsMin = Math.min(seedBee, seedCee, beeCee);
+    expect(combined.sim).toBe(allPairsMin);
+    expect(allPairsMin).toBe(beeCee);
+    expect(beeCee).toBeLessThan(Math.min(seedBee, seedCee));
   });
 });

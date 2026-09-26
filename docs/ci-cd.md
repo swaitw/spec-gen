@@ -1,29 +1,40 @@
 ## CI/CD Integration
 
-spec-gen is designed to run in automated pipelines. The deterministic commands (`init`, `analyze`, `drift`, `test`, `digest`) need no API key and produce consistent results.
+openlore is designed to run in automated pipelines. The deterministic commands (`init`, `analyze`, `drift`, `test`, `digest`) need no API key and produce consistent results.
 
 ### Pre-Commit Hook
 
-spec-gen provides two pre-commit hooks that address spec alignment from opposite directions:
+openlore provides two pre-commit hooks that address spec alignment from opposite directions:
 
 | Hook | Direction | Speed | Installed via |
 |------|-----------|-------|---------------|
-| **Drift** | Reactive — code changed without spec | Milliseconds, no API key | `spec-gen drift --install-hook` |
-| **Decisions gate** | Proactive — pending decisions await review | Instant, no LLM | `spec-gen setup --tools claude` |
+| **Drift** | Reactive — code changed without spec | Milliseconds, no API key | `openlore drift --install-hook` |
+| **Decisions gate** | Proactive — pending decisions await review | Instant, no LLM | `openlore setup --tools claude` |
 
 **Drift hook** — blocks commits when code changes are not reflected in existing specs:
 
 ```bash
-spec-gen drift --install-hook     # Install
-spec-gen drift --uninstall-hook   # Remove
+openlore drift --install-hook     # Install
+openlore drift --uninstall-hook   # Remove
 ```
 
 **Decisions gate** — blocks commits until all recorded architectural decisions have been reviewed and approved. No LLM at commit time: consolidation runs in the background each time an agent calls `record_decision`, so by the time the hook fires, decisions are already verified.
 
 ```bash
-spec-gen setup --tools claude         # Install (also installs Claude Code skills)
-spec-gen decisions --uninstall-hook   # Remove decisions hook only
+openlore setup --tools claude         # Install (also installs Claude Code skills)
+openlore decisions --uninstall-hook   # Remove decisions hook only
 ```
+
+When the gate blocks, the JSON output includes a `reason` field:
+
+| Reason | Meaning | Action |
+|--------|---------|--------|
+| `verified` | Decisions consolidated and verified — await human review | Present to user, call `approve_decision` / `reject_decision`, then `--sync` |
+| `approved_not_synced` | Decisions approved but not written to specs yet | Run `openlore decisions --sync`, retry commit |
+| `drafts_pending_consolidation` | Drafts recorded but consolidation never ran | Run `openlore decisions --consolidate --gate` |
+| `no_decisions_recorded` | Source files staged but no decisions recorded | Run `openlore decisions --consolidate --gate` for fallback extraction |
+
+The gate uses a sentinel file (`.git/OPENLORE_GATE_RAN`) written by the pre-commit hook and checked by the post-commit hook. If a commit bypasses the gate via `--no-verify`, the post-commit hook detects the missing sentinel and logs a warning.
 
 **How they relate**: they address different failure modes and do not substitute for each other.
 
@@ -33,7 +44,7 @@ The drift hook asks: *"has this source file's spec coverage been kept up to date
 
 A commit can trigger drift without any decisions pending (a pure refactor touches a spec-covered file). A commit can have decisions synced without satisfying drift (syncing a decision appends a new requirement but does not update the spec's source file coverage metadata). Run both: decisions for design governance, drift as a coverage staleness check.
 
-Pending decisions are stored in `.spec-gen/decisions/pending.json` (auto-added to `.gitignore` on install).
+Pending decisions are stored in `.openlore/decisions/pending.json` (auto-added to `.gitignore` on install).
 
 ### GitHub Actions / CI Pipelines
 
@@ -51,17 +62,47 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm install -g spec-gen-cli
-      - run: spec-gen drift --fail-on error --json
+      - run: npm install -g openlore
+      - run: openlore drift --fail-on error --json
 ```
 
 ```bash
 # Or in any CI script
-spec-gen drift --fail-on error --json    # JSON output, fail on errors only
-spec-gen drift --fail-on warning         # Fail on warnings too
-spec-gen drift --domains auth,user       # Check specific domains
-spec-gen drift --no-color                # Plain output for CI logs
+openlore drift --fail-on error --json    # JSON output, fail on errors only
+openlore drift --fail-on warning         # Fail on warnings too
+openlore drift --domains auth,user       # Check specific domains
+openlore drift --no-color                # Plain output for CI logs
 ```
+
+### Bootstrap the index from a shared bundle
+
+Turn per-run cold indexing into a validated import plus (at most) a rebuild: commit a `.olbundle`
+artifact and `openlore import` it at the top of the job. Because import validates against the checked-out
+commit, catches up a bounded clean-ancestor delta, and falls back to a rebuild when it cannot prove
+that path safe, so it is safe to run unconditionally.
+
+```bash
+if [ -f .openlore/index-bundle.olbundle ]; then
+  openlore import .openlore/index-bundle.olbundle   # validated import, or transparent rebuild
+else
+  openlore analyze
+fi
+```
+
+See [shareable-bundle.md](shareable-bundle.md#ci-bootstrap-recipe).
+
+### Shard a monorepo analysis
+
+After restoring or building one complete index, CI jobs may update only the packages they own:
+
+```bash
+openlore analyze --shard payments --shard shared-contracts
+```
+
+The command retains the whole graph and re-resolves cross-package callers. It does not publish a
+repository-wide freshness fingerprint or rebuild repository-wide artifacts from partial input.
+Inspect `.openlore/analysis/workspace-shards.json` for retained-shard freshness and any explicitly
+stale frontier. If no prior index exists, the command performs a disclosed full analysis instead.
 
 ### Deterministic vs. LLM-Enhanced
 
@@ -72,4 +113,3 @@ spec-gen drift --no-color                # Plain output for CI logs
 | **Commands** | `analyze`, `drift`, `init` | `generate`, `verify`, `drift --use-llm` |
 | **Reproducibility** | Identical every run | May vary |
 | **Best for** | CI, pre-commit hooks, quick checks | Initial generation, reducing false positives |
-

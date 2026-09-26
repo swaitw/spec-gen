@@ -16,11 +16,19 @@
  *   const results = await SpecVectorIndex.search(outputDir, "email validation", embedSvc);
  */
 
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, dirname, relative, isAbsolute } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
-import type { EmbeddingService } from './embedding-service.js';
+import { isConfinedPath, readFileConfined } from '../../utils/path-confinement.js';
+import type { Embedder } from './embedding-service.js';
+import { tokenize, buildBm25Corpus, bm25MatchEvidence, bm25Score } from './vector-index.js';
+import type { MatchEvidence, SearchableFields } from './retrieval-evidence.js';
+import { vectorMatchEvidence } from './retrieval-evidence.js';
+import { atomicWriteFile } from '../decisions/atomic-store.js';
+import { acquireLockAt, isLockHeld } from '../runtime/advisory-lock.js';
+import { compareVocabularyRank, expandVocabularyQuery, scoredExpansionTerms } from './repo-vocabulary.js';
 
 // ============================================================================
 // TYPES
@@ -50,6 +58,11 @@ export interface SpecSearchResult {
     linkedFiles: string[];
   };
   score: number;
+  /** Optional for legacy test doubles; every production search path emits it. */
+  scoreKind?: 'bm25' | 'cosine_distance';
+  /** Optional for legacy test doubles; every production search path emits it. */
+  matchEvidence?: MatchEvidence;
+  expansionTerms?: string[];
 }
 
 // ============================================================================
@@ -59,7 +72,249 @@ export interface SpecSearchResult {
 const DB_FOLDER = 'vector-index';
 const TABLE_NAME = 'specs';
 
-// Mapping entry shape from .spec-gen/analysis/mapping.json
+/**
+ * Spec-index metadata sidecar, sibling to the LanceDB folder. Separate from the
+ * function index's `vector-index-meta.json` so the two tables can have
+ * independent embedding states. Source of truth for whether the spec table
+ * supports ANN search.
+ */
+const META_FILE = 'spec-index-meta.json';
+const FRESHNESS_FILE = 'spec-index-freshness.json';
+const SPEC_INDEX_LOCK_FILE = '.spec-index.lock';
+const META_SCHEMA_VERSION = 2;
+const SPEC_ARTIFACT_MAX_BYTES = 4 * 1024 * 1024;
+const FRESHNESS_MAX_BYTES = 256 * 1024;
+const FRESHNESS_RETURNED_FILES = 1_000;
+const FRESHNESS_MAX_PATH_BYTES = 1_024;
+const SPEC_INDEX_LOCK_MAX_WAIT_MS = 30_000;
+
+interface SpecIndexMeta {
+  hasEmbeddings: boolean;
+  dim: number;
+  model: string | null;
+  builtAt: string;
+  schemaVersion: number;
+  /** SHA-256 of the canonical, authoritative records used to build the table. */
+  recordsDigest: string;
+  recordCount: number;
+  /** SHA-256 of every persisted search-relevant field, including dense vectors. */
+  tableDigest: string;
+}
+
+export interface SpecIndexFreshness {
+  builtAt: string | null;
+  tracking: 'tracked' | 'unavailable';
+  changedFileCount: number | null;
+  changedFiles: string[];
+  changedFilesTruncated?: boolean;
+}
+
+export interface SpecSearchSnapshot {
+  results: SpecSearchResult[];
+  indexFreshness: SpecIndexFreshness | null;
+  retrievalMode: 'semantic' | 'keyword' | 'keyword+vocabulary';
+}
+
+interface LockedSpecSearchResult {
+  results: SpecSearchResult[];
+  retrievalMode: 'semantic' | 'keyword' | 'keyword+vocabulary';
+}
+
+export class SpecIndexLockTimeoutError extends Error {
+  readonly code = 'SPEC_INDEX_LOCK_TIMEOUT';
+
+  constructor(readonly timeoutMs: number) {
+    super(`spec-index lock was not acquired within ${timeoutMs}ms`);
+    this.name = 'SpecIndexLockTimeoutError';
+  }
+}
+
+export function isSpecIndexLockTimeoutError(
+  error: unknown,
+): error is SpecIndexLockTimeoutError {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; timeoutMs?: unknown };
+  return candidate.code === 'SPEC_INDEX_LOCK_TIMEOUT'
+    && typeof candidate.timeoutMs === 'number'
+    && Number.isFinite(candidate.timeoutMs);
+}
+
+interface SpecFreshnessReceipt {
+  schemaVersion: 1;
+  indexBuiltAt: string;
+  changedFiles: string[];
+  trackingUnavailable?: true;
+}
+
+type SpecMetaState =
+  | { kind: 'missing' }
+  | { kind: 'legacy'; meta: Omit<SpecIndexMeta, 'recordsDigest' | 'recordCount' | 'tableDigest'> }
+  | { kind: 'current'; meta: SpecIndexMeta }
+  | { kind: 'malformed' };
+
+function specMetaPath(outputDir: string): string {
+  return join(outputDir, META_FILE);
+}
+
+function specFreshnessPath(outputDir: string): string {
+  return join(outputDir, FRESHNESS_FILE);
+}
+
+function hasControlCharacters(value: string): boolean {
+  return [...value].some(character => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+}
+
+async function acquireSpecIndexLock(outputDir: string): Promise<() => Promise<void>> {
+  const result = await acquireLockAt(outputDir, SPEC_INDEX_LOCK_FILE, {
+    bestEffortAfterMaxWait: false,
+    maxWaitMs: SPEC_INDEX_LOCK_MAX_WAIT_MS,
+  });
+  if (isLockHeld(result)) {
+    throw new SpecIndexLockTimeoutError(SPEC_INDEX_LOCK_MAX_WAIT_MS);
+  }
+  return result.release;
+}
+
+function readSpecFreshnessReceipt(outputDir: string): SpecFreshnessReceipt | null {
+  try {
+    const path = specFreshnessPath(outputDir);
+    const fd = openSync(path, 'r');
+    let serialized: string;
+    try {
+      if (fstatSync(fd).size > FRESHNESS_MAX_BYTES) return null;
+      const buffer = Buffer.alloc(FRESHNESS_MAX_BYTES + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const count = readSync(fd, buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (count === 0) break;
+        bytesRead += count;
+      }
+      if (bytesRead > FRESHNESS_MAX_BYTES) return null;
+      serialized = buffer.subarray(0, bytesRead).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+    const value = JSON.parse(serialized) as unknown;
+    if (!value || typeof value !== 'object') return null;
+    const receipt = value as Record<string, unknown>;
+    if (receipt.schemaVersion !== 1 || typeof receipt.indexBuiltAt !== 'string'
+      || receipt.trackingUnavailable === true
+      || !Array.isArray(receipt.changedFiles)
+      || !receipt.changedFiles.every(file => typeof file === 'string'
+        && Buffer.byteLength(file) <= FRESHNESS_MAX_PATH_BYTES
+        && !isAbsolute(file)
+        && !file.split(/[\\/]/).includes('..')
+        && !hasControlCharacters(file))) return null;
+    return receipt as unknown as SpecFreshnessReceipt;
+  } catch {
+    return null;
+  }
+}
+
+function specSearchPredicate(domain?: string, section?: string): string | null {
+  const clauses: string[] = [];
+  if (domain) clauses.push(`\`domain\` = '${domain.replace(/'/g, "''")}'`);
+  if (section) clauses.push(`\`section\` = '${section.replace(/'/g, "''")}'`);
+  return clauses.length > 0 ? clauses.join(' AND ') : null;
+}
+
+function isLegacySpecMeta(
+  value: unknown,
+): value is Omit<SpecIndexMeta, 'recordsDigest' | 'recordCount' | 'tableDigest'> {
+  if (!value || typeof value !== 'object') return false;
+  const meta = value as Record<string, unknown>;
+  return meta.schemaVersion === 1
+    && typeof meta.hasEmbeddings === 'boolean'
+    && typeof meta.dim === 'number' && Number.isInteger(meta.dim) && meta.dim >= 0
+    && (typeof meta.model === 'string' || meta.model === null)
+    && typeof meta.builtAt === 'string'
+    && (meta.hasEmbeddings ? meta.dim > 0 : meta.dim === 0 && meta.model === null);
+}
+
+function isCurrentSpecMeta(value: unknown): value is SpecIndexMeta {
+  if (!value || typeof value !== 'object') return false;
+  const meta = value as Record<string, unknown>;
+  return meta.schemaVersion === META_SCHEMA_VERSION
+    && typeof meta.hasEmbeddings === 'boolean'
+    && typeof meta.dim === 'number' && Number.isInteger(meta.dim) && meta.dim >= 0
+    && (typeof meta.model === 'string' || meta.model === null)
+    && typeof meta.builtAt === 'string'
+    && typeof meta.recordsDigest === 'string' && /^[a-f0-9]{64}$/.test(meta.recordsDigest)
+    && typeof meta.recordCount === 'number' && Number.isInteger(meta.recordCount) && meta.recordCount > 0
+    && typeof meta.tableDigest === 'string' && /^[a-f0-9]{64}$/.test(meta.tableDigest)
+    && (meta.hasEmbeddings ? meta.dim > 0 : meta.dim === 0 && meta.model === null);
+}
+
+/** Missing is a legitimate legacy state; malformed or foreign-shaped bytes are not. */
+function readSpecMeta(outputDir: string): SpecMetaState {
+  const path = specMetaPath(outputDir);
+  if (!existsSync(path)) return { kind: 'missing' };
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    if (isCurrentSpecMeta(value)) return { kind: 'current', meta: value };
+    if (isLegacySpecMeta(value)) return { kind: 'legacy', meta: value };
+    return { kind: 'malformed' };
+  } catch {
+    return { kind: 'malformed' };
+  }
+}
+
+async function writeSpecMeta(outputDir: string, meta: SpecIndexMeta): Promise<void> {
+  await atomicWriteFile(specMetaPath(outputDir), JSON.stringify(meta, null, 2) + '\n');
+  // Establish an explicit zero point. If this second write is interrupted,
+  // freshness() reports unavailable rather than claiming a false zero.
+  await atomicWriteFile(specFreshnessPath(outputDir), JSON.stringify({
+    schemaVersion: 1,
+    indexBuiltAt: meta.builtAt,
+    changedFiles: [],
+  } satisfies SpecFreshnessReceipt, null, 2) + '\n');
+}
+
+type AuthoritativeSpecRecord = Omit<SpecRecord, 'vector'>;
+
+/** Order-independent digest of exactly the fields from which the searchable table is derived. */
+function digestSpecRecords(records: readonly AuthoritativeSpecRecord[]): string {
+  const canonical = records.map(record => JSON.stringify({
+    id: record.id,
+    domain: record.domain,
+    section: record.section,
+    title: record.title,
+    text: record.text,
+    linkedFiles: record.linkedFiles,
+  })).sort();
+  const hash = createHash('sha256');
+  hash.update(`spec-records-v1\n${canonical.length}\n`);
+  for (const record of canonical) hash.update(`${Buffer.byteLength(record)}:${record}\n`);
+  return hash.digest('hex');
+}
+
+function digestPersistedSpecRows(rows: readonly Record<string, unknown>[]): string {
+  const canonical = rows.map(row => JSON.stringify({
+    id: String(row.id ?? ''),
+    domain: String(row.domain ?? ''),
+    section: String(row.section ?? ''),
+    title: String(row.title ?? ''),
+    text: String(row.text ?? ''),
+    linkedFiles: String(row.linkedFiles ?? ''),
+    vector: row.vector == null ? null : Array.from(row.vector as ArrayLike<number>),
+  })).sort();
+  const hash = createHash('sha256');
+  hash.update(`persisted-spec-records-v1\n${canonical.length}\n`);
+  for (const record of canonical) hash.update(`${Buffer.byteLength(record)}:${record}\n`);
+  return hash.digest('hex');
+}
+
+const verifiedSpecTables = new Map<string, { metaDigest: string; tableVersion: number }>();
+
+/** Test-only: force the next search through the cold verification path. */
+export function _resetSpecVectorIndexVerificationCacheForTesting(): void {
+  verifiedSpecTables.clear();
+}
+
+// Mapping entry shape from .openlore/analysis/mapping.json
 interface MappingEntry {
   requirement: string;
   service?: string;
@@ -194,6 +449,83 @@ function buildText(domain: string, section: ParsedSection): string {
   return parts.join('\n');
 }
 
+export function searchableFieldsForSpecRow(row: Record<string, unknown>): SearchableFields {
+  const domain = String(row.domain ?? '');
+  const title = String(row.title ?? '');
+  const text = String(row.text ?? '');
+  const header = `[spec:${domain}] ${title}`;
+  const prose = text.startsWith(`${header}\n`) ? text.slice(header.length + 1) : '';
+  return {
+    symbol: title,
+    path: `[spec:${domain}]`,
+    doc: prose,
+  };
+}
+
+// ============================================================================
+// ADR PARSER
+// ============================================================================
+
+interface AdrRecord {
+  id: string;
+  domain: string;
+  section: string;
+  title: string;
+  text: string;
+  linkedFiles: string;
+}
+
+async function findAdrFiles(decisionsDir: string): Promise<string[]> {
+  if (!(await fileExists(decisionsDir))) return [];
+  try {
+    const entries = await readdir(decisionsDir);
+    return entries
+      .filter((f) => /^adr-\d+.*\.md$/i.test(f))
+      .map((f) => join(decisionsDir, f))
+      // Same symlink vector as findSpecFiles: an ADR-named link out of the repo.
+      .filter((p) => isConfinedPath(decisionsDir, p));
+  } catch (error) {
+    throw new Error(`Cannot enumerate authoritative decision directory ${decisionsDir}`, { cause: error });
+  }
+}
+
+async function parseAdrFiles(decisionsDir: string): Promise<AdrRecord[]> {
+  const files = await findAdrFiles(decisionsDir);
+  const records: AdrRecord[] = [];
+
+  for (const filePath of files) {
+    try {
+      const content = await readFileConfined(
+        decisionsDir,
+        relative(decisionsDir, filePath),
+        SPEC_ARTIFACT_MAX_BYTES,
+        false,
+        true,
+      );
+      const titleMatch = content.match(/^#\s+(ADR-\d+):\s+(.+)$/m);
+      if (!titleMatch) continue;
+      const adrNum = titleMatch[1];
+      const title = titleMatch[2].trim();
+
+      records.push({
+        id: `decisions.${adrNum.toLowerCase()}`,
+        domain: 'decisions',
+        section: adrNum,
+        title: `${adrNum}: ${title}`,
+        text: `[decision] ${adrNum}: ${title}\n${content}`,
+        linkedFiles: '[]',
+      });
+    } catch (error) {
+      throw new Error(
+        `Cannot read authoritative decision artifact ${relative(decisionsDir, filePath)}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  return records;
+}
+
 // ============================================================================
 // SPEC VECTOR INDEX
 // ============================================================================
@@ -203,16 +535,38 @@ export class SpecVectorIndex {
    * Discover all spec.md files under specsDir, parse them, enrich with mapping,
    * embed, and write to LanceDB table "specs".
    *
-   * @param outputDir  Path to .spec-gen/analysis/
+   * @param outputDir  Path to .openlore/analysis/
    * @param specsDir   Path to openspec/specs/ (or any directory containing domain/spec.md files)
    * @param mappingJsonPath  Path to mapping.json (optional -- no enrichment if absent)
    */
   static async build(
     outputDir: string,
     specsDir: string,
-    embedSvc: EmbeddingService,
-    mappingJsonPath?: string
-  ): Promise<{ recordCount: number }> {
+    embedSvc: Embedder | null,
+    mappingJsonPath?: string,
+    decisionsDir?: string
+  ): Promise<{ recordCount: number; hasEmbeddings: boolean }> {
+    const release = await acquireSpecIndexLock(outputDir);
+    try {
+      return await SpecVectorIndex._buildLocked(
+        outputDir,
+        specsDir,
+        embedSvc,
+        mappingJsonPath,
+        decisionsDir,
+      );
+    } finally {
+      await release();
+    }
+  }
+
+  private static async _buildLocked(
+    outputDir: string,
+    specsDir: string,
+    embedSvc: Embedder | null,
+    mappingJsonPath?: string,
+    decisionsDir?: string,
+  ): Promise<{ recordCount: number; hasEmbeddings: boolean }> {
     const { connect } = await import('@lancedb/lancedb');
 
     // Load mapping index (optional)
@@ -226,22 +580,37 @@ export class SpecVectorIndex {
       }
     }
 
-    // Discover spec files
+    // Discover spec files — distinguish "directory missing" from "directory
+    // present but empty" so callers can tell a misconfig from an unseeded repo.
     const specFiles = await findSpecFiles(specsDir);
     if (specFiles.length === 0) {
-      throw new Error(`No spec.md files found in ${specsDir}`);
+      const dirExists = await fileExists(specsDir);
+      throw new Error(
+        dirExists
+          ? `Spec directory ${specsDir} exists but contains no spec.md files — run 'openlore generate', or point openspecPath at your specs`
+          : `Spec directory ${specsDir} does not exist — run 'openlore init' (it now detects docs/specs/ and specs/)`
+      );
     }
 
     // Parse all specs into records (without vectors)
-    const records: Omit<SpecRecord, 'vector'>[] = [];
+    const records: AuthoritativeSpecRecord[] = [];
 
     for (const specFile of specFiles) {
       const domain = basename(dirname(specFile));
       let markdown: string;
       try {
-        markdown = await readFile(specFile, 'utf-8');
-      } catch {
-        continue;
+        markdown = await readFileConfined(
+          specsDir,
+          relative(specsDir, specFile),
+          SPEC_ARTIFACT_MAX_BYTES,
+          false,
+          true,
+        );
+      } catch (error) {
+        throw new Error(
+          `Cannot read authoritative spec artifact ${relative(specsDir, specFile)}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
       }
 
       const sections = parseSpecFile(markdown);
@@ -268,8 +637,60 @@ export class SpecVectorIndex {
       }
     }
 
+    // Also index ADR files from openspec/decisions/ if decisionsDir provided
+    if (decisionsDir) {
+      const adrRecords = await parseAdrFiles(decisionsDir);
+      records.push(...adrRecords);
+    }
+
     if (records.length === 0) {
       throw new Error('No spec sections could be parsed');
+    }
+
+    const dbPath = join(outputDir, DB_FOLDER);
+    const recordsDigest = digestSpecRecords(records);
+    const metaState = readSpecMeta(outputDir);
+
+    // Reuse is allowed only when both the authoritative inputs and the persisted
+    // table agree with the atomically-published metadata. Missing legacy metadata
+    // is still readable by search(), but is intentionally rebuilt here because it
+    // cannot prove which inputs produced the table.
+    if (metaState.kind === 'current'
+      && metaState.meta.recordsDigest === recordsDigest
+      && metaState.meta.recordCount === records.length
+      && metaState.meta.hasEmbeddings === Boolean(embedSvc)
+      && metaState.meta.model === (embedSvc?.modelName ?? null)
+      && SpecVectorIndex.exists(outputDir)
+      && await SpecVectorIndex._tableMatchesDigest(outputDir, metaState.meta)) {
+      // A verified no-op rebuild is still an authoritative freshness check.
+      // Clear watcher changes that were reverted or did not affect indexed rows.
+      await writeSpecMeta(outputDir, metaState.meta);
+      return { recordCount: records.length, hasEmbeddings: metaState.meta.hasEmbeddings };
+    }
+
+    // ── BM25-only build (no embedding service) ───────────────────────────────
+    // Write records without a `vector` column and record hasEmbeddings:false.
+    if (!embedSvc) {
+      const db = await connect(dbPath);
+      const table = await db.createTable(
+        TABLE_NAME,
+        records as unknown as Record<string, unknown>[],
+        { mode: 'overwrite' }
+      );
+      const rows = await table.query().toArray() as Record<string, unknown>[];
+      const meta: SpecIndexMeta = {
+        hasEmbeddings: false,
+        dim: 0,
+        model: null,
+        builtAt: new Date().toISOString(),
+        schemaVersion: META_SCHEMA_VERSION,
+        recordsDigest,
+        recordCount: records.length,
+        tableDigest: digestPersistedSpecRows(rows),
+      };
+      await writeSpecMeta(outputDir, meta);
+      await SpecVectorIndex._rememberVerifiedTable(outputDir, table, meta);
+      return { recordCount: records.length, hasEmbeddings: false };
     }
 
     // Batch-embed
@@ -286,11 +707,24 @@ export class SpecVectorIndex {
     }));
 
     // Write to LanceDB (same DB folder, table "specs")
-    const dbPath = join(outputDir, DB_FOLDER);
     const db = await connect(dbPath);
-    await db.createTable(TABLE_NAME, fullRecords as unknown as Record<string, unknown>[], { mode: 'overwrite' });
+    const table = await db.createTable(TABLE_NAME, fullRecords as unknown as Record<string, unknown>[], { mode: 'overwrite' });
+    const persistedRows = await table.query().toArray() as Record<string, unknown>[];
 
-    return { recordCount: fullRecords.length };
+    const meta: SpecIndexMeta = {
+      hasEmbeddings: true,
+      dim: fullRecords[0]?.vector.length ?? 0,
+      model: embedSvc.modelName ?? null,
+      builtAt: new Date().toISOString(),
+      schemaVersion: META_SCHEMA_VERSION,
+      recordsDigest,
+      recordCount: fullRecords.length,
+      tableDigest: digestPersistedSpecRows(persistedRows),
+    };
+    await writeSpecMeta(outputDir, meta);
+    await SpecVectorIndex._rememberVerifiedTable(outputDir, table, meta);
+
+    return { recordCount: fullRecords.length, hasEmbeddings: true };
   }
 
   /**
@@ -299,40 +733,155 @@ export class SpecVectorIndex {
   static async search(
     outputDir: string,
     query: string,
-    embedSvc: EmbeddingService,
+    embedSvc: Embedder | null | undefined,
     opts: {
       limit?: number;
       domain?: string;
       section?: string;
+      /** Internal diagnostic: return the ordinary bounded candidate window before result cutoff. */
+      traceCandidates?: boolean;
+      vocabularyExpansion?: boolean;
     } = {}
   ): Promise<SpecSearchResult[]> {
+    return (await SpecVectorIndex.searchWithFreshness(outputDir, query, embedSvc, opts)).results;
+  }
+
+  /** Read search results and their freshness disclosure from one locked index generation. */
+  static async searchWithFreshness(
+    outputDir: string,
+    query: string,
+    embedSvc: Embedder | null | undefined,
+    opts: {
+      limit?: number;
+      domain?: string;
+      section?: string;
+      traceCandidates?: boolean;
+      vocabularyExpansion?: boolean;
+    } = {},
+  ): Promise<SpecSearchSnapshot> {
+    const queryVector = await SpecVectorIndex._embedQueryOutsideLock(outputDir, query, embedSvc);
+    const release = await acquireSpecIndexLock(outputDir);
+    try {
+      const searchResult = await SpecVectorIndex._searchLocked(outputDir, query, embedSvc, queryVector, opts);
+      return { ...searchResult, indexFreshness: SpecVectorIndex._freshnessUnlocked(outputDir) };
+    } finally {
+      await release();
+    }
+  }
+
+  private static async _embedQueryOutsideLock(
+    outputDir: string,
+    query: string,
+    embedSvc: Embedder | null | undefined,
+  ): Promise<number[] | null> {
+    if (!embedSvc) return null;
+
+    // Avoid remote work for a known BM25-only generation. This metadata read is
+    // short and locked; the network call itself deliberately is not.
+    const release = await acquireSpecIndexLock(outputDir);
+    let shouldEmbed = true;
+    try {
+      const state = readSpecMeta(outputDir);
+      const tableExists = existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`));
+      if (!tableExists || state.kind === 'malformed') {
+        shouldEmbed = false;
+      } else if (state.kind === 'current' || state.kind === 'legacy') {
+        shouldEmbed = state.meta.hasEmbeddings
+          && state.meta.model === (embedSvc.modelName ?? null);
+      }
+    } finally {
+      await release();
+    }
+    if (!shouldEmbed) return null;
+
+    try {
+      const [queryVector] = await embedSvc.embed([query]);
+      return queryVector ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private static async _searchLocked(
+    outputDir: string,
+    query: string,
+    embedSvc: Embedder | null | undefined,
+    queryVector: number[] | null,
+    opts: {
+      limit?: number;
+      domain?: string;
+      section?: string;
+      traceCandidates?: boolean;
+      vocabularyExpansion?: boolean;
+    },
+  ): Promise<LockedSpecSearchResult> {
     const { connect } = await import('@lancedb/lancedb');
 
-    const { limit = 10, domain, section } = opts;
+    const { limit = 10, domain, section, traceCandidates = false, vocabularyExpansion = true } = opts;
 
     if (!SpecVectorIndex.exists(outputDir)) {
-      throw new Error('No spec index found. Run "spec-gen analyze --embed" or "spec-gen analyze --reindex-specs" first.');
+      throw new Error('No spec index found. Run "openlore analyze" first.');
     }
-
-    const [queryVector] = await embedSvc.embed([query]);
-    if (!queryVector) throw new Error('Failed to embed query');
 
     const dbPath = join(outputDir, DB_FOLDER);
     const db = await connect(dbPath);
-    const table = await db.openTable(TABLE_NAME);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const table: any = await db.openTable(TABLE_NAME);
+
+    // ── BM25-only path ─────────────────────────────────────────────────────────
+    // Force BM25 when no embedder is available OR the spec index was built
+    // without embeddings (no `vector` column). Missing sidecar ⇒ legacy embedded.
+    const metaState = readSpecMeta(outputDir);
+    const meta = metaState.kind === 'current' || metaState.kind === 'legacy' ? metaState.meta : null;
+    if (metaState.kind === 'current'
+      && !await SpecVectorIndex._tableMatchesDigest(outputDir, metaState.meta, table)) {
+      throw new Error('Spec index content does not match its metadata. Run "openlore analyze" to rebuild it.');
+    }
+    // Schema-v1 and missing metadata cannot prove table shape. Probe the actual
+    // table before selecting ANN so a missing/corrupt sidecar on a BM25-only
+    // table never turns into a nearestTo() call against a nonexistent column.
+    const indexHasEmbeddings = metaState.kind === 'current'
+      ? metaState.meta.hasEmbeddings
+      : (await table.schema()).fields.some((field: { name: string }) => field.name === 'vector');
+    const indexMatchesEmbedder = !meta
+      || meta.model === (embedSvc?.modelName ?? null);
+    if (!embedSvc || !indexHasEmbeddings || !queryVector || !indexMatchesEmbedder) {
+      return {
+        results: await SpecVectorIndex._bm25Only(outputDir, table, query, limit, domain, section, traceCandidates, vocabularyExpansion),
+        retrievalMode: expandVocabularyQuery(outputDir, [], vocabularyExpansion).vocabularyAvailable
+          ? 'keyword+vocabulary'
+          : 'keyword',
+      };
+    }
+
+    // Dimension safety-net: a model switch without a spec-index rebuild would make
+    // the query vector's dimension disagree with the stored vectors and crash ANN.
+    if (meta && meta.dim > 0 && queryVector.length !== meta.dim) {
+      return {
+        results: await SpecVectorIndex._bm25Only(outputDir, table, query, limit, domain, section, traceCandidates, vocabularyExpansion),
+        retrievalMode: expandVocabularyQuery(outputDir, [], vocabularyExpansion).vocabularyAvailable
+          ? 'keyword+vocabulary'
+          : 'keyword',
+      };
+    }
 
     const fetchLimit = Math.min(limit * 10, 500);
-    const rows = await table.query().nearestTo(queryVector).limit(fetchLimit).toArray();
+    let denseQuery = table.query().nearestTo(queryVector).distanceType('cosine');
+    const densePredicate = specSearchPredicate(domain, section);
+    // where() is a LanceDB prefilter by default, so filtered rows participate in
+    // ANN recall instead of being discarded after a bounded fetch.
+    if (densePredicate) denseQuery = denseQuery.where(densePredicate);
+    const rows = await denseQuery.limit(fetchLimit).toArray();
 
     const filtered = rows
-      .filter(row => {
+      .filter((row: Record<string, unknown>) => {
         if (domain && (row.domain as string) !== domain) return false;
         if (section && (row.section as string) !== section) return false;
         return true;
       })
-      .slice(0, limit);
+      .slice(0, traceCandidates ? undefined : limit);
 
-    return filtered.map(row => {
+    const results = filtered.map((row: Record<string, unknown>) => {
       let linkedFiles: string[] = [];
       try {
         linkedFiles = JSON.parse(row.linkedFiles as string) as string[];
@@ -348,8 +897,171 @@ export class SpecVectorIndex {
           linkedFiles,
         },
         score: row._distance as number,
+        scoreKind: 'cosine_distance' as const,
+        matchEvidence: vectorMatchEvidence(3),
       };
     });
+    return { results, retrievalMode: 'semantic' };
+  }
+
+  /**
+   * BM25-only search over the spec corpus: used when no embedding service is
+   * available or the index was built without embeddings. Scores the full
+   * corpus with BM25 and returns the top `limit` matching sections.
+   */
+  private static async _bm25Only(
+    outputDir: string,
+    table: { query(): { toArray(): Promise<Record<string, unknown>[]> } },
+    query: string,
+    limit: number,
+    domain?: string,
+    section?: string,
+    traceCandidates = false,
+    vocabularyExpansion = true,
+  ): Promise<SpecSearchResult[]> {
+    const allRows = await table.query().toArray() as Record<string, unknown>[];
+    const corpus = buildBm25Corpus(
+      allRows.map(r => ({ id: r.id as string, text: r.text as string }))
+    );
+    const queryTokens = tokenize(query);
+    const expandedQuery = expandVocabularyQuery(outputDir, queryTokens, vocabularyExpansion);
+    const rowById = new Map(allRows.map(r => [r.id as string, r]));
+
+    return corpus.docs
+      .map((doc, i) => ({
+        idx: i,
+        score: bm25Score(corpus, queryTokens, i),
+        expansionScore: bm25Score(corpus, expandedQuery.expansionTokens, i),
+        id: doc.id,
+      }))
+      .filter(({ score, expansionScore }) => score > 0 || expansionScore > 0)
+      // Deterministic ordering: score desc, ties broken by id asc.
+      .sort(compareVocabularyRank)
+      .map(({ idx, score, expansionScore }) => {
+        const row = rowById.get(corpus.docs[idx].id);
+        return row ? { row, idx, score, expansionScore } : null;
+      })
+      .filter((x): x is { row: Record<string, unknown>; idx: number; score: number; expansionScore: number } => x !== null)
+      .filter(({ row }) => {
+        if (domain && (row.domain as string) !== domain) return false;
+        if (section && (row.section as string) !== section) return false;
+        return true;
+      })
+      .slice(0, traceCandidates ? limit * 3 : limit)
+      .map(({ row, idx, score, expansionScore }) => {
+        let linkedFiles: string[] = [];
+        try {
+          linkedFiles = JSON.parse(row.linkedFiles as string) as string[];
+        } catch { /* ignore */ }
+        return {
+          record: {
+            id: row.id as string,
+            domain: row.domain as string,
+            section: row.section as string,
+            title: row.title as string,
+            text: row.text as string,
+            linkedFiles,
+          },
+          score: score > 0 ? score : expansionScore,
+          scoreKind: 'bm25' as const,
+          matchEvidence: bm25MatchEvidence(
+            corpus,
+            score > 0 ? queryTokens : expandedQuery.expansionTokens,
+            idx,
+            searchableFieldsForSpecRow(row),
+            score > 0 ? 1 : 2,
+          ),
+          ...(() => {
+            const terms = scoredExpansionTerms(expandedQuery.expansionTokens, corpus.docs[idx].tfMap);
+            return terms.length > 0 ? { expansionTerms: terms } : {};
+          })(),
+        };
+      });
+  }
+
+  /**
+   * Record spec files changed since the current index build. The receipt is
+   * versioned and tied to builtAt, so a later full build makes an older receipt
+   * inert without requiring a racy delete.
+   */
+  static async noteSpecFilesChanged(outputDir: string, files: string[]): Promise<void> {
+    const release = await acquireSpecIndexLock(outputDir);
+    try {
+      const state = readSpecMeta(outputDir);
+      if (state.kind !== 'current' && state.kind !== 'legacy') return;
+      const builtAt = state.meta.builtAt;
+      const receiptPath = specFreshnessPath(outputDir);
+      const previous = readSpecFreshnessReceipt(outputDir);
+      // Missing, malformed, oversized, or generation-mismatched history cannot
+      // be reconstructed from the current batch. Persist an explicit sticky
+      // unavailable state until a full rebuild establishes a new zero point.
+      if (!previous || previous.indexBuiltAt !== builtAt) {
+        await atomicWriteFile(receiptPath, JSON.stringify({
+          schemaVersion: 1,
+          indexBuiltAt: builtAt,
+          changedFiles: [],
+          trackingUnavailable: true,
+        } satisfies SpecFreshnessReceipt, null, 2) + '\n');
+        return;
+      }
+      const changedFiles = new Set(
+        previous.changedFiles,
+      );
+      for (const file of files) changedFiles.add(file.split('\\').join('/'));
+      const nextReceipt: SpecFreshnessReceipt = {
+        schemaVersion: 1,
+        indexBuiltAt: builtAt,
+        changedFiles: [...changedFiles].sort(),
+      };
+      let payload = JSON.stringify(nextReceipt, null, 2) + '\n';
+      if (Buffer.byteLength(payload) > FRESHNESS_MAX_BYTES) {
+        payload = JSON.stringify({
+          schemaVersion: 1,
+          indexBuiltAt: builtAt,
+          changedFiles: [],
+          trackingUnavailable: true,
+        } satisfies SpecFreshnessReceipt, null, 2) + '\n';
+      }
+      await atomicWriteFile(receiptPath, payload);
+    } finally {
+      await release();
+    }
+  }
+
+  /** Honest spec-index freshness for serving; malformed/stale receipts report unavailable. */
+  static async freshness(outputDir: string): Promise<SpecIndexFreshness | null> {
+    const release = await acquireSpecIndexLock(outputDir);
+    try {
+      return SpecVectorIndex._freshnessUnlocked(outputDir);
+    } finally {
+      await release();
+    }
+  }
+
+  private static _freshnessUnlocked(outputDir: string): SpecIndexFreshness | null {
+    const state = readSpecMeta(outputDir);
+    if (state.kind !== 'current' && state.kind !== 'legacy') {
+      return existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`))
+        ? { builtAt: null, tracking: 'unavailable', changedFileCount: null, changedFiles: [] }
+        : null;
+    }
+    const receipt = readSpecFreshnessReceipt(outputDir);
+    if (!receipt || receipt.indexBuiltAt !== state.meta.builtAt) {
+      return {
+        builtAt: state.meta.builtAt,
+        tracking: 'unavailable',
+        changedFileCount: null,
+        changedFiles: [],
+      };
+    }
+    const changedFiles = [...receipt.changedFiles].sort();
+    return {
+      builtAt: state.meta.builtAt,
+      tracking: 'tracked',
+      changedFileCount: changedFiles.length,
+      changedFiles: changedFiles.slice(0, FRESHNESS_RETURNED_FILES),
+      ...(changedFiles.length > FRESHNESS_RETURNED_FILES ? { changedFilesTruncated: true } : {}),
+    };
   }
 
   /**
@@ -357,7 +1069,69 @@ export class SpecVectorIndex {
    */
   static exists(outputDir: string): boolean {
     // LanceDB stores each table as a subfolder inside the DB folder
-    return existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`));
+    if (!existsSync(join(outputDir, DB_FOLDER, `${TABLE_NAME}.lance`))) return false;
+    return readSpecMeta(outputDir).kind !== 'malformed';
+  }
+
+  private static async _rememberVerifiedTable(
+    outputDir: string,
+    table: { version(): Promise<number> },
+    meta: SpecIndexMeta,
+  ): Promise<void> {
+    verifiedSpecTables.set(join(outputDir, DB_FOLDER), {
+      metaDigest: JSON.stringify(meta),
+      tableVersion: await table.version(),
+    });
+  }
+
+  private static async _tableMatchesDigest(
+    outputDir: string,
+    meta: SpecIndexMeta,
+    existingTable?: { version(): Promise<number>; query(): { toArray(): Promise<Record<string, unknown>[]> } },
+  ): Promise<boolean> {
+    try {
+      let table = existingTable;
+      if (!table) {
+        const { connect } = await import('@lancedb/lancedb');
+        const db = await connect(join(outputDir, DB_FOLDER));
+        table = await db.openTable(TABLE_NAME);
+      }
+      const dbPath = join(outputDir, DB_FOLDER);
+      const metaDigest = JSON.stringify(meta);
+      // Lance publishes supported mutations as immutable table versions. This
+      // lookup is constant-cost; recursively statting every fragment made every
+      // warm query scale with the physical table layout.
+      const tableVersion = await table.version();
+      const cached = verifiedSpecTables.get(dbPath);
+      if (cached?.metaDigest === metaDigest && cached.tableVersion === tableVersion) return true;
+
+      const rows = await table.query().toArray() as Record<string, unknown>[];
+      if (rows.length !== meta.recordCount) return false;
+      const vectorLengths = rows.map(row => row.vector == null
+        ? null
+        : Array.from(row.vector as ArrayLike<number>).length);
+      if (meta.hasEmbeddings) {
+        if (meta.dim <= 0 || vectorLengths.some(length => length !== meta.dim)) return false;
+      } else if (meta.dim !== 0 || vectorLengths.some(length => length !== null)) {
+        return false;
+      }
+      const records = rows.map(row => ({
+        id: String(row.id ?? ''),
+        domain: String(row.domain ?? ''),
+        section: String(row.section ?? ''),
+        title: String(row.title ?? ''),
+        text: String(row.text ?? ''),
+        linkedFiles: String(row.linkedFiles ?? ''),
+      }));
+      const matches = digestSpecRecords(records) === meta.recordsDigest
+        && digestPersistedSpecRows(rows) === meta.tableDigest;
+      if (matches) {
+        verifiedSpecTables.set(dbPath, { metaDigest, tableVersion });
+      }
+      return matches;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -379,6 +1153,10 @@ async function findSpecFiles(specsDir: string): Promise<string[]> {
   for (const entry of entries) {
     const domainDir = join(specsDir, entry);
     const specFile = join(domainDir, 'spec.md');
+    // `fileExists` stats THROUGH a symlink, so a committed
+    // `openspec/specs/notes/spec.md -> ~/private.md` would otherwise be read and
+    // chunked into the vector index — an artifact `openlore export` ships.
+    if (!isConfinedPath(specsDir, specFile)) continue;
     if (await fileExists(specFile)) {
       results.push(specFile);
     }

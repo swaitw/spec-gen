@@ -1,23 +1,28 @@
 /**
- * spec-gen view command
+ * openlore view command
  *
  * Starts a local React (Vite) server to visualize analysis graphs,
  * then opens the user's browser.
  */
 
 import { Command } from 'commander';
-import { readFile } from 'node:fs/promises';
+import { llmTlsRelaxed, withRelaxedTls } from '../../core/services/tls-scope.js';
+import { readFile, unlink } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { fileExists } from '../../utils/command-helpers.js';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../../utils/logger.js';
+import { safeJoin } from '../../utils/path-confinement.js';
+import { isLoopbackHost } from '../../utils/loopback.js';
 import {
   MAX_QUERY_LENGTH,
   MAX_CHAT_BODY_BYTES,
   DEFAULT_VIEWER_PORT,
   DEFAULT_VIEWER_HOST,
-  SPEC_GEN_ANALYSIS_REL_PATH,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_REL_PATH,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
   ARTIFACT_DEPENDENCY_GRAPH,
@@ -25,32 +30,75 @@ import {
   ARTIFACT_REFACTOR_PRIORITIES,
   ARTIFACT_MAPPING,
 } from '../../constants.js';
+import {
+  createApiGuardMiddleware,
+  createBrowserSessionGuard,
+  writeInstanceDescriptor,
+} from './local-http-guard.js';
 import { VectorIndex } from '../../core/analyzer/vector-index.js';
-import { EmbeddingService } from '../../core/analyzer/embedding-service.js';
-import { getSkeletonContent, detectLanguage } from '../../core/analyzer/code-shaper.js';
+import { resolveEmbedder } from '../../core/analyzer/embedder.js';
+import { getSkeletonContent } from '../../core/analyzer/code-shaper.js';
+import { detectLanguage } from '../../core/analyzer/language-detection.js';
 import { runChatAgent, resolveProviderConfig } from '../../core/services/chat-agent.js';
+import { collectSpecMarkdown, readConfinedFile } from './view-files.js';
+import { readViewerFreshness, setViewerFreshnessHeaders } from './viewer-freshness.js';
+import { loadViewerToolchain, OptionalFeatureError } from './optional-features.js';
+import {
+  redactLocalPaths,
+  redactSecretTextWithKnownValues,
+} from '../../core/services/secret-redaction.js';
 
-/** Strip internal filesystem paths and API keys from error messages before sending to clients. */
+/**
+ * Credentials this server can be holding. Enumerated so the shared redactor can match the
+ * EXACT value, not just a provider-shaped one: an error body echoed by a gateway may name
+ * the key with no `sk-`/`AIza`/`Bearer` framing at all, and this path forwards 300 bytes of
+ * provider error text to the BROWSER over SSE.
+ */
+const VIEW_CREDENTIAL_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_COMPAT_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'EMBED_API_KEY',
+  'OPENLORE_EMBEDDING_API_KEY',
+] as const;
+
+/**
+ * Strip internal filesystem paths and credentials from error messages before sending them
+ * to clients.
+ *
+ * Delegates to `secret-redaction`, which is the single source of truth for every server
+ * output channel (mcp-security: Secret Confinement Across All Output Paths). The private
+ * pattern list this used to carry was a weaker second redactor — it missed free-standing
+ * `AIza…` keys, `x-goog-api-key:`, GitHub `gh[pous]_` tokens, JWTs, AWS `AKIA…`, echoed
+ * `"api_key": …` fields, PEM blocks and `user:pass@` URLs — on the one channel that
+ * answers a remote browser. Same call shape as `doctor`'s redactDoctorResults.
+ */
 export function sanitizeErrorMessage(msg: string): string {
-  return msg
-    .replace(/\/Users\/[^\s:]+/g, '[path]')
-    .replace(/\/home\/[^\s:]+/g, '[path]')
-    .replace(/[A-Z]:\\[^\s:]+/g, '[path]')
-    .replace(/[?&]key=[A-Za-z0-9\-_]{10,}/g, '?key=[REDACTED]')
-    .replace(/sk-ant-[A-Za-z0-9\-_]{10,}/g, '[REDACTED]')
-    .replace(/sk-[A-Za-z0-9\-_]{20,}/g, '[REDACTED]')
-    .replace(/Bearer\s+\S{10,}/g, 'Bearer [REDACTED]')
-    .replace(/x-api-key:\s*\S{10,}/gi, 'x-api-key: [REDACTED]');
+  return redactLocalPaths(
+    redactSecretTextWithKnownValues(
+      msg,
+      VIEW_CREDENTIAL_ENV_VARS.map(name => process.env[name]),
+    ).value,
+  );
 }
 
-/** Ensure a resolved path stays within the project root. Returns null if invalid. */
+/**
+ * Ensure a resolved path stays within the project root. Returns null if invalid.
+ *
+ * Delegates to the shared `safeJoin` so this surface gets the same SYMLINK-aware
+ * containment the MCP handlers have (mcp-security: Symlink-Aware Path Confinement).
+ * The lexical-only check this used to do accepted an in-repo symlink pointing
+ * outside the root, which the `/api/skeleton` and `/api/spec-requirements` routes
+ * would then read.
+ */
 export function safePath(rootPath: string, userPath: string): string | null {
-  const root = resolve(rootPath);
-  const abs = resolve(rootPath, userPath);
-  if (abs !== root && !abs.startsWith(root + sep)) {
+  try {
+    return safeJoin(resolve(rootPath), userPath);
+  } catch {
     return null;
   }
-  return abs;
 }
 
 function openBrowser(url: string): void {
@@ -59,16 +107,17 @@ function openBrowser(url: string): void {
 
   const args = platform === 'win32' ? ['/c', 'start', '', url] : [url];
 
-  const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+  // windowsHide: without it, the `cmd /c start` launcher itself flashes a console window.
+  const child = spawn(cmd, args, { stdio: 'ignore', detached: true, windowsHide: true });
   child.unref();
 }
 
 export const viewCommand = new Command('view')
-  .description('Start an interactive graph viewer (React) for .spec-gen/analysis')
-  .option('--analysis <path>', 'Path to analysis directory', `${SPEC_GEN_ANALYSIS_REL_PATH}/`)
+  .description('Start an interactive graph viewer (React) for .openlore/analysis')
+  .option('--analysis <path>', 'Path to analysis directory', `${OPENLORE_ANALYSIS_REL_PATH}/`)
   .option('--spec <path>', 'Path to spec files directory', `./${OPENSPEC_DIR}/${OPENSPEC_SPECS_SUBDIR}/`)
   .option('--port <n>', 'Port to run the viewer on', String(DEFAULT_VIEWER_PORT))
-  .option('--host <host>', 'Host to bind (use 0.0.0.0 for LAN)', DEFAULT_VIEWER_HOST)
+  .option('--host <host>', 'Host to bind (default loopback; every route requires the entry link)', DEFAULT_VIEWER_HOST)
   .option('--no-open', 'Do not open the browser automatically', false)
   .action(
     async (options: {
@@ -84,11 +133,26 @@ export const viewCommand = new Command('view')
       const llmContextPath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
       const refactorPath = join(analysisDir, ARTIFACT_REFACTOR_PRIORITIES);
       const mappingPath = join(analysisDir, ARTIFACT_MAPPING);
-      const specDir = resolve(rootPath, options.spec);
+      const specDir = safePath(rootPath, options.spec);
+
+      if (!specDir) {
+        logger.error('Spec directory resolves outside the project root');
+        process.exitCode = 1;
+        return;
+      }
+
+      const attachFreshness = async (
+        res: { setHeader(name: string, value: string): void },
+        artifactPath: string,
+      ) => {
+        const freshness = await readViewerFreshness(rootPath, analysisDir, artifactPath);
+        setViewerFreshnessHeaders((name, value) => res.setHeader(name, value), freshness);
+        return freshness;
+      };
 
       if (!(await fileExists(graphPath))) {
         logger.error(`Missing graph file: ${graphPath}`);
-        logger.info('Tip', 'Run "spec-gen analyze" first (or pass --analysis)');
+        logger.info('Tip', 'Run "openlore analyze" first (or pass --analysis)');
         process.exitCode = 1;
         return;
       }
@@ -115,14 +179,55 @@ export const viewCommand = new Command('view')
       const port = isNaN(parsedPort) ? DEFAULT_VIEWER_PORT : parsedPort;
       const host = options.host || DEFAULT_VIEWER_HOST;
 
+      // A non-loopback bind is now the same posture as `serve`: the token is required
+      // on every route (below), and the page no longer contains it — so binding a
+      // container interface for a published port is safe as long as the operator keeps
+      // the entry URL to themselves. Warn, rather than refuse.
+      // A WILDCARD bind cannot work: the rebinding guard compares the request's Host
+      // against the bound name, and no client ever sends "0.0.0.0" as a Host — so the
+      // server would start, print a URL nobody can open, and 403 every request
+      // including the handshake. Refuse with the address the user actually wants.
+      if (host === '0.0.0.0' || host === '::' || host === '[::]') {
+        logger.error(
+          `Cannot bind the wildcard address "${host}": the viewer authenticates each request ` +
+            `against the host it was started with, and a client never sends "${host}" as its ` +
+            `Host header — every request would be rejected. Bind the address you will actually ` +
+            `open (e.g. --host 127.0.0.1, or --host <this machine's IP> to reach it from the network).`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (!isLoopbackHost(host)) {
+        logger.warning(
+          `Binding non-loopback host "${host}": anyone who can reach this port needs the ` +
+            `entry link below to use the viewer. Treat that URL as a password.`,
+        );
+      }
+
+      // Per-instance token. Injected into the served UI so its same-origin /api
+      // requests authenticate; required by the money/agent chat route (always)
+      // and by every route when bound to a non-loopback host. See local-http-guard.ts.
+      const token = randomBytes(24).toString('hex');
+
       logger.section('Starting Graph Viewer');
       logger.info('Analysis', analysisDir);
       logger.info('Graph', graphPath);
 
-      // Dynamic imports — vite and @vitejs/plugin-react are only needed for `spec-gen view`,
+      // Dynamic imports — vite and @vitejs/plugin-react are only needed for `openlore view`,
       // so we load them at runtime to avoid ERR_MODULE_NOT_FOUND for other commands (#24).
-      const { createServer } = await import('vite');
-      const { default: react } = await import('@vitejs/plugin-react');
+      // They are optional dependencies, so absence is reported as an uninstalled feature with its
+      // install line, never a raw module-resolution error
+      // (cli: OptionalFeatureDependenciesDegradeAtTheirOwnCommand).
+      let createServer: Awaited<ReturnType<typeof loadViewerToolchain>>['createServer'];
+      let react: Awaited<ReturnType<typeof loadViewerToolchain>>['react'];
+      try {
+        ({ createServer, react } = await loadViewerToolchain());
+      } catch (err) {
+        if (!(err instanceof OptionalFeatureError)) throw err;
+        logger.error(err.message);
+        process.exitCode = 1;
+        return;
+      }
 
       const server = await createServer({
         root: viewerRoot,
@@ -130,11 +235,59 @@ export const viewCommand = new Command('view')
         plugins: [
           react(),
           {
-            name: 'spec-gen-graph-api',
+            name: 'openlore-graph-api',
             configureServer(devServer) {
+              // SECURITY, first gate: EVERY route, including `/` and its assets. This
+              // is what stops another local process from simply fetching the page. It
+              // also performs the one-time ?token= → HttpOnly-cookie handshake that
+              // lets the browser in; see createBrowserSessionGuard.
+              devServer.middlewares.use(
+                createBrowserSessionGuard({ boundHost: host, boundPort: port, token }),
+              );
+
+              // SECURITY, second gate: one guard in front of every /api/* route.
+              // Redundant with the session guard for authentication, kept because it
+              // is the shared policy both local surfaces apply (mcp-security:
+              // AllLocalHttpSurfacesShareTheGuard) and it keeps `serve` and `view`
+              // from drifting.
+              devServer.middlewares.use(
+                '/api',
+                createApiGuardMiddleware({
+                  boundHost: host,
+                  boundPort: port,
+                  token,
+                  requireTokenFor: (rel) => rel === '/chat',
+                }),
+              );
+
+              devServer.middlewares.use('/api/freshness', async (_req, res) => {
+                try {
+                  if (!(await fileExists(graphPath))) {
+                    res.statusCode = 404;
+                    res.end(JSON.stringify({ error: 'dependency-graph.json not found — run "openlore analyze"' }));
+                    return;
+                  }
+                  const freshness = await attachFreshness(res, graphPath);
+                  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                  res.statusCode = 200;
+                  res.end(JSON.stringify(freshness));
+                } catch (err) {
+                  res.statusCode = 500;
+                  res.end(JSON.stringify({ error: sanitizeErrorMessage((err as Error).message) }));
+                }
+              });
+
               devServer.middlewares.use('/api/dependency-graph', async (_req, res) => {
                 try {
+                  // Friendly 404 (matching the sibling artifact endpoints) when the graph
+                  // was removed/renamed after server start, rather than a 500 on ENOENT.
+                  if (!(await fileExists(graphPath))) {
+                    res.statusCode = 404;
+                    res.end(JSON.stringify({ error: 'dependency-graph.json not found — run "openlore analyze"' }));
+                    return;
+                  }
                   const json = await readFile(graphPath, 'utf-8');
+                  await attachFreshness(res, graphPath);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(json);
@@ -152,6 +305,7 @@ export const viewCommand = new Command('view')
                     return;
                   }
                   const json = await readFile(llmContextPath, 'utf-8');
+                  await attachFreshness(res, llmContextPath);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(json);
@@ -172,6 +326,7 @@ export const viewCommand = new Command('view')
                     callGraph?: { classes?: unknown[]; inheritanceEdges?: unknown[]; edges?: unknown[]; nodes?: unknown[] };
                   };
                   const cg = raw.callGraph ?? {};
+                  await attachFreshness(res, llmContextPath);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(JSON.stringify({
@@ -194,6 +349,7 @@ export const viewCommand = new Command('view')
                     return;
                   }
                   const json = await readFile(refactorPath, 'utf-8');
+                  await attachFreshness(res, refactorPath);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(json);
@@ -211,6 +367,7 @@ export const viewCommand = new Command('view')
                     return;
                   }
                   const json = await readFile(mappingPath, 'utf-8');
+                  await attachFreshness(res, mappingPath);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(json);
@@ -228,44 +385,13 @@ export const viewCommand = new Command('view')
                     return;
                   }
 
-                  // Recursively read all spec files and concatenate them
-                  const { readdirSync, statSync } = await import('node:fs');
-
-                  const collectSpecFiles = (dir: string): string[] => {
-                    const files: string[] = [];
-                    try {
-                      const entries = readdirSync(dir);
-                      for (const entry of entries) {
-                        if (entry.startsWith('.')) continue;
-                        const fullPath = join(dir, entry);
-                        const stat = statSync(fullPath);
-                        if (stat.isDirectory()) {
-                          files.push(...collectSpecFiles(fullPath));
-                        } else if (entry.endsWith('.md')) {
-                          files.push(fullPath);
-                        }
-                      }
-                    } catch {
-                      // ignore errors in subdirectories
-                    }
-                    return files;
-                  };
-
-                  const specFiles = collectSpecFiles(specDir).sort();
-                  let combinedSpec = '';
-
-                  for (const filePath of specFiles) {
-                    try {
-                      const content = await readFile(filePath, 'utf-8');
-                      combinedSpec += content + '\n\n';
-                    } catch {
-                      // skip files that can't be read
-                    }
-                  }
+                  const collected = await collectSpecMarkdown(specDir, { confinementRoot: rootPath });
 
                   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+                  res.setHeader('X-OpenLore-Spec-Truncated', String(collected.truncated));
+                  res.setHeader('X-OpenLore-Spec-Bytes', String(collected.bytes));
                   res.statusCode = 200;
-                  res.end(combinedSpec);
+                  res.end(collected.content);
                 } catch (err) {
                   res.statusCode = 500;
                   res.end(JSON.stringify({ error: sanitizeErrorMessage((err as Error).message) }));
@@ -307,7 +433,8 @@ export const viewCommand = new Command('view')
                     if (!specFileAbs || !(await fileExists(specFileAbs))) continue;
 
                     try {
-                      const content = await readFile(specFileAbs, 'utf-8');
+                      const content = (await readConfinedFile(rootPath, specFileAbs, MAX_CHAT_BODY_BYTES))
+                        .toString('utf8');
 
                       // Split into Requirement sections and find the one that matches reqName exactly
                       // We will compare titles case-insensitively but otherwise match the title text directly.
@@ -380,7 +507,8 @@ export const viewCommand = new Command('view')
                     res.end(JSON.stringify({ error: 'Access denied: path outside project' }));
                     return;
                   }
-                  const source = await readFile(absFile, 'utf-8');
+                  const source = (await readConfinedFile(rootPath, absFile, MAX_CHAT_BODY_BYTES))
+                    .toString('utf8');
                   const language = detectLanguage(file);
                   const skeleton = getSkeletonContent(source, language);
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -513,10 +641,14 @@ export const viewCommand = new Command('view')
                   const modelTimeout = AbortSignal.timeout(10_000);
                   let models: string[] = [];
                   if (cfg.kind === 'gemini') {
-                    const r = await fetch(
+                    const r = await withRelaxedTls(() => fetch(
                       `https://generativelanguage.googleapis.com/v1beta/models?key=${cfg.apiKey}`,
-                      { signal: modelTimeout }
-                    );
+                      // Never follow a redirect: the key is in the URL, so a followed hop
+                      // carries it to whatever host the redirect names. Same rule as
+                      // serve-client.ts; a cross-origin redirect strips only
+                      // Authorization/Cookie/Proxy-Authorization, nothing else.
+                      { signal: modelTimeout, redirect: 'error' }
+                    ), llmTlsRelaxed());
                     if (r.ok) {
                       const data = await r.json() as { models?: Array<{ name: string; supportedGenerationMethods?: string[] }> };
                       models = (data.models ?? [])
@@ -524,18 +656,45 @@ export const viewCommand = new Command('view')
                         .map(m => m.name.replace('models/', ''));
                     }
                   } else if (cfg.kind === 'anthropic') {
-                    const r = await fetch(`${cfg.baseUrl}/models`, {
+                    const r = await withRelaxedTls(() => fetch(`${cfg.baseUrl}/models`, {
                       headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01' },
                       signal: modelTimeout,
-                    });
+                      // Never follow a redirect: `x-api-key` survives a cross-origin hop.
+                      redirect: 'error',
+                    }), llmTlsRelaxed());
                     if (r.ok) {
                       const data = await r.json() as { data?: Array<{ id: string }> };
                       models = (data.data ?? []).map(m => m.id);
                     }
                   } else {
+                    // Unconfigured fallback (no key + the default OpenAI base) means the
+                    // user never set a provider — don't fire an unauthenticated request at
+                    // api.openai.com (which 401s and looks like "zero models"). A genuine
+                    // local provider has a custom baseUrl, so it still lists models keylessly.
+                    if (!cfg.apiKey && cfg.baseUrl === 'https://api.openai.com/v1') {
+                      res.statusCode = 200;
+                      res.end(JSON.stringify({
+                        provider: cfg.kind, currentModel: cfg.model, models: [],
+                        error: 'No LLM provider configured — set an API key (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) or OPENAI_COMPAT_BASE_URL.',
+                      }));
+                      return;
+                    }
                     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                     if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
-                    const r = await fetch(`${cfg.baseUrl}/models`, { headers, signal: modelTimeout });
+                    const r = await withRelaxedTls(
+                      () =>
+                        // Never follow a redirect: a loopback baseUrl is trusted because it
+                        // cannot reach the network, which only holds while it cannot hand
+                        // back a redirect to somewhere that can.
+                        //
+                        // The next two lines are load-bearing IN THIS ORDER: the reviewed-egress
+                        // guard requires the rationale immediately above the marker, and CodeQL
+                        // requires the marker immediately above the call. Nothing goes between.
+                        // INTENTIONAL EGRESS: repo config can select only loopback; remote endpoints are operator-supplied.
+                        // codeql[js/file-access-to-http]
+                        fetch(`${cfg.baseUrl}/models`, { headers, signal: modelTimeout, redirect: 'error' }),
+                      llmTlsRelaxed(),
+                    );
                     if (r.ok) {
                       const data = await r.json() as { data?: Array<{ id: string }> };
                       models = (data.data ?? []).map(m => m.id).sort();
@@ -545,9 +704,13 @@ export const viewCommand = new Command('view')
                   res.statusCode = 200;
                   res.end(JSON.stringify({ provider: cfg.kind, currentModel: cfg.model, models }));
                 } catch (err) {
-                  logger.error(`[chat/models] error: ${(err as Error).message}`);
+                  // Sanitize BEFORE logging: the gemini path puts the API key in the
+                  // request URL (?key=...), and fetch errors embed the URL — so the raw
+                  // message can carry the key into the server console/log.
+                  const safe = sanitizeErrorMessage((err as Error).message);
+                  logger.error(`[chat/models] error: ${safe}`);
                   res.statusCode = 500;
-                  res.end(JSON.stringify({ error: sanitizeErrorMessage((err as Error).message) }));
+                  res.end(JSON.stringify({ error: safe }));
                 }
               });
 
@@ -567,11 +730,16 @@ export const viewCommand = new Command('view')
                   }
                   if (!VectorIndex.exists(analysisDir)) {
                     res.statusCode = 404;
-                    res.end(JSON.stringify({ error: 'No vector index found. Run spec-gen analyze --embed first.' }));
+                    res.end(JSON.stringify({ error: 'No vector index found. Run openlore analyze --embed first.' }));
                     return;
                   }
-                  const embedSvc = EmbeddingService.fromEnv();
-                  const results = await VectorIndex.search(analysisDir, q, embedSvc, { limit: 5 });
+                  const { readOpenLoreConfig } = await import('../../core/services/config-manager.js');
+                  const config = await readOpenLoreConfig(rootPath);
+                  const embedSvc = await resolveEmbedder(config);
+                  const results = await VectorIndex.search(analysisDir, q, embedSvc, {
+                    limit: 5,
+                    vocabularyExpansion: config?.retrieval?.vocabularyExpansion !== false,
+                  });
                   res.setHeader('Content-Type', 'application/json; charset=utf-8');
                   res.statusCode = 200;
                   res.end(JSON.stringify(results.map(r => ({
@@ -596,13 +764,62 @@ export const viewCommand = new Command('view')
         },
       });
 
-      await server.listen();
+      try {
+        await server.listen();
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (/EADDRINUSE|address already in use/i.test(msg)) {
+          logger.error(`Port ${port} is already in use. Start the viewer on another port: openlore view --port <n>`);
+        } else {
+          logger.error(`Failed to start the viewer: ${msg}`);
+        }
+        process.exitCode = 1;
+        return;
+      }
 
+      // The entry link. It carries the token, which the first request exchanges for an
+      // HttpOnly cookie before redirecting to the bare URL — so the token does not
+      // linger in the address bar, in history, or in a Referer header. The link stays
+      // usable for the life of this process (so a second browser can be pointed at it);
+      // a restart issues a fresh token and invalidates the old one.
       const url = `http://${host}:${port}/`;
+      const entryUrl = `${url}?token=${token}`;
       logger.success(`Viewer running at ${url}`);
+      logger.info('Open this link', entryUrl);
+      logger.info('Note', 'the link is the credential — anyone who has it can use this viewer');
+
+      // Discovery + stale-instance detection (parity with the `serve` daemon):
+      // record where the viewer is listening so a later invocation / tool can
+      // detect a live or stale instance instead of a mystery port occupant.
+      const descriptorPath = join(rootPath, OPENLORE_DIR, 'view.json');
+      try {
+        // 0600 — the descriptor carries the instance token that gates /api/chat.
+        await writeInstanceDescriptor(rootPath, descriptorPath, {
+          port,
+          pid: process.pid,
+          host,
+          token,
+          startedAt: new Date().toISOString(),
+        });
+      } catch {
+        // Discovery is best-effort; a read-only .openlore must not stop the viewer.
+      }
+
+      // Graceful shutdown: close the server and drop the descriptor so a stale
+      // view.json never outlives the process (parity with `serve`).
+      let shuttingDown = false;
+      const shutdown = async (): Promise<void> => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        await unlink(descriptorPath).catch(() => {});
+        await server.close().catch(() => {});
+        process.exit(0);
+      };
+      process.on('SIGINT', () => void shutdown());
+      process.on('SIGTERM', () => void shutdown());
 
       if (options.open) {
-        openBrowser(url);
+        openBrowser(entryUrl);
       }
 
       // Vite keeps the event loop alive; nothing else to do here.

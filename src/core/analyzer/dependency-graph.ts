@@ -8,7 +8,14 @@
 
 import { ImportExportParser, resolveImport, type ExportInfo, type FileAnalysis } from './import-parser.js';
 import { extractAllHttpEdges, type HttpEdge } from './http-route-parser.js';
+import { deriveDomainFromPath } from './domain-naming.js';
+import { escapeDotString } from '../../utils/misc.js';
 import type { ScoredFile } from '../../types/index.js';
+import {
+  PAGERANK_DAMPING_FACTOR,
+  PAGERANK_CONVERGENCE_TOLERANCE,
+  PAGERANK_MAX_ITERATIONS,
+} from '../../constants.js';
 
 // ============================================================================
 // CONSTANTS
@@ -61,12 +68,18 @@ export interface DependencyEdge {
   source: string;
   target: string;
   importedNames: string[];
+  /** Exact source-export identities for statically named imports; aliases are resolved. */
+  importedSourceNames?: string[];
   isTypeOnly: boolean;
   weight: number;
   /** Present when this edge was derived from an HTTP call rather than a static import */
   httpEdge?: HttpEdge;
   /** True when this edge was synthesized from a call-graph cross-file call (implicit import) */
   isCallEdge?: boolean;
+  /** Resolution evidence retained when a call-graph edge becomes a file dependency. */
+  resolutionConfidence?: string;
+  /** Present when this edge is an HTML page → asset reference (decision b555b680) */
+  assetKind?: 'script' | 'stylesheet';
 }
 
 /**
@@ -147,6 +160,138 @@ export interface DependencyGraphOptions {
 // ============================================================================
 
 /**
+ * Compute the outgoing dependency edges for a single file from its parsed
+ * imports. The canonical edge-resolution logic, shared by the full-build
+ * `buildEdges` and the watcher's incremental `dependency-graph.json` update so
+ * the two can never drift. Pure: resolves each import against `fileSet` and
+ * returns the edges; the caller owns adjacency/state.
+ *
+ * @param fromAbs    absolute path of the importing file (edge source)
+ * @param analysis   the file's parsed imports/exports (FileAnalysis)
+ * @param fileSet    absolute paths of all files that are nodes in the graph
+ * @param rootDir    project root, used as the import-resolution base
+ * @param extensions optional resolver extension override (undefined = defaults)
+ */
+export async function computeFileImportEdges(
+  fromAbs: string,
+  analysis: FileAnalysis,
+  fileSet: Set<string>,
+  rootDir: string,
+  extensions?: string[],
+): Promise<DependencyEdge[]> {
+  const isPythonFile = fromAbs.endsWith('.py') || fromAbs.endsWith('.pyw');
+  const isJavaFile = fromAbs.endsWith('.java');
+  const edges: DependencyEdge[] = [];
+
+  for (const imp of analysis.imports) {
+    // Skip non-relative imports for JS/TS (always npm packages). Python and Java
+    // must NOT skip: `from services.retriever import X` / absolute class FQNs may
+    // resolve to a local module.
+    if (!imp.isRelative && !isPythonFile && !isJavaFile) continue;
+    // Skip builtins / third-party that can't resolve to a project file.
+    if (!imp.isRelative && imp.isBuiltin) continue;
+
+    const resolvedPath = await resolveImport(imp.source, fromAbs, {
+      baseDir: rootDir,
+      extensions,
+      sourcePackage: isJavaFile ? analysis.javaPackage : undefined,
+    });
+    if (!resolvedPath || !fileSet.has(resolvedPath)) continue;
+
+    const edge: DependencyEdge = {
+      source: fromAbs,
+      target: resolvedPath,
+      importedNames: imp.importedNames,
+      ...(imp.importedSourceNames ? { importedSourceNames: imp.importedSourceNames } : {}),
+      isTypeOnly: imp.isTypeOnly,
+      weight: imp.isTypeOnly ? 0.5 : 1,
+    };
+    // Carry the HTML asset label (script / stylesheet) onto the edge.
+    if (imp.assetKind) edge.assetKind = imp.assetKind;
+    edges.push(edge);
+  }
+
+  return edges;
+}
+
+/**
+ * Normalize a cycle to a rotation-invariant key: drop the repeated closing node, rotate so the
+ * lexicographically smallest node is first, join. Two rotations of the same cycle map to one key.
+ */
+function normalizeCycleKey(cycle: string[]): string {
+  const clean = cycle.slice(0, -1); // remove the duplicate closing element
+  if (clean.length === 0) return '';
+  const minIdx = clean.indexOf(clean.reduce((min, curr) => (curr < min ? curr : min)));
+  return [...clean.slice(minIdx), ...clean.slice(0, minIdx)].join('|');
+}
+
+/**
+ * Detect cycles in a directed graph via DFS back-edges — ITERATIVELY, with an explicit frame stack.
+ *
+ * A recursive DFS here is a latent process-abort: on a repository with a long import/dependency
+ * chain the recursion depth equals the chain length, and a chain of a few thousand files overflows
+ * the JS call stack with `RangeError: Maximum call stack size exceeded`, aborting `analyze` for the
+ * whole repository (issue #302 follow-up: no fatal crash for any repo shape; same lesson as the
+ * iterative parse-health walk and the iterative Tarjan SCC in condensation.ts).
+ *
+ * Output is IDENTICAL to the previous recursive implementation: each frame remembers its position
+ * in its neighbor list, so nodes are entered and exited in the exact same order, back-edges are
+ * detected at the same points, and the same cycles are recorded in the same order. Deduplication is
+ * by rotation-invariant key through a Set — the same result the previous pairwise scan produced,
+ * without its O(cycles²) cost on a graph with many cycles.
+ */
+export function detectDependencyCycles(
+  adjacencyList: ReadonlyMap<string, ReadonlySet<string>>,
+  nodeIds: Iterable<string>,
+): string[][] {
+  const cycles: string[][] = [];
+  const seenKeys = new Set<string>();
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+  const path: string[] = [];
+
+  interface Frame { node: string; neighbors: string[]; index: number; }
+
+  // Mark a node on entry (exactly as the recursion did at function entry) and build its frame.
+  const enter = (node: string): Frame => {
+    visited.add(node);
+    recursionStack.add(node);
+    path.push(node);
+    return { node, neighbors: [...(adjacencyList.get(node) ?? [])], index: 0 };
+  };
+
+  for (const rootId of nodeIds) {
+    if (visited.has(rootId)) continue;
+    const stack: Frame[] = [enter(rootId)];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      if (frame.index < frame.neighbors.length) {
+        const neighbor = frame.neighbors[frame.index++];
+        if (!visited.has(neighbor)) {
+          stack.push(enter(neighbor)); // descend — equivalent to the recursive call
+        } else if (recursionStack.has(neighbor)) {
+          // Back-edge: the neighbor is on the current path, so path[cycleStart..] is a cycle.
+          const cycle = path.slice(path.indexOf(neighbor));
+          cycle.push(neighbor); // complete the cycle
+          const key = normalizeCycleKey(cycle);
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            cycles.push(cycle);
+          }
+        }
+      } else {
+        // Neighbors exhausted — leave the node, exactly as the recursion did on return.
+        path.pop();
+        recursionStack.delete(frame.node);
+        stack.pop();
+      }
+    }
+  }
+
+  return cycles;
+}
+
+/**
  * Builds and analyzes a dependency graph from scored files
  */
 export class DependencyGraphBuilder {
@@ -164,8 +309,8 @@ export class DependencyGraphBuilder {
       rootDir: options.rootDir,
       extensions: options.extensions ?? [],  // empty = auto-detect per file in resolveImport
       minClusterSize: options.minClusterSize ?? 2,
-      dampingFactor: options.dampingFactor ?? 0.85,
-      maxIterations: options.maxIterations ?? 100,
+      dampingFactor: options.dampingFactor ?? PAGERANK_DAMPING_FACTOR,
+      maxIterations: options.maxIterations ?? PAGERANK_MAX_ITERATIONS,
     };
   }
 
@@ -173,6 +318,7 @@ export class DependencyGraphBuilder {
    * Build the dependency graph from scored files
    */
   async build(files: ScoredFile[]): Promise<DependencyGraphResult> {
+    files = files.filter(file => !file.tooling);
     // Clear any previous state
     this.nodes.clear();
     this.edges = [];
@@ -332,44 +478,18 @@ export class DependencyGraphBuilder {
       const analysis = analyses.get(file.absolutePath);
       if (!analysis) continue;
 
-      const isPythonFile = file.absolutePath.endsWith('.py') || file.absolutePath.endsWith('.pyw');
-      const isJavaFile = file.absolutePath.endsWith('.java');
-
-      for (const imp of analysis.imports) {
-        // Skip non-relative imports for JS/TS (those are always npm packages).
-        // For Python files we must NOT skip: `from services.retriever import X`
-        // is flagged isRelative=false but may resolve to a local module.
-        // For Java files we also must NOT skip: imports are always absolute
-        // class FQNs and we try to resolve them against the project source root.
-        if (!imp.isRelative && !isPythonFile && !isJavaFile) continue;
-        // Skip known builtins and third-party packages that can't resolve to
-        // a file inside the project (Python stdlib, JDK, Spring, etc.).
-        if (!imp.isRelative && imp.isBuiltin) continue;
-
-        // Resolve the import to an absolute path
-        const resolvedPath = await resolveImport(imp.source, file.absolutePath, {
-          baseDir: this.options.rootDir,
-          extensions: this.options.extensions.length > 0 ? this.options.extensions : undefined,
-          sourcePackage: isJavaFile ? analysis.javaPackage : undefined,
-        });
-
-        // Skip if not resolved or not in our file set
-        if (!resolvedPath || !fileSet.has(resolvedPath)) continue;
-
-        // Create edge
-        const edge: DependencyEdge = {
-          source: file.absolutePath,
-          target: resolvedPath,
-          importedNames: imp.importedNames,
-          isTypeOnly: imp.isTypeOnly,
-          weight: imp.isTypeOnly ? 0.5 : 1,
-        };
-
+      const edges = await computeFileImportEdges(
+        file.absolutePath,
+        analysis,
+        fileSet,
+        this.options.rootDir,
+        this.options.extensions.length > 0 ? this.options.extensions : undefined,
+      );
+      for (const edge of edges) {
         this.edges.push(edge);
-
         // Update adjacency lists
-        this.adjacencyList.get(file.absolutePath)?.add(resolvedPath);
-        this.reverseAdjacencyList.get(resolvedPath)?.add(file.absolutePath);
+        this.adjacencyList.get(file.absolutePath)?.add(edge.target);
+        this.reverseAdjacencyList.get(edge.target)?.add(file.absolutePath);
       }
     }
   }
@@ -385,40 +505,50 @@ export class DependencyGraphBuilder {
   }
 
   /**
-   * Calculate betweenness centrality using Brandes' algorithm
+   * Calculate betweenness centrality using Brandes' algorithm.
+   *
+   * Two robustness properties matter on large repositories (up to DEFAULT_MAX_FILES nodes),
+   * both output-preserving (identical normalized centrality to the naive formulation):
+   *
+   * 1. The BFS frontier is drained with a head index, not `Array.prototype.shift()`. `shift()`
+   *    is O(queue length) per call, so a single wide BFS (e.g. a barrel file importing hundreds
+   *    of modules) degrades to O(frontier²); the head index keeps each dequeue O(1).
+   * 2. The per-source working maps are allocated ONCE and reset between sources by touching only
+   *    the nodes the previous BFS actually visited (the stack), instead of re-initializing all V
+   *    nodes every source. Every node mutated during a source's BFS/back-prop is reachable from
+   *    that source, so it is on the stack — resetting the stack restores full defaults. This turns
+   *    the dominant O(V²) reinitialization into O(V · reachable), near-linear on a modular graph
+   *    (measured ~29× faster at 8k nodes, and the gap widens with V).
    */
   private calculateBetweenness(): void {
     const nodeIds = Array.from(this.nodes.keys());
     const betweenness = new Map<string, number>();
+    const predecessors = new Map<string, string[]>();
+    const sigma = new Map<string, number>();
+    const distance = new Map<string, number>();
+    const delta = new Map<string, number>();
 
-    // Initialize betweenness to 0
+    // Initialize all working state once; per-source state is reset by touched-node scope below.
     for (const id of nodeIds) {
       betweenness.set(id, 0);
+      predecessors.set(id, []);
+      sigma.set(id, 0);
+      distance.set(id, -1);
+      delta.set(id, 0);
     }
 
     // Brandes' algorithm
     for (const source of nodeIds) {
       const stack: string[] = [];
-      const predecessors = new Map<string, string[]>();
-      const sigma = new Map<string, number>();
-      const distance = new Map<string, number>();
-      const delta = new Map<string, number>();
-
-      // Initialize
-      for (const v of nodeIds) {
-        predecessors.set(v, []);
-        sigma.set(v, 0);
-        distance.set(v, -1);
-        delta.set(v, 0);
-      }
 
       sigma.set(source, 1);
       distance.set(source, 0);
 
-      // BFS
+      // BFS (head-index queue: O(1) dequeue instead of O(n) shift())
       const queue: string[] = [source];
-      while (queue.length > 0) {
-        const v = queue.shift()!;
+      let head = 0;
+      while (head < queue.length) {
+        const v = queue[head++];
         stack.push(v);
 
         const neighbors = this.adjacencyList.get(v) ?? new Set();
@@ -436,6 +566,10 @@ export class DependencyGraphBuilder {
         }
       }
 
+      // Snapshot the visited nodes before back-prop empties the stack, so we can reset
+      // exactly the touched working state for the next source.
+      const touched = stack.slice();
+
       // Back-propagation
       while (stack.length > 0) {
         const w = stack.pop()!;
@@ -448,6 +582,14 @@ export class DependencyGraphBuilder {
         if (w !== source) {
           betweenness.set(w, betweenness.get(w)! + delta.get(w)!);
         }
+      }
+
+      // Reset only the nodes this source touched, restoring full defaults for the next source.
+      for (const v of touched) {
+        predecessors.set(v, []);
+        sigma.set(v, 0);
+        distance.set(v, -1);
+        delta.set(v, 0);
       }
     }
 
@@ -497,7 +639,7 @@ export class DependencyGraphBuilder {
       [pageRank, newPageRank] = [newPageRank, pageRank];
 
       // Check convergence
-      if (maxDiff < 1e-6) break;
+      if (maxDiff < PAGERANK_CONVERGENCE_TOLERANCE) break;
     }
 
     // Normalize and update nodes
@@ -517,6 +659,7 @@ export class DependencyGraphBuilder {
 
     // Group by directory
     const dirGroups = new Map<string, string[]>();
+    const dirOfNode = new Map<string, string>();
     for (const nodeId of nodeIds) {
       const node = this.nodes.get(nodeId)!;
       const dir = node.file.directory || '(root)';
@@ -525,6 +668,29 @@ export class DependencyGraphBuilder {
         dirGroups.set(dir, []);
       }
       dirGroups.get(dir)!.push(nodeId);
+      dirOfNode.set(nodeId, dir);
+    }
+
+    // Count internal / external edges per directory in ONE edge pass (O(E)), instead of
+    // re-scanning every edge for every directory group (O(D·E)). Equivalent by definition:
+    // an edge whose endpoints share a directory is internal to it; an edge crossing two
+    // directories is external to BOTH; an endpoint outside the indexed node set (dangling
+    // import target) contributes to neither, exactly as `fileSet.has(...)` did per cluster.
+    const internalByDir = new Map<string, number>();
+    const externalByDir = new Map<string, number>();
+    for (const dir of dirGroups.keys()) {
+      internalByDir.set(dir, 0);
+      externalByDir.set(dir, 0);
+    }
+    for (const edge of this.edges) {
+      const sourceDir = dirOfNode.get(edge.source);
+      const targetDir = dirOfNode.get(edge.target);
+      if (sourceDir !== undefined && sourceDir === targetDir) {
+        internalByDir.set(sourceDir, internalByDir.get(sourceDir)! + 1);
+      } else {
+        if (sourceDir !== undefined) externalByDir.set(sourceDir, externalByDir.get(sourceDir)! + 1);
+        if (targetDir !== undefined) externalByDir.set(targetDir, externalByDir.get(targetDir)! + 1);
+      }
     }
 
     // Create clusters from directory groups
@@ -532,21 +698,8 @@ export class DependencyGraphBuilder {
     for (const [dir, files] of dirGroups) {
       if (files.length < this.options.minClusterSize) continue;
 
-      // Calculate internal and external edges
-      let internalEdges = 0;
-      let externalEdges = 0;
-      const fileSet = new Set(files);
-
-      for (const edge of this.edges) {
-        const sourceInCluster = fileSet.has(edge.source);
-        const targetInCluster = fileSet.has(edge.target);
-
-        if (sourceInCluster && targetInCluster) {
-          internalEdges++;
-        } else if (sourceInCluster || targetInCluster) {
-          externalEdges++;
-        }
-      }
+      const internalEdges = internalByDir.get(dir)!;
+      const externalEdges = externalByDir.get(dir)!;
 
       // Calculate cohesion (internal density)
       const possibleInternalEdges = files.length * (files.length - 1);
@@ -557,7 +710,7 @@ export class DependencyGraphBuilder {
       const coupling = totalEdges > 0 ? externalEdges / totalEdges : 0;
 
       // Generate suggested domain name
-      const suggestedDomain = this.suggestDomainName(dir, files);
+      const suggestedDomain = this.suggestDomainName(dir, files, internalEdges > 0);
 
       clusters.push({
         id: `cluster-${clusterId}`,
@@ -579,128 +732,41 @@ export class DependencyGraphBuilder {
   /**
    * Suggest a domain name based on directory and file contents
    */
-  private suggestDomainName(dir: string, files: string[]): string {
-    // Extract meaningful name from directory
+  private suggestDomainName(dir: string, files: string[], isStructural: boolean): string {
+    // Walk the directory path leaf-first, skipping build-layout / reverse-DNS
+    // package noise, via the shared helper so cluster domains stay in lockstep
+    // with repository-mapper's inferred domains (issue #138).
     const parts = dir.split('/').filter(p => p && p !== '(root)');
-
-    // Common patterns to convert
-    const patterns: [RegExp, string][] = [
-      [/^src$/i, ''],
-      [/^lib$/i, ''],
-      [/^app$/i, ''],
-      [/^(api|routes|endpoints?)$/i, 'api'],
-      [/^(models?|entities|schemas?)$/i, 'domain'],
-      [/^(services?)$/i, 'services'],
-      [/^(controllers?)$/i, 'controllers'],
-      [/^(utils?|helpers?|common)$/i, 'utilities'],
-      [/^(components?)$/i, 'components'],
-      [/^(hooks?)$/i, 'hooks'],
-      [/^(auth|authentication)$/i, 'authentication'],
-      [/^(users?)$/i, 'users'],
-      [/^(products?)$/i, 'products'],
-      [/^(orders?)$/i, 'orders'],
-      [/^(payments?)$/i, 'payments'],
-      [/^(core)$/i, 'core'],
-    ];
-
-    // Try to find a meaningful name
-    for (const part of parts.reverse()) {
-      for (const [pattern, replacement] of patterns) {
-        if (pattern.test(part)) {
-          return replacement || part.toLowerCase();
-        }
-      }
-      // If no pattern matches, use the part as-is
-      if (!/^(src|lib|app)$/i.test(part)) {
-        return part.toLowerCase().replace(/[^a-z0-9]/g, '-');
-      }
+    const derived = deriveDomainFromPath(parts);
+    if (derived) {
+      return derived;
     }
 
-    // Fallback: use first file's name pattern
-    if (files.length > 0) {
-      const firstFile = this.nodes.get(files[0])?.file.name ?? 'unknown';
-      return firstFile.replace(/\.(ts|js|tsx|jsx|py)x?$/, '').toLowerCase();
-    }
+    // A non-structural root group is configuration, not a business domain. Do not let scan order
+    // (especially a leading dotfile) mint the name.
+    if (
+      dir === '(root)' && !isStructural &&
+      files.every(id => {
+        const file = this.nodes.get(id)?.file;
+        return file?.isConfig === true || file?.name.startsWith('.') === true;
+      })
+    ) return '(root config)';
 
-    return 'misc';
+    const candidates = files
+      .map(id => this.nodes.get(id)?.file.name ?? '')
+      .filter(name => !name.startsWith('.'))
+      .map(name => name.replace(/\.[a-z0-9]+$/i, '').toLowerCase().replace(/[^a-z0-9]+/g, '-'))
+      .filter(name => /^[a-z0-9]/.test(name))
+      .sort();
+    return candidates[0] ?? 'misc';
   }
 
   /**
-   * Detect cycles in the dependency graph using DFS
+   * Detect cycles in the dependency graph. Delegates to the module-level iterative implementation
+   * so a deep import chain cannot overflow the call stack (see {@link detectDependencyCycles}).
    */
   private detectCycles(): string[][] {
-    const cycles: string[][] = [];
-    const visited = new Set<string>();
-    const recursionStack = new Set<string>();
-    const path: string[] = [];
-
-    const dfs = (node: string): void => {
-      visited.add(node);
-      recursionStack.add(node);
-      path.push(node);
-
-      const neighbors = this.adjacencyList.get(node) ?? new Set();
-      for (const neighbor of neighbors) {
-        if (!visited.has(neighbor)) {
-          dfs(neighbor);
-        } else if (recursionStack.has(neighbor)) {
-          // Found a cycle
-          const cycleStart = path.indexOf(neighbor);
-          const cycle = path.slice(cycleStart);
-          cycle.push(neighbor); // Complete the cycle
-
-          // Check if this cycle is not a duplicate (or rotation of existing)
-          if (!this.isDuplicateCycle(cycles, cycle)) {
-            cycles.push(cycle);
-          }
-        }
-      }
-
-      path.pop();
-      recursionStack.delete(node);
-    };
-
-    for (const nodeId of this.nodes.keys()) {
-      if (!visited.has(nodeId)) {
-        dfs(nodeId);
-      }
-    }
-
-    return cycles;
-  }
-
-  /**
-   * Check if a cycle is a duplicate or rotation of an existing cycle
-   */
-  private isDuplicateCycle(existingCycles: string[][], newCycle: string[]): boolean {
-    const normalizedNew = this.normalizeCycle(newCycle);
-
-    for (const existing of existingCycles) {
-      const normalizedExisting = this.normalizeCycle(existing);
-      if (normalizedNew === normalizedExisting) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Normalize a cycle for comparison (smallest element first, then compare)
-   */
-  private normalizeCycle(cycle: string[]): string {
-    // Remove the duplicate closing element
-    const clean = cycle.slice(0, -1);
-    if (clean.length === 0) return '';
-
-    // Find the smallest element
-    const minIdx = clean.indexOf(
-      clean.reduce((min, curr) => (curr < min ? curr : min))
-    );
-
-    // Rotate so smallest is first
-    const rotated = [...clean.slice(minIdx), ...clean.slice(0, minIdx)];
-    return rotated.join('|');
+    return detectDependencyCycles(this.adjacencyList, this.nodes.keys());
   }
 
   /**
@@ -827,6 +893,15 @@ export async function buildDependencyGraph(
 const IMPLICIT_IMPORT_LANGS = new Set(['Swift', 'C++', 'C']);
 
 /**
+ * Languages that DO use explicit imports for cross-package references but need
+ * NO import for same-package classes (JVM package semantics). Their dependency
+ * graph would otherwise show only the sparse cross-package import edges and miss
+ * every same-package relationship — so call-graph edges are injected (deduped
+ * against existing import edges) regardless of the import-edge count. See #138.
+ */
+const SAME_PACKAGE_IMPLICIT_LANGS = new Set(['Java', 'Kotlin']);
+
+/**
  * Synthesize dependency edges from cross-file call edges and inject them into
  * an existing DependencyGraphResult in-place.
  *
@@ -835,14 +910,18 @@ const IMPLICIT_IMPORT_LANGS = new Set(['Swift', 'C++', 'C']);
  */
 export function injectCallGraphEdges(
   depGraph: DependencyGraphResult,
-  callEdges: Array<{ callerId: string; calleeId: string }>,
+  callEdges: Array<{ callerId: string; calleeId: string; confidence?: string }>,
   nodeFilePath: (id: string) => string | undefined,
 ): void {
   // Build a Set of node IDs for quick membership test
   const nodeIds = new Set(depGraph.nodes.map(n => n.id));
 
-  // Collect unique file-level edges
-  const seen = new Set<string>();
+  // Collect unique file-level edges. Seed `seen` with the file pairs that
+  // already have an edge (e.g. cross-package imports) so injected call edges
+  // never duplicate an existing import edge — this makes injection safe to run
+  // for languages that mix explicit imports with implicit same-package refs
+  // (Java/Kotlin), not just import-less languages (Swift/C/C++).
+  const seen = new Set<string>(depGraph.edges.map(e => `${e.source}→${e.target}`));
   const newEdges: DependencyEdge[] = [];
 
   for (const ce of callEdges) {
@@ -853,7 +932,15 @@ export function injectCallGraphEdges(
     const key = `${callerFile}→${calleeFile}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    newEdges.push({ source: callerFile, target: calleeFile, importedNames: [], isTypeOnly: false, weight: 1, isCallEdge: true });
+    newEdges.push({
+      source: callerFile,
+      target: calleeFile,
+      importedNames: [],
+      isTypeOnly: false,
+      weight: 1,
+      isCallEdge: true,
+      ...(ce.confidence ? { resolutionConfidence: ce.confidence } : {}),
+    });
   }
 
   if (newEdges.length === 0) return;
@@ -899,7 +986,7 @@ export function injectCallGraphEdges(
   depGraph.statistics.structuralClusterCount = depGraph.structuralClusters.length;
 }
 
-export { IMPLICIT_IMPORT_LANGS };
+export { IMPLICIT_IMPORT_LANGS, SAME_PACKAGE_IMPLICIT_LANGS };
 
 // ============================================================================
 // EXPORT FORMATS
@@ -977,17 +1064,24 @@ export function toDotFormat(result: DependencyGraphResult): string {
   lines.push('    rankdir=LR;');
   lines.push('    node [shape=box];');
 
-  // Create node definitions with labels
+  // Every value below is a repository-derived path or symbol name interpolated into a
+  // double-quoted DOT string, so all of them go through the same escape. Escaping only
+  // the visible label (the previous behaviour) left the node/edge ids able to terminate
+  // their own quoted string and corrupt the rest of the graph.
   for (const node of result.nodes) {
-    const name = node.file.name.replace(/"/g, '\\"');
+    const name = escapeDotString(node.file.name);
     const color = node.metrics.pageRank > 0.5 ? 'lightblue' : 'white';
-    lines.push(`    "${node.id}" [label="${name}" fillcolor="${color}" style="filled"];`);
+    lines.push(
+      `    "${escapeDotString(node.id)}" [label="${name}" fillcolor="${color}" style="filled"];`
+    );
   }
 
   // Create edges
   for (const edge of result.edges) {
     const style = edge.isTypeOnly ? 'dashed' : 'solid';
-    lines.push(`    "${edge.source}" -> "${edge.target}" [style="${style}"];`);
+    lines.push(
+      `    "${escapeDotString(edge.source)}" -> "${escapeDotString(edge.target)}" [style="${style}"];`
+    );
   }
 
   lines.push('}');

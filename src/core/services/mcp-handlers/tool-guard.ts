@@ -1,0 +1,406 @@
+/**
+ * MCP tool response hardening (spec-10).
+ *
+ * A single set of guards every tool runs through in the CallTool handler, so the
+ * whole surface has one uniform input-validation, timeout, output-cap, and
+ * error-normalization path:
+ *
+ *   - Input validation BEFORE the handler runs, against the tool's own declared
+ *     `inputSchema` (reusing the hand-written JSON-Schema-subset validator from
+ *     spec-05 — no Ajv). Invalid args are a Tool Execution Error (`isError: true`) whose text
+ *     names the parameter, the expected shape, and a corrected example call, so the calling
+ *     model can self-correct (change: adopt-mcp-protocol-conformance; SEP-1303).
+ *   - Per-tool timeout via Promise.race, with slow tools overridden.
+ *   - Output size cap: oversized results are truncated DETERMINISTICALLY with a
+ *     `truncated: true` note telling the agent how to narrow the query — never a
+ *     silent drop.
+ *   - Error normalization to a stable code taxonomy, distinguishing "repo not
+ *     analyzed yet" (actionable) from real failures.
+ */
+
+import { validateAgainstSchema } from '../../../cli/manifest/schema-validator.js';
+import { MCP_TOOL_TIMEOUT_MS, MCP_TOOL_TIMEOUT_OVERRIDES } from '../../../constants.js';
+import { suggestKey } from '../config-schema.js';
+import { sanitizeForTerminal } from '../../../utils/misc.js';
+import { redactSecretString } from '../secret-redaction.js';
+
+/** Stable MCP tool error-code taxonomy. */
+export type McpToolErrorCode = 'INVALID_ARGS' | 'NOT_ANALYZED' | 'TIMEOUT' | 'OUTPUT_TRUNCATED' | 'INTERNAL';
+
+const MAX_UNKNOWN_KEY_DISPLAY = 80;
+const MAX_SUGGESTION_KEY_LENGTH = 128;
+
+/** Reject the first unknown own property with a bounded, deterministic hint. */
+export function validateKnownProperties(value: unknown, knownKeys: readonly string[]): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const known = new Set(knownKeys);
+  const key = Object.keys(value as Record<string, unknown>).find(candidate => !known.has(candidate));
+  if (key === undefined) return null;
+  const shown = key.length <= MAX_UNKNOWN_KEY_DISPLAY
+    ? key
+    : `${key.slice(0, MAX_UNKNOWN_KEY_DISPLAY - 1)}…`;
+  const suggestion = key.length <= MAX_SUGGESTION_KEY_LENGTH
+    ? suggestKey(key, knownKeys)
+    : undefined;
+  return suggestion
+    ? `unknown property "${shown}"; did you mean "${suggestion}"?`
+    : `unknown property "${shown}"`;
+}
+
+function schemaAtPath(schema: Record<string, unknown>, path: string): Record<string, unknown> {
+  let current = schema;
+  for (const rawSegment of path.split('/').slice(1)) {
+    const segment = rawSegment.replace(/~1/g, '/').replace(/~0/g, '~');
+    const next = /^\d+$/.test(segment)
+      ? current.items
+      : (current.properties as Record<string, unknown> | undefined)?.[segment];
+    if (!next || typeof next !== 'object' || Array.isArray(next)) return {};
+    current = next as Record<string, unknown>;
+  }
+  return current;
+}
+
+/** A value of the shape a property schema declares, for a corrected-call example. */
+function exampleValue(propertySchema: Record<string, unknown>, key?: string, depth = 0): unknown {
+  if (Array.isArray(propertySchema.enum) && propertySchema.enum.length > 0) return propertySchema.enum[0];
+  if ('const' in propertySchema) return propertySchema.const;
+  const expected = Array.isArray(propertySchema.type)
+    ? propertySchema.type.join('|')
+    : typeof propertySchema.type === 'string' ? propertySchema.type : 'value';
+  if (expected.includes('string')) return key === 'directory' ? '/absolute/path/to/project' : 'example';
+  if (expected.includes('number') || expected.includes('integer')) {
+    return typeof propertySchema.minimum === 'number' ? propertySchema.minimum : 1;
+  }
+  if (expected.includes('boolean')) return true;
+  if (expected.includes('array')) {
+    const items = propertySchema.items;
+    const count = typeof propertySchema.minItems === 'number' ? propertySchema.minItems : 0;
+    return items && typeof items === 'object' && depth < MAX_EXAMPLE_DEPTH
+      ? Array.from({ length: count }, () => exampleValue(items as Record<string, unknown>, undefined, depth + 1))
+      : [];
+  }
+  // An object example fills its own required properties, so the example validates.
+  return depth < MAX_EXAMPLE_DEPTH ? exampleToolArguments(propertySchema, depth + 1) : {};
+}
+
+const MAX_EXAMPLE_DEPTH = 4;
+
+/**
+ * A minimal argument object that satisfies a schema's `required` list, each value an example of its
+ * declared shape — the "corrected example" half of an actionable validation error.
+ */
+export function exampleToolArguments(inputSchema: unknown, depth = 0): Record<string, unknown> {
+  if (!inputSchema || typeof inputSchema !== 'object') return {};
+  const schema = inputSchema as Record<string, unknown>;
+  const properties = schema.properties && typeof schema.properties === 'object'
+    ? schema.properties as Record<string, Record<string, unknown>>
+    : {};
+  const required = Array.isArray(schema.required) ? schema.required.filter((k): k is string => typeof k === 'string') : [];
+  return Object.fromEntries(required.map(key => [key, exampleValue(properties[key] ?? {}, key, depth)]));
+}
+
+/** Characters of rejection detail kept; a caller-supplied value is echoed inside it. */
+const MAX_INVALID_ARGUMENTS_DETAIL = 1_000;
+
+/**
+ * The text of an actionable Tool Execution Error for rejected arguments: the tool, what is wrong
+ * (parameter path and expected shape), and a corrected example call to retry with. The detail echoes
+ * caller-supplied values, so it is bounded, secret-redacted, and stripped of terminal controls like
+ * every other error result.
+ */
+export function invalidArgumentsMessage(
+  toolName: string,
+  detail: string,
+  inputSchema: unknown,
+  exampleOverrides: Record<string, unknown> = {},
+): string {
+  const trimmed = detail.replace(/\.+$/, '');
+  const bounded = trimmed.length > MAX_INVALID_ARGUMENTS_DETAIL
+    ? `${trimmed.slice(0, MAX_INVALID_ARGUMENTS_DETAIL - 1)}…`
+    : trimmed;
+  const example = { ...exampleToolArguments(inputSchema), ...exampleOverrides };
+  return sanitizeForTerminal(redactSecretString(
+    `Tool error [INVALID_ARGS]: Invalid arguments for "${toolName}": ${bounded}. ` +
+    `Fix the arguments and call "${toolName}" again, for example with: ${JSON.stringify(example)}`,
+  ));
+}
+
+type InvalidArgumentsResult = { content: Array<{ type: 'text'; text: string }>; isError: true };
+
+/**
+ * Check a tool call's arguments before anything runs (change: adopt-mcp-protocol-conformance): schema
+ * validation, then the `directory`. A rejection is a Tool Execution Error (`isError: true`) the model
+ * can act on, never a JSON-RPC protocol error; it creates nothing, so no telemetry is written for it.
+ */
+export async function checkToolArguments(
+  toolName: string,
+  args: unknown,
+  inputSchema: unknown,
+  options: { hadExplicitDirectory: boolean; validateDirectory: (directory: string) => Promise<string> },
+): Promise<{ ok: true; directory: string } | { ok: false; result: InvalidArgumentsResult }> {
+  const reject = (text: string) => ({ ok: false as const, result: { content: [{ type: 'text' as const, text }], isError: true as const } });
+  const argError = validateToolArgs(args, inputSchema);
+  if (argError) return reject(invalidArgumentsMessage(toolName, argError, inputSchema));
+  const raw = args !== null && typeof args === 'object' ? (args as Record<string, unknown>).directory : undefined;
+  try {
+    return { ok: true, directory: await options.validateDirectory(typeof raw === 'string' ? raw : '') };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const hint = options.hadExplicitDirectory
+      ? ''
+      : '; the server launch root could not be used, so pass an existing absolute project path as "directory"';
+    return reject(invalidArgumentsMessage(toolName, `/directory: ${detail}${hint}`, inputSchema, { directory: '/absolute/path/to/project' }));
+  }
+}
+
+/**
+ * Validate args against a tool's inputSchema. Returns a human-readable message on
+ * failure, or null when valid (or when no schema is declared).
+ */
+export function validateToolArgs(args: unknown, inputSchema: unknown): string | null {
+  if (!inputSchema || typeof inputSchema !== 'object') return null;
+  const schema = inputSchema as Record<string, unknown>;
+  const properties = schema.properties && typeof schema.properties === 'object'
+    ? schema.properties as Record<string, Record<string, unknown>>
+    : {};
+
+  const unknownError = validateKnownProperties(args, Object.keys(properties));
+  if (unknownError) return unknownError;
+
+  const errors = validateAgainstSchema(args ?? {}, schema);
+  if (errors.length === 0) return null;
+  return errors.map(error => {
+    if (!error.path) return error.message;
+    const propertySchema = schemaAtPath(schema, error.path);
+    const example = JSON.stringify(exampleValue(propertySchema));
+    if (error.message === 'missing required property') {
+      const expected = Array.isArray(propertySchema.type)
+        ? propertySchema.type.join('|')
+        : typeof propertySchema.type === 'string' ? propertySchema.type : 'value';
+      return `${error.path}: missing required property; expected type ${expected}; example: ${example}`;
+    }
+    // Every other rejection of a known parameter carries an example of the declared shape too.
+    return Object.keys(propertySchema).length > 0
+      ? `${error.path}: ${error.message}; example: ${example}`
+      : `${error.path}: ${error.message}`;
+  }).join('; ');
+}
+
+/** Thrown when a tool exceeds its timeout — classified as TIMEOUT downstream. */
+export class ToolTimeoutError extends Error {
+  constructor(public readonly toolName: string, public readonly ms: number) {
+    super(`Tool "${toolName}" exceeded its ${ms}ms timeout. Narrow the query or run analyze_codebase first.`);
+    this.name = 'ToolTimeoutError';
+  }
+}
+
+/** The timeout budget for a tool (per-tool override or the default). */
+export function toolTimeoutMs(toolName: string): number {
+  return MCP_TOOL_TIMEOUT_OVERRIDES[toolName] ?? MCP_TOOL_TIMEOUT_MS;
+}
+
+/** Race a tool's work against its timeout. Rejects with ToolTimeoutError on expiry. */
+export function withToolTimeout<T>(work: Promise<T>, toolName: string, msOverride?: number): Promise<T> {
+  const ms = msOverride ?? toolTimeoutMs(toolName);
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ToolTimeoutError(toolName, ms)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+/**
+ * Deterministically cap a result string to a byte budget. When over budget, cut on
+ * a UTF-8-safe boundary and append a note explaining how to narrow the query.
+ */
+export function capOutput(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: false };
+  const note =
+    '\n\n…[output truncated — exceeded the response byte budget. Narrow the query: add a filePattern, ' +
+    'lower a limit/maxDepth/maxResults, or query a specific symbol/file.]';
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(note, 'utf8'));
+  let slice = text.slice(0, budget);
+  while (slice.length > 0 && Buffer.byteLength(slice, 'utf8') > budget) slice = slice.slice(0, -1);
+  return { text: slice + note, truncated: true };
+}
+
+/**
+ * Bytes `JSON.stringify` emits for one code point, excluding the surrounding quotes.
+ *
+ * Mirrors the JSON string grammar exactly: the two mandatory escapes, the short
+ * control escapes, `\u00XX` for the remaining C0 range, and otherwise the UTF-8
+ * width of the code point.
+ */
+function jsonEscapedCodePointBytes(cp: number): number {
+  if (cp === 0x22 /* " */ || cp === 0x5c /* \ */) return 2;
+  if (cp < 0x20) return (cp === 0x08 || cp === 0x09 || cp === 0x0a || cp === 0x0c || cp === 0x0d) ? 2 : 6;
+  if (cp < 0x80) return 1;
+  if (cp < 0x800) return 2;
+  // A LONE surrogate — `for…of` only ever yields one when the text is not well-formed,
+  // since it yields a valid pair as its combined code point. JSON.stringify emits it as
+  // the six-byte `\udXXX` escape, not as UTF-8.
+  if (cp >= 0xd800 && cp <= 0xdfff) return 6;
+  if (cp < 0x10000) return 3;
+  return 4;
+}
+
+/** Bytes `JSON.stringify(text)` emits, excluding the surrounding quotes. */
+function jsonEscapedBytes(text: string): number {
+  let total = 0;
+  for (const ch of text) total += jsonEscapedCodePointBytes(ch.codePointAt(0)!);
+  return total;
+}
+
+/**
+ * The largest cut index into `text` — always on a code-point boundary — whose
+ * JSON-escaped form fits `budget` bytes.
+ *
+ * Replaces a binary search whose predicate re-serialized the ENTIRE enclosing result
+ * on every probe (~20-27 full pretty-prints of a multi-megabyte object). Escaped byte
+ * length is a prefix sum over code points, so one O(len) pass answers every probe in
+ * O(1) — and the answer is exact rather than estimated.
+ *
+ * Cutting on a code-point boundary is also why the sums are additive: splitting a
+ * surrogate pair would leave a lone surrogate, which JSON escapes to six bytes rather
+ * than contributing its half of a four-byte character. The cut can therefore land one
+ * code point earlier than a byte-exact search would, never later, and never inside a
+ * character. (change: optimize-serving-hot-path-caches)
+ */
+function largestFittingJsonCut(text: string, budget: number): number {
+  if (budget <= 0) return 0;
+  let bytes = 0;
+  let cut = 0;
+  for (const ch of text) {
+    const next = bytes + jsonEscapedCodePointBytes(ch.codePointAt(0)!);
+    if (next > budget) return cut;
+    bytes = next;
+    cut += ch.length;
+  }
+  return cut;
+}
+
+/**
+ * Cap a tool RESULT to a byte budget while keeping it parseable.
+ *
+ * Tool results are serialized to JSON before being sent to the agent. Naively
+ * byte-truncating that JSON (what capOutput does to a raw string) cuts mid-string-
+ * literal and yields UNPARSEABLE JSON — the agent can't use any of it (this is how
+ * get_spec on a >256 KB spec broke). Instead:
+ *   - string results (raw-text tools) → capOutput, unchanged;
+ *   - object results → re-serialize with the single largest top-level string field
+ *     truncated to fit (shape preserved, valid JSON, marked `truncated: true`);
+ *   - anything else over budget → a valid JSON envelope wrapping the partial.
+ * Binary search keeps the result within the byte budget despite JSON-escaping overhead.
+ *
+ * The string branch also SANITIZES, which the object branches do not need to: an object
+ * result is emitted through `JSON.stringify`, which escapes control characters to
+ * `\uXXXX` and renders them inert on the way to the agent's terminal. A string result
+ * is emitted verbatim, so its control characters survive — and the one string-returning
+ * handler (`get_signatures`) returns extracted source, code COMMENTS included. That
+ * makes a comment in an analyzed repository a way to clear the agent's terminal and
+ * print a forged OpenLore verdict. Newlines are the signature listing's own structure,
+ * so they are kept.
+ */
+export function capStructuredResult(result: unknown, maxBytes: number): { text: string; truncated: boolean } {
+  if (typeof result === 'string') {
+    return capOutput(sanitizeForTerminal(result, { keepNewlines: true }), maxBytes);
+  }
+
+  const full = JSON.stringify(result, null, 2);
+  if (Buffer.byteLength(full, 'utf8') <= maxBytes) return { text: full, truncated: false };
+
+  // Truncate the dominant top-level string field and re-serialize — keeps the shape.
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const obj = result as Record<string, unknown>;
+    let key: string | null = null;
+    let keyLen = 0;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'string' && v.length > keyLen) { keyLen = v.length; key = k; }
+    }
+    if (key) {
+      const field = obj[key] as string;
+      const marker = '\n\n…[truncated — this field exceeded the response byte budget; narrow the query]';
+      // Serialize the enclosing shape ONCE with the field emptied; the field's own
+      // contribution is then pure arithmetic. `""` in the shell is the 2 quote bytes
+      // the real field also pays, so the shell's size needs no adjustment.
+      const shellBytes = Buffer.byteLength(
+        JSON.stringify({ ...obj, [key]: '', truncated: true }, null, 2), 'utf8',
+      );
+      const best = largestFittingJsonCut(field, maxBytes - shellBytes - jsonEscapedBytes(marker));
+      const capped = { ...obj, [key]: field.slice(0, best) + marker, truncated: true };
+      const text = JSON.stringify(capped, null, 2);
+      if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: true };
+    }
+  }
+
+  // Fallback (arrays / no dominant string field): a valid JSON envelope around the partial.
+  const note =
+    'output exceeded the response byte budget; narrow the query (add a filePattern, lower a ' +
+    'limit/maxDepth/maxResults, or query a specific symbol/file).';
+  const redactions = result && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>).redactions
+    : undefined;
+  const indexStaleness = result && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>).indexStaleness
+    : undefined;
+  const truncatedAtDepth = result && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>).truncatedAtDepth
+    : undefined;
+  const soundness = result && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>).soundness
+    : undefined;
+  let preservedIndexStaleness = indexStaleness;
+  const envelopeWith = (partial: string, staleness: unknown): Record<string, unknown> => ({
+    truncated: true,
+    note,
+    ...(redactions === undefined ? {} : { redactions }),
+    ...(staleness === undefined ? {} : { indexStaleness: staleness }),
+    ...(truncatedAtDepth === undefined ? {} : { truncatedAtDepth }),
+    ...(soundness === undefined ? {} : { soundness }),
+    partial,
+  });
+
+  // An untrusted artifact can cite many very long paths. Keeping that machine
+  // list verbatim would make the "capped" envelope itself exceed maxBytes even
+  // with an empty partial. Compact only when necessary, retaining the factual
+  // boundary, count, one bounded example, and repair status.
+  if (
+    indexStaleness !== undefined
+    && Buffer.byteLength(JSON.stringify(envelopeWith('', indexStaleness), null, 2), 'utf8') > maxBytes
+  ) {
+    const stale = indexStaleness && typeof indexStaleness === 'object' && !Array.isArray(indexStaleness)
+      ? indexStaleness as Record<string, unknown>
+      : {};
+    const files = Array.isArray(stale.staleFiles)
+      ? stale.staleFiles.filter((file): file is string => typeof file === 'string')
+      : [];
+    const first = files[0]?.slice(0, 256);
+    preservedIndexStaleness = {
+      staleFiles: first ? [first] : [],
+      staleFileCount: files.length,
+      ...(files.length > (first ? 1 : 0) ? { staleFilesOmitted: files.length - (first ? 1 : 0) } : {}),
+      note: 'The index is behind the working tree; results may omit recent edits. Stale-file details were bounded to fit the response.',
+      ...(stale.repairScheduled === true ? { repairScheduled: true } : {}),
+      ...(stale.uncheckedCitations === true ? { uncheckedCitations: true } : {}),
+    };
+  }
+  const envelope = (partial: string): Record<string, unknown> => ({
+    // Freshness is a mandatory factual boundary, not optional detail. Preserve
+    // a bounded form even when the structured payload falls back to a
+    // truncation envelope (change: disclose-stale-serving-on-cold-reads).
+    ...envelopeWith(partial, preservedIndexStaleness),
+  });
+  const envelopeShellBytes = Buffer.byteLength(JSON.stringify(envelope(''), null, 2), 'utf8');
+  const best = largestFittingJsonCut(full, maxBytes - envelopeShellBytes);
+  return { text: JSON.stringify(envelope(full.slice(0, best)), null, 2), truncated: true };
+}
+
+/** Map an error to the stable taxonomy code (actionable vs real failure). */
+export function classifyToolError(err: unknown): McpToolErrorCode {
+  if (err instanceof ToolTimeoutError) return 'TIMEOUT';
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (/no analysis found|run analyze_codebase|not available.*re-run|re-run analyze_codebase|call graph (db )?not available/.test(msg)) {
+    return 'NOT_ANALYZED';
+  }
+  return 'INTERNAL';
+}

@@ -1,10 +1,10 @@
-# spec-gen Architecture
+# openlore Architecture
 
-This document describes the internal architecture of spec-gen.
+This document describes the internal architecture of openlore.
 
 ## Overview
 
-spec-gen is a CLI tool that reverse-engineers OpenSpec specifications from existing codebases. It follows a pipeline architecture with five main phases (plus an optional ADR enrichment stage):
+openlore is a CLI tool that reverse-engineers OpenSpec specifications from existing codebases. It follows a pipeline architecture with five main phases (plus an optional ADR enrichment stage):
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -48,28 +48,28 @@ src/cli/
 
 ### API Layer (`src/api/`)
 
-The API layer provides a programmatic interface for external consumers (like OpenSpec CLI). Each CLI command has a corresponding API function that returns typed results without side effects.
+The API layer provides a programmatic interface for external consumers (like OpenSpec CLI). Its analysis and generation entry points are facades over the same core pipelines used by the CLI, so configuration, artifacts, indexes, provider resolution, and cache semantics cannot drift between front ends.
 
 ```
 src/api/
 ├── index.ts           # Barrel export — public API surface
 ├── types.ts           # Option and result type definitions
-├── init.ts            # specGenInit() — project detection, config creation
-├── analyze.ts         # specGenAnalyze() — static analysis pipeline
-├── generate.ts        # specGenGenerate() — LLM spec generation
-├── verify.ts          # specGenVerify() — spec accuracy testing
-├── drift.ts           # specGenDrift() — spec-to-code drift detection
-└── run.ts             # specGenRun() — full pipeline orchestration
+├── init.ts            # openloreInit() — project detection, config creation
+├── analyze.ts         # openloreAnalyze() — shared analysis-core facade
+├── generate.ts        # openloreGenerate() — shared generation-core facade
+├── verify.ts          # openloreVerify() — spec accuracy testing
+├── drift.ts           # openloreDrift() — spec-to-code drift detection
+└── run.ts             # openloreRun() — full pipeline orchestration
 ```
 
 **Design Principles:**
-- No `process.exit`, `console.log`, or `process.chdir` — pure library code
+- No `process.exit` or `process.chdir`; logger output is request-scoped and muted by default
 - Progress callbacks (`onProgress`) instead of terminal output
-- Errors are thrown, not swallowed into exit codes
-- All functions return typed result objects
+- Stable `OpenLoreError` codes at public failure boundaries
+- Typed cache/degradation markers and discriminated dry-run results
 - Optional dependencies on LLM providers (only imported when needed)
 
-**Package exports:** `import { specGenAnalyze } from 'spec-gen'` imports the API; the CLI is available at `spec-gen/cli`.
+**Package exports:** `import { openloreAnalyze } from 'openlore'` imports the API; the CLI is available at `openlore/cli`.
 
 ### Core Layer (`src/core/`)
 
@@ -96,7 +96,7 @@ FileWalker ──▶ SignificanceScorer ──▶ ImportParser ──▶ Depende
 RepositoryMapper ◀────────────────────────────────────────────┘
       │
       ▼
-ArtifactGenerator ──▶ .spec-gen/analysis/
+ArtifactGenerator ──▶ .openlore/analysis/
 ```
 
 #### Generator (`src/core/generator/`)
@@ -179,7 +179,7 @@ interface DependencyNode { ... }
 interface DependencyEdge { ... }
 
 // Configuration types
-interface SpecGenConfig {
+interface OpenLoreConfig {
   version: string;
   projectType: ProjectType;
   openspecPath: string;
@@ -271,7 +271,7 @@ Score = NameScore (0-30) + PathScore (0-25) +
 ### Full Pipeline
 
 ```
-User runs: spec-gen
+User runs: openlore
 
   ┌─────────────────────────────────────────────────────────────┐
   │                      INITIALIZATION                          │
@@ -297,7 +297,7 @@ User runs: spec-gen
   │  └─────────────┘    └─────────────┘                         │
   │         │                 │                                  │
   │         ▼                 ▼                                  │
-  │  .spec-gen/         Dependency                               │
+  │  .openlore/         Dependency                               │
   │  analysis/          Graph                                    │
   └─────────────────────────────────────────────────────────────┘
                                 │
@@ -348,10 +348,15 @@ interface LLMServiceOptions {
   sslVerify?: boolean;   // SSL certificate verification (default: true)
   maxRetries?: number;
   timeout?: number;
-  logDir?: string;
+  logDir?: string;       // Explicit trusted path, or a path confined by logRoot
+  logRoot?: string;      // Canonical project-root boundary for OpenLore-owned logs
   enableLogging?: boolean;
 }
 ```
+
+When logging is enabled, OpenLore-owned callers always pair their repository-derived
+`logDir` with `logRoot`. Embedders may omit `logRoot` only when they supply an explicit,
+trusted `logDir`; enabling logging with neither boundary nor an explicit path is rejected.
 
 **Supported Providers:**
 - Anthropic Claude (primary, used when `ANTHROPIC_API_KEY` is set)
@@ -389,7 +394,7 @@ CLI --insecure flag  >  config.json llm.sslVerify  >  true (default)
 ### Error Categories
 
 ```typescript
-class SpecGenError extends Error {
+class OpenLoreError extends Error {
   code: string;        // Machine-readable code
   suggestion?: string; // User-friendly fix
 }

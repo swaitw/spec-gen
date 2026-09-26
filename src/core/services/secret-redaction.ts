@@ -1,0 +1,287 @@
+/**
+ * Secret redaction — the single source of truth for scrubbing provider API keys
+ * and other credentials out of EVERY server output channel.
+ * change: add-secret-redaction-boundary
+ *
+ * mcp-security "Secret Confinement Across All Output Paths" requires that a key
+ * read for an LLM call never appears in a tool result, telemetry event, log line,
+ * or written artifact — extending mcp-quality's error-text sanitization to all
+ * channels. This module backs both `sanitizeMcpError` (error text) and the deep
+ * `redactSecrets` walker used on structured payloads (telemetry, echoed config).
+ *
+ * Kept dependency-free so any layer (utils, telemetry, logger) can import it
+ * without an import cycle.
+ */
+
+/**
+ * Object KEY names whose string value is a secret and must be replaced wholesale.
+ * Matches the name as a whole token, with optional prefixes/suffixes joined by
+ * `-`/`_`/`.` (e.g. `anthropicApiKey`, `x-openlore-token`, `client_secret`).
+ */
+const SECRET_KEY_NAME =
+  /(^|[._-])(api[._-]?key|apikey|token|secret|password|passwd|authorization|auth|credential|client[._-]?secret|access[._-]?key|private[._-]?key|session[._-]?key|session[._-]?id|signing[._-]?key|cookie|webhook(?:[._-]?url)?|pat)([._-]|$)/i;
+
+/** Canonical AWS SDK credential property names, including camelCase object syntax. */
+const CLOUD_CREDENTIAL_KEY_NAME = /^(?:aws)?(?:secretAccessKey|sessionToken)$/i;
+
+export type SecretKind =
+  | 'api-key'
+  | 'authorization'
+  | 'cloud-credential'
+  | 'connection-string'
+  | 'jwt'
+  | 'private-key'
+  | 'secret-field';
+
+export interface RedactionDisclosure {
+  count: number;
+  kinds: SecretKind[];
+}
+
+export interface RedactionResult<T> {
+  value: T;
+  redactions: RedactionDisclosure;
+}
+
+interface SecretPattern {
+  pattern: RegExp;
+  kind: SecretKind;
+  replacement?: string;
+}
+
+/** Fixed, deterministic credential patterns, ordered broadest-first to avoid double counting. */
+const SECRET_VALUE_PATTERNS: readonly SecretPattern[] = [
+  // Stop at a surrounding object/header delimiter so embedded provider diagnostics are
+  // scrubbed without erasing sibling source properties. A credential value must contain
+  // a scheme plus payload, so `{ Authorization: token, ... }` remains ordinary code.
+  {
+    pattern: /(["']?Authorization["']?\s*:\s*)(["']?)(?:[A-Za-z][A-Za-z0-9_-]*\s+[^}\]\n\r]*?|[A-Za-z0-9_+/=-]{10,})\2(?=\s*,\s*["']?[A-Za-z][A-Za-z0-9_-]*["']?\s*:|[}\]\n\r]|$)/gi,
+    kind: 'authorization',
+    replacement: '$1$2$MARKER$2',
+  },
+  { pattern: /Bearer\s+\S{10,}/gi, kind: 'authorization', replacement: 'Bearer $MARKER' },
+  { pattern: /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g, kind: 'private-key' },
+  { pattern: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?):\/\/[^\s:/]+:[^\s@/]+@[^\s'"`]+/gi, kind: 'connection-string' },
+  // Any OTHER scheme carrying `user:pass@` — the enumeration above covers the databases
+  // we expected, but the credential is in the same place whatever the scheme is, and
+  // `https://svc:S3cr3tPw@internal/api` (a gateway URL echoed in a provider error) was
+  // passing every channel untouched. Runs after the specific patterns so their typed
+  // match still wins for a known scheme.
+  // Scheme bounded to 40 chars (the longest registered IANA scheme is ~36). Unbounded,
+  // `[a-z0-9+.-]*` eats a long dotted token, then REQUIRES `://`, then backtracks from
+  // every offset — and because `.` is in the class the payload is just an ordinary long
+  // member chain (`a.a.a.a…`), i.e. what real source code looks like. Measured 16,620 ms
+  // on 100 KB; bounded, 11 ms, with identical matches.
+  { pattern: /\b[a-z][a-z0-9+.-]{0,40}:\/\/[^\s:/@]+:[^\s@/]+@[^\s'"`]+/gi, kind: 'connection-string' },
+  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, kind: 'jwt' },
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, kind: 'cloud-credential' },
+  {
+    pattern: /((?:AWS_SECRET_ACCESS_KEY|aws_secret_access_key|awsSecretAccessKey|secretAccessKey)\s*[=:]\s*)["']?[A-Za-z0-9/+=]{40}["']?/gi,
+    kind: 'cloud-credential',
+    replacement: '$1$MARKER',
+  },
+  {
+    pattern: /((?:AWS_SESSION_TOKEN|aws_session_token|awsSessionToken|sessionToken)\s*[=:]\s*)["']?[A-Za-z0-9/+=]{16,}["']?/gi,
+    kind: 'cloud-credential',
+    replacement: '$1$MARKER',
+  },
+  // Provider header forms that carry the raw key. Anthropic sends `x-api-key`, Google
+  // sends `x-goog-api-key`; a proxy that echoes the inbound request in its error body
+  // puts the header (name and value) verbatim into text we then log.
+  { pattern: /x-api-key:[^\n\r]*/gi, kind: 'api-key', replacement: 'x-api-key: $MARKER' },
+  { pattern: /x-goog-api-key:[^\n\r]*/gi, kind: 'api-key', replacement: 'x-goog-api-key: $MARKER' },
+  {
+    pattern: /((?:api[_-]?key|password|passwd|secret|token)["']?\s*[=:]\s*)(?!\[REDACTED(?::[a-z-]+)?\])(?:"[^"\r\n]{8,}"|'[^'\r\n]{8,}'|(?!(?:undefined|null|true|false)\b)(?:(?=[A-Za-z0-9_+/=-]{8,}(?:\s|[;,]|$))(?=[A-Za-z0-9_+/=-]*[0-9_+/=-])[A-Za-z0-9_+/=-]{8,}|[A-Za-z]{8,}(?=\s|$)))/gi,
+    kind: 'secret-field',
+    replacement: '$1$MARKER',
+  },
+  { pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,})\b/g, kind: 'api-key' },
+  { pattern: /sk-ant-[A-Za-z0-9\-_]{10,}/g, kind: 'api-key' },
+  { pattern: /sk-[A-Za-z0-9\-_]{20,}/g, kind: 'api-key' },
+  // Google API keys are self-identifying by prefix, so they can be caught free-standing
+  // (e.g. embedded in a URL that has already been reshaped by a proxy).
+  { pattern: /AIza[0-9A-Za-z\-_]{35}/g, kind: 'api-key' },
+  // Google-style `?key=...` in a provider URL (e.g. Gemini generateContent).
+  { pattern: /([?&]key=)[A-Za-z0-9\-_]{8,}/gi, kind: 'api-key', replacement: '$1$MARKER' },
+];
+
+/** True when an object key name denotes a credential (either naming convention). */
+function isSecretKeyName(key: string): boolean {
+  return SECRET_KEY_NAME.test(key) || CLOUD_CREDENTIAL_KEY_NAME.test(key);
+}
+
+/**
+ * Absolute filesystem paths → `[path]`.
+ *
+ * Not a credential, so it is NOT one of the secret patterns (it must not inflate a
+ * redaction receipt), but it belongs in this module rather than being re-implemented per
+ * surface: the view server ships error text to a browser, and a home-directory path
+ * discloses the operator's username and local layout. Compose it with the secret
+ * redactors at any surface that answers a remote client.
+ */
+export function redactLocalPaths(s: string): string {
+  return s
+    .replace(/\/Users\/[^\s:]+/g, '[path]')
+    .replace(/\/home\/[^\s:]+/g, '[path]')
+    .replace(/[A-Z]:\\[^\s:]+/g, '[path]');
+}
+
+function marker(kind: SecretKind, typed: boolean): string {
+  return typed ? `[REDACTED:${kind}]` : '[REDACTED]';
+}
+
+function redactStringWithReport(s: string, typed: boolean): RedactionResult<string> {
+  let value = s;
+  let count = 0;
+  const kinds = new Set<SecretKind>();
+  for (const { pattern, kind, replacement } of SECRET_VALUE_PATTERNS) {
+    value = value.replace(pattern, (...args: unknown[]) => {
+      count++;
+      kinds.add(kind);
+      const replacementText = replacement ?? '$MARKER';
+      const groups = args.slice(1, -2) as string[];
+      return replacementText
+        .replace('$MARKER', marker(kind, typed))
+        .replace(/\$(\d+)/g, (_match, index: string) => groups[Number(index) - 1] ?? '');
+    });
+  }
+  return { value, redactions: { count, kinds: [...kinds].sort() } };
+}
+
+/** Redact credential-shaped substrings from a single string. */
+export function redactSecretString(s: string): string {
+  return redactStringWithReport(s, false).value;
+}
+
+/** Redact credential-shaped spans and return a typed, deterministic disclosure receipt. */
+export function redactSecretText(s: string): RedactionResult<string> {
+  return redactStringWithReport(s, true);
+}
+
+/**
+ * Redact both credential-shaped text and exact credentials already known to the
+ * caller. Exact matching closes the diagnostic-echo case where a real operator
+ * key is intentionally short or otherwise does not resemble a provider token.
+ * Callers must pass credential values only — URLs, model names, and other config
+ * are deliberately not inferred as secrets here.
+ */
+export function redactSecretTextWithKnownValues(
+  s: string,
+  knownValues: Iterable<string | undefined>,
+): RedactionResult<string> {
+  const initial = redactStringWithReport(s, true);
+  let value = initial.value;
+  let count = initial.redactions.count;
+  const kinds = new Set(initial.redactions.kinds);
+  const unique = [...new Set([...knownValues].filter((candidate): candidate is string => Boolean(candidate)))]
+    .sort((a, b) => b.length - a.length);
+
+  for (const secret of unique) {
+    let occurrences = 0;
+    let cursor = 0;
+    while ((cursor = value.indexOf(secret, cursor)) !== -1) {
+      occurrences++;
+      cursor += secret.length;
+    }
+    if (occurrences === 0) continue;
+    value = value.split(secret).join(marker('api-key', true));
+    count += occurrences;
+    kinds.add('api-key');
+  }
+
+  return { value, redactions: { count, kinds: [...kinds].sort() } };
+}
+
+/**
+ * Deep-redact a value before it leaves the server on a non-error channel:
+ * - strings → credential-shaped substrings replaced;
+ * - object fields whose KEY name denotes a secret → value replaced with `[REDACTED]`;
+ * - arrays/objects → walked recursively.
+ * Returns a redacted copy; the input is not mutated. Cycle-safe: a back-reference resolves
+ * to the already-created redacted twin of the visited node, never to the original — so the
+ * output graph never embeds an un-scrubbed subtree.
+ */
+export function redactSecrets<T>(value: T, _seen?: WeakMap<object, unknown>): T {
+  if (typeof value === 'string') return redactSecretString(value) as unknown as T;
+  if (value === null || typeof value !== 'object') return value;
+
+  // original → redacted twin, registered BEFORE recursing so a cycle closing on this node
+  // resolves to the (in-progress) redacted copy, not the unredacted original.
+  const seen = _seen ?? new WeakMap<object, unknown>();
+  if (seen.has(value as object)) return seen.get(value as object) as T;
+
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value as object, copy);
+    for (const v of value) copy.push(redactSecrets(v, seen));
+    return copy as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  seen.set(value as object, out);
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    // ANY value under a secret-named key, not only a string one: `{"apiKey":{"value":"…"}}`
+    // and `{"token":["…"]}` are ordinary shapes for a credential read out of a config or a
+    // provider response, and the old string-only test walked straight into them (the
+    // nested string then only met the pattern matcher, which a short or unusual key
+    // escapes). null/undefined is left as-is — replacing it would invent a credential
+    // where there is none.
+    if (isSecretKeyName(k) && v != null) {
+      out[k] = '[REDACTED]';
+    } else {
+      out[k] = redactSecrets(v, seen);
+    }
+  }
+  return out as T;
+}
+
+/**
+ * Deep-redact a structured value while counting every replaced span. This is used at
+ * disclosure-bearing boundaries; the compatibility `redactSecrets` API above intentionally
+ * retains its historical untyped marker and return shape for telemetry and error callers.
+ */
+export function redactSecretsWithReport<T>(value: T, typed = true): RedactionResult<T> {
+  const seen = new WeakMap<object, unknown>();
+  const kinds = new Set<SecretKind>();
+  let count = 0;
+
+  const visit = (current: unknown): unknown => {
+    if (typeof current === 'string') {
+      const result = redactStringWithReport(current, typed);
+      count += result.redactions.count;
+      for (const kind of result.redactions.kinds) kinds.add(kind);
+      return result.value;
+    }
+    if (current === null || typeof current !== 'object') return current;
+    if (seen.has(current)) return seen.get(current);
+
+    if (Array.isArray(current)) {
+      const copy: unknown[] = [];
+      seen.set(current, copy);
+      for (const item of current) copy.push(visit(item));
+      return copy;
+    }
+
+    const copy: Record<string, unknown> = {};
+    seen.set(current, copy);
+    for (const [key, child] of Object.entries(current as Record<string, unknown>)) {
+      // Key-named secrets are replaced whatever their VALUE type — see redactSecrets.
+      if (child != null && CLOUD_CREDENTIAL_KEY_NAME.test(key)) {
+        copy[key] = marker('cloud-credential', typed);
+        count++;
+        kinds.add('cloud-credential');
+      } else if (child != null && SECRET_KEY_NAME.test(key)) {
+        copy[key] = marker('secret-field', typed);
+        count++;
+        kinds.add('secret-field');
+      } else {
+        copy[key] = visit(child);
+      }
+    }
+    return copy;
+  };
+
+  return {
+    value: visit(value) as T,
+    redactions: { count, kinds: [...kinds].sort() },
+  };
+}

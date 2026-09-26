@@ -1,5 +1,5 @@
 /**
- * spec-gen refresh-stories command
+ * openlore refresh-stories command
  *
  * Scans story files for stale risk_context sections and re-runs annotate_story
  * on any story that references functions/files changed since the last commit.
@@ -7,87 +7,100 @@
  */
 
 import { Command } from 'commander';
-import { mkdir, readFile, writeFile, chmod, readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { execSync } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
 import { fileExists } from '../../utils/command-helpers.js';
+import { gitPathArgs } from '../../utils/git-args.js';
+import { execFileGitSync } from '../../utils/git-exec.js';
 import { handleAnnotateStory } from '../../core/services/mcp-handlers/change.js';
+import {
+  displayHookPath,
+  hookManagerWarning,
+  isResolvedGitRepository,
+  resolveGitHookTarget,
+  resolveTrustedHookLauncher,
+  renderTrustedHookCommand,
+  updateHookFile,
+} from '../git-hooks.js';
 
 // ============================================================================
 // HOOK MANAGEMENT
 // ============================================================================
 
-const HOOK_MARKER = '# spec-gen-refresh-hook';
+const HOOK_MARKER = '# openlore-refresh-hook';
 
-const HOOK_CONTENT = `
+const renderHookContent = (command: string) => `
 ${HOOK_MARKER}
 # Automatically refresh stale risk_context in story files after structural changes.
-# Installed by: spec-gen refresh-stories --install-hook
+# Installed by: openlore refresh-stories --install-hook
 
-npx --yes spec-gen refresh-stories 2>/dev/null || true
-# end-spec-gen-refresh-hook
+${command} 2>/dev/null || true
+# end-openlore-refresh-hook
 `.trimStart();
 
-async function installPostCommitHook(rootPath: string): Promise<void> {
-  const hooksDir = join(rootPath, '.git', 'hooks');
-  const hookPath = join(hooksDir, 'post-commit');
+export async function installPostCommitHook(rootPath: string): Promise<void> {
+  const target = await resolveGitHookTarget(rootPath, 'post-commit');
+  const hookPath = target.hookPath;
 
-  if (!(await fileExists(join(rootPath, '.git')))) {
+  if (!(await isResolvedGitRepository(rootPath, target))) {
     logger.error('Not a git repository. Cannot install hook.');
     process.exitCode = 1;
     return;
   }
-
-  await mkdir(hooksDir, { recursive: true });
-
-  let existingContent = '';
-  if (await fileExists(hookPath)) {
-    existingContent = await readFile(hookPath, 'utf-8');
-
-    if (existingContent.includes(HOOK_MARKER)) {
-      logger.success('Post-commit hook is already installed.');
-      return;
-    }
-
-    logger.discovery('Existing post-commit hook found. Appending spec-gen refresh check.');
-    const newContent = existingContent.trimEnd() + '\n\n' + HOOK_CONTENT;
-    await writeFile(hookPath, newContent, 'utf-8');
-  } else {
-    const newContent = '#!/bin/sh\n\n' + HOOK_CONTENT;
-    await writeFile(hookPath, newContent, 'utf-8');
+  if (!target.canInstall) {
+    logger.warning(hookManagerWarning(target, 'openlore refresh-stories'));
+    return;
   }
-
-  await chmod(hookPath, 0o755);
-  logger.success('Post-commit hook installed at .git/hooks/post-commit');
+  const launcher = await resolveTrustedHookLauncher(rootPath);
+  if (!launcher) { logger.error('Cannot pin an OpenLore installation outside this repository. Install OpenLore globally and retry.'); process.exitCode = 1; return; }
+  const hookContent = renderHookContent(renderTrustedHookCommand(launcher, ['refresh-stories']));
+  let alreadyInstalled = false;
+  let appended = false;
+  const result = await updateHookFile(hookPath, (existing) => {
+    if (existing?.includes(HOOK_MARKER)) { alreadyInstalled = true; const refreshed = existing.replace(/# openlore-refresh-hook[\s\S]*?# end-openlore-refresh-hook/, hookContent.trimEnd()); return refreshed === existing ? null : refreshed; }
+    appended = existing !== null;
+    return existing ? existing.trimEnd() + '\n\n' + hookContent : '#!/bin/sh\n\n' + hookContent;
+  });
+  if (result.status === 'unavailable') {
+    logger.warning(`Cannot install the refresh-stories hook at ${displayHookPath(hookPath)}: ${result.reason}`);
+    return;
+  }
+  if (alreadyInstalled) {
+    logger.success('Post-commit hook is already installed.');
+    return;
+  }
+  if (appended) logger.discovery('Existing post-commit hook found. Appending openlore refresh check.');
+  logger.success(`Post-commit hook installed at ${displayHookPath(hookPath)}`);
   logger.discovery('Story risk_context will be refreshed after each commit that touches source files.');
 }
 
-async function uninstallPostCommitHook(rootPath: string): Promise<void> {
-  const hookPath = join(rootPath, '.git', 'hooks', 'post-commit');
-
-  if (!(await fileExists(hookPath))) {
+export async function uninstallPostCommitHook(rootPath: string): Promise<void> {
+  const { hookPath } = await resolveGitHookTarget(rootPath, 'post-commit');
+  let found = false;
+  let blockFound = false;
+  let deleted = false;
+  const result = await updateHookFile(hookPath, (existing) => {
+    if (existing === null) return null;
+    found = true;
+    if (!existing.includes(HOOK_MARKER)) return null;
+    blockFound = true;
+    const cleaned = existing
+      .replace(/\n*# openlore-refresh-hook[\s\S]*?# end-openlore-refresh-hook\n*/g, '')
+      .trim();
+    if (!cleaned || cleaned === '#!/bin/sh') { deleted = true; return undefined; }
+    return cleaned + '\n';
+  });
+  if (result.status === 'unavailable') {
+    logger.warning(`Cannot uninstall the refresh-stories hook at ${displayHookPath(hookPath)}: ${result.reason}`);
+  } else if (!found) {
     logger.warning('No post-commit hook found.');
-    return;
-  }
-
-  const content = await readFile(hookPath, 'utf-8');
-  if (!content.includes(HOOK_MARKER)) {
-    logger.warning('Post-commit hook does not contain spec-gen refresh check.');
-    return;
-  }
-
-  const newContent = content
-    .replace(/\n*# spec-gen-refresh-hook[\s\S]*?# end-spec-gen-refresh-hook\n*/g, '')
-    .trim();
-
-  if (!newContent || newContent === '#!/bin/sh') {
-    const { unlink } = await import('node:fs/promises');
-    await unlink(hookPath);
-    logger.success('Post-commit hook removed (file deleted — was only spec-gen).');
+  } else if (!blockFound) {
+    logger.warning('Post-commit hook does not contain openlore refresh check.');
+  } else if (deleted) {
+    logger.success('Post-commit hook removed (file deleted — was only openlore).');
   } else {
-    await writeFile(hookPath, newContent + '\n', 'utf-8');
-    logger.success('Spec-gen refresh check removed from post-commit hook.');
+    logger.success('OpenLore refresh check removed from post-commit hook.');
   }
 }
 
@@ -98,7 +111,7 @@ async function uninstallPostCommitHook(rootPath: string): Promise<void> {
 /** Files changed in the last commit (HEAD~1..HEAD). */
 function getLastCommitChangedFiles(rootPath: string): string[] {
   try {
-    const output = execSync('git diff HEAD~1 HEAD --name-only', {
+    const output = execFileGitSync('git', gitPathArgs('diff', 'HEAD~1', 'HEAD', '--name-only'), {
       cwd: rootPath,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -110,7 +123,7 @@ function getLastCommitChangedFiles(rootPath: string): string[] {
   } catch {
     // Might be the first commit or a shallow clone — fall back to HEAD only
     try {
-      const output = execSync('git diff-tree --no-commit-id -r --name-only HEAD', {
+      const output = execFileGitSync('git', gitPathArgs('diff-tree', '--no-commit-id', '-r', '--name-only', 'HEAD'), {
         cwd: rootPath,
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -244,12 +257,12 @@ export const refreshStoriesCommand = new Command('refresh-stories')
     'after',
     `
 Examples:
-  $ spec-gen refresh-stories                       Refresh stories affected by last commit
-  $ spec-gen refresh-stories --all                 Refresh every story that has risk_context
-  $ spec-gen refresh-stories --dry-run             Show what would be refreshed
-  $ spec-gen refresh-stories --install-hook        Install as post-commit hook
-  $ spec-gen refresh-stories --uninstall-hook      Remove post-commit hook
-  $ spec-gen refresh-stories --stories ./stories   Use a custom stories directory
+  $ openlore refresh-stories                       Refresh stories affected by last commit
+  $ openlore refresh-stories --all                 Refresh every story that has risk_context
+  $ openlore refresh-stories --dry-run             Show what would be refreshed
+  $ openlore refresh-stories --install-hook        Install as post-commit hook
+  $ openlore refresh-stories --uninstall-hook      Remove post-commit hook
+  $ openlore refresh-stories --stories ./stories   Use a custom stories directory
 `
   )
   .action(async function (this: Command, options: {

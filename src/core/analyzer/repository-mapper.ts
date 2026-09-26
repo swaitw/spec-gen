@@ -14,13 +14,17 @@ import {
   ENTRY_POINTS_PREVIEW_LIMIT,
   LANGUAGES_PREVIEW_LIMIT,
   DIRECTORIES_PREVIEW_LIMIT,
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_REPOSITORY_MAP,
+  SOURCE_SCAN_MAX_FILE_BYTES,
 } from '../../constants.js';
 import type { ProjectType, ScoredFile, FileMetadata } from '../../types/index.js';
 import { FileWalker, type FileWalkerOptions } from './file-walker.js';
 import { SignificanceScorer, type ScoringConfig } from './significance-scorer.js';
+import { classifyDomainFile, deriveDomainOwnershipFromPath, DOMAIN_NOISE_DIRS } from './domain-naming.js';
+import { isEntirelyOpenLoreManaged } from '../../utils/openlore-managed-file.js';
+import { readSourceCapped } from './bounded-file-scan.js';
 
 // ============================================================================
 // TYPES
@@ -88,6 +92,28 @@ export interface RepositoryMapSummary {
   totalFiles: number;
   analyzedFiles: number;
   skippedFiles: number;
+  /**
+   * Why each skipped file was skipped, keyed by reason (`gitignore`, `pattern`, `error`,
+   * `directory:<name>`). The walker has always tallied this; it stopped here and never reached a
+   * user, so `analyze` reported a bare count that read like a parse problem (change:
+   * fix-analyze-native-abort-and-file-cost-budget).
+   *
+   * Optional because a map reconstructed from a persisted `RepoStructure` genuinely does not know
+   * the breakdown — that artifact only ever stored the count. Absent there means "not recorded",
+   * which the renderer treats as "say nothing extra" rather than fabricating an empty tally.
+   */
+  skippedReasons?: Record<string, number>;
+  /** How many symlinks were followed into the corpus (disclosure; see FileWalkerResult). */
+  symlinkFollowed?: number;
+  /** Include patterns the caller set that matched no file — a visible config no-op. */
+  includePatternsUnmatched?: string[];
+  /**
+   * Present only when the file walk stopped at the `maxFiles` cap — the analyzed corpus is a
+   * truncated prefix of the repository, not the whole thing. Carried through so `analyze` can
+   * disclose the partial corpus instead of reporting a smaller count as if it were complete.
+   * Absent means the walk completed (or a persisted map that never recorded it).
+   */
+  truncated?: { limit: number; atPath: string };
   languages: LanguageBreakdown[];
   frameworks: DetectedFramework[];
   directories: DirectoryStats[];
@@ -115,8 +141,12 @@ export interface RepositoryMapperOptions {
   maxFiles?: number;
   /** Patterns to force-include, overriding gitignore and excludePatterns */
   includePatterns?: string[];
+  /** Repository patterns that may override defaults, but never ignore files. */
+  restrictedIncludePatterns?: string[];
   /** Additional patterns to exclude */
   excludePatterns?: string[];
+  /** Generated directories that cannot be brought into the source corpus by an include. */
+  protectedExcludePatterns?: string[];
   /** Custom scoring configuration */
   scoringConfig?: ScoringConfig;
   /** Progress callback */
@@ -460,31 +490,32 @@ function detectLayer(file: ScoredFile): keyof typeof LAYER_PATTERNS | null {
  * Infer domains from file paths and names
  */
 function inferDomains(files: ScoredFile[]): Record<string, ScoredFile[]> {
-  const domains: Record<string, ScoredFile[]> = {};
+  // Prototype-less: keys are domain names derived from repository directory names,
+  // so the `!domains[domain]` guard below would otherwise read Object.prototype for a
+  // directory named `__proto__` and then throw on `.push`.
+  const domains: Record<string, ScoredFile[]> = Object.create(null) as Record<
+    string,
+    ScoredFile[]
+  >;
 
   // Common domain prefixes to look for
   const domainPrefixes = new Map<string, string[]>();
 
   for (const file of files) {
-    // Skip test and config files for domain inference
-    if (file.isTest || file.isConfig) continue;
+    // Only defining files may mint repository-map candidates. Supporting
+    // tests are attached later, after final-domain reconciliation.
+    if (classifyDomainFile(file).role !== 'defining') continue;
 
-    // Extract potential domain from path
-    const pathParts = file.path.split('/');
-
-    // Check for domain-like directory names (skip common non-domain dirs)
-    const skipDirs = new Set(['src', 'lib', 'app', 'core', 'common', 'shared', 'utils', 'helpers', 'config']);
-
-    for (const part of pathParts) {
-      if (part && !skipDirs.has(part.toLowerCase()) && !part.startsWith('.')) {
-        // This could be a domain
-        const domain = part.toLowerCase();
-        if (!domains[domain]) {
-          domains[domain] = [];
-        }
-        domains[domain].push(file);
-        break; // Only use first domain-like directory
+    // Derive the stable ownership root for this source tree. JVM package
+    // layouts remain leaf-oriented; module layouts keep technical children
+    // under their first meaningful owner.
+    const dirParts = file.path.replace(/\\/g, '/').split('/').slice(0, -1);
+    const domain = deriveDomainOwnershipFromPath(dirParts, file.extension);
+    if (domain) {
+      if (!domains[domain]) {
+        domains[domain] = [];
       }
+      domains[domain].push(file);
     }
 
     // Also check file name prefixes (e.g., user-service.ts -> user)
@@ -493,7 +524,7 @@ function inferDomains(files: ScoredFile[]): Record<string, ScoredFile[]> {
 
     if (nameParts.length > 1) {
       const prefix = nameParts[0].toLowerCase();
-      if (prefix.length > 2 && !skipDirs.has(prefix)) {
+      if (prefix.length > 2 && !DOMAIN_NOISE_DIRS.has(prefix)) {
         if (!domainPrefixes.has(prefix)) {
           domainPrefixes.set(prefix, []);
         }
@@ -533,10 +564,11 @@ export class RepositoryMapper {
     this.options = {
       maxFiles: options.maxFiles ?? DEFAULT_MAX_FILES,
       includePatterns: options.includePatterns ?? [],
+      restrictedIncludePatterns: options.restrictedIncludePatterns ?? [],
       excludePatterns: options.excludePatterns ?? [],
       scoringConfig: options.scoringConfig ?? {},
       onProgress: options.onProgress ?? (() => {}),
-      outputDir: options.outputDir ?? join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR),
+      outputDir: options.outputDir ?? join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR),
     };
   }
 
@@ -594,8 +626,12 @@ export class RepositoryMapper {
     const extToLang: Record<string, string> = {
       '.ts': 'TypeScript',
       '.tsx': 'TypeScript (React)',
+      '.mts': 'TypeScript',
+      '.cts': 'TypeScript',
       '.js': 'JavaScript',
       '.jsx': 'JavaScript (React)',
+      '.mjs': 'JavaScript',
+      '.cjs': 'JavaScript',
       '.py': 'Python',
       '.rs': 'Rust',
       '.go': 'Go',
@@ -714,8 +750,15 @@ export class RepositoryMapper {
    * Cluster files by various dimensions
    */
   private clusterFiles(files: ScoredFile[]): FileClusters {
-    // By directory
-    const byDirectory: Record<string, ScoredFile[]> = {};
+    // By directory. Prototype-less for the same reason as FileWalker.directoryCounts:
+    // the keys are directory names from the scanned repository, and for a directory
+    // named `__proto__` the guard below would read Object.prototype (truthy), skip the
+    // array init, and then throw on `.push`. `Object.create(null)` has no prototype to
+    // hit, and still serializes as a plain object.
+    const byDirectory: Record<string, ScoredFile[]> = Object.create(null) as Record<
+      string,
+      ScoredFile[]
+    >;
     for (const file of files) {
       const dir = file.directory || '(root)';
       if (!byDirectory[dir]) {
@@ -760,7 +803,9 @@ export class RepositoryMapper {
     const walkerOptions: FileWalkerOptions = {
       maxFiles: this.options.maxFiles,
       includePatterns: this.options.includePatterns,
+      restrictedIncludePatterns: this.options.restrictedIncludePatterns,
       excludePatterns: this.options.excludePatterns,
+      protectedExcludePatterns: this.options.protectedExcludePatterns,
       onProgress: (progress) => {
         const cap = Math.min(this.options.maxFiles ?? DEFAULT_MAX_FILES, 5_000);
         const pct = 10 + Math.round((Math.min(progress.filesFound, cap) / cap) * 30);
@@ -771,6 +816,24 @@ export class RepositoryMapper {
     const walker = new FileWalker(this.rootPath, walkerOptions);
     const walkResult = await walker.walk();
 
+    // change: fix-first-analysis-self-contamination
+    // Installer-owned files remain visible in the raw inventory, but never characterize the
+    // user's repository. Only marker-bearing text formats are opened here; source files do not
+    // pay for another read pass.
+    for (const file of walkResult.files) {
+      if (
+        file.size > SOURCE_SCAN_MAX_FILE_BYTES ||
+        !['', '.json', '.md', '.mdc'].includes(file.extension.toLowerCase())
+      ) continue;
+      try {
+        const content = await readSourceCapped(file.absolutePath, SOURCE_SCAN_MAX_FILE_BYTES);
+        if (content !== null && isEntirelyOpenLoreManaged(file.path, content)) file.tooling = true;
+      } catch {
+        // The normal scoring/extraction paths retain their existing unreadable-file behavior.
+      }
+    }
+    const userFiles = walkResult.files.filter(file => !file.tooling);
+
     this.options.onProgress?.('scoring', 40);
 
     // Score all files
@@ -780,24 +843,25 @@ export class RepositoryMapper {
     this.options.onProgress?.('analyzing', 70);
 
     // Detect project type and frameworks
-    const projectType = this.detectProjectType(walkResult.files);
-    const languages = this.calculateLanguages(walkResult.files);
-    const frameworks = this.detectFrameworks(walkResult.files);
+    const projectType = this.detectProjectType(userFiles);
+    const languages = this.calculateLanguages(userFiles);
+    const frameworks = this.detectFrameworks(userFiles);
+    const userScoredFiles = scoredFiles.filter(file => !file.tooling);
 
     // Extract special file categories
-    const highValueFiles = scoredFiles.slice(0, HIGH_VALUE_FILES_LIMIT);
-    const entryPoints = scoredFiles.filter(f => f.isEntryPoint);
-    const schemaFiles = scoredFiles.filter(f =>
+    const highValueFiles = userScoredFiles.slice(0, HIGH_VALUE_FILES_LIMIT);
+    const entryPoints = userScoredFiles.filter(f => f.isEntryPoint);
+    const schemaFiles = userScoredFiles.filter(f =>
       f.tags.includes('schema') ||
       f.name.toLowerCase().includes('model') ||
       f.name.toLowerCase().includes('entity') ||
       f.name.toLowerCase().includes('schema')
     );
-    const configFiles = scoredFiles.filter(f => f.isConfig);
+    const configFiles = userScoredFiles.filter(f => f.isConfig);
 
     // Calculate directory stats and clusters
-    const directories = this.calculateDirectoryStats(scoredFiles);
-    const clusters = this.clusterFiles(scoredFiles);
+    const directories = this.calculateDirectoryStats(userScoredFiles);
+    const clusters = this.clusterFiles(userScoredFiles);
 
     this.options.onProgress?.('complete', 100);
 
@@ -814,6 +878,10 @@ export class RepositoryMapper {
         totalFiles: walkResult.summary.totalFiles + walkResult.summary.skippedCount,
         analyzedFiles: walkResult.summary.totalFiles,
         skippedFiles: walkResult.summary.skippedCount,
+        skippedReasons: walkResult.summary.skippedReasons,
+        symlinkFollowed: walkResult.summary.symlinkFollowed,
+        includePatternsUnmatched: walkResult.summary.includePatternsUnmatched,
+        truncated: walkResult.summary.truncated,
         languages,
         frameworks,
         directories,
@@ -854,7 +922,7 @@ export class RepositoryMapper {
 
     lines.push(`# Repository Analysis: ${map.metadata.projectName}`);
     lines.push('');
-    lines.push(`> Generated by spec-gen v${map.metadata.version} on ${map.metadata.analyzedAt}`);
+    lines.push(`> Generated by openlore v${map.metadata.version} on ${map.metadata.analyzedAt}`);
     lines.push('');
 
     // Overview
@@ -864,6 +932,16 @@ export class RepositoryMapper {
     lines.push(`- **Total Files**: ${map.summary.totalFiles}`);
     lines.push(`- **Analyzed Files**: ${map.summary.analyzedFiles}`);
     lines.push(`- **Skipped Files**: ${map.summary.skippedFiles}`);
+    if (map.summary.symlinkFollowed) {
+      lines.push(`- **Symlinks Followed**: ${map.summary.symlinkFollowed}`);
+    }
+    if (map.summary.truncated) {
+      lines.push(
+        `- **⚠️ Partial corpus**: walk stopped at the ${map.summary.truncated.limit}-file ` +
+          `cap (at \`${map.summary.truncated.atPath}\`); results below cover only the first ` +
+          `${map.summary.truncated.limit} files.`,
+      );
+    }
     lines.push('');
 
     // Languages

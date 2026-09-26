@@ -5,15 +5,15 @@
  * working tree and a base ref (typically main/master).
  */
 
-import { execFile } from 'node:child_process';
-import { access } from 'node:fs/promises';
-import { join, extname, basename } from 'node:path';
-import { promisify } from 'node:util';
+import { lstat, opendir, realpath, stat } from 'node:fs/promises';
+import { extname, basename, posix, resolve } from 'node:path';
 import type { ChangedFile } from '../../types/index.js';
 import { logger } from '../../utils/logger.js';
 import { DIFF_MAX_CHARS } from '../../constants.js';
+import { gitPathArgs } from '../../utils/git-args.js';
+import { readFileConfined, safeJoin } from '../../utils/path-confinement.js';
+import { execFileGit as execFileAsync, spawnGit } from '../../utils/git-exec.js';
 
-const execFileAsync = promisify(execFile);
 
 /** Git's well-known empty tree SHA — used as base ref for single-commit repos */
 const GIT_EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf899d15f71049056';
@@ -34,6 +34,30 @@ export interface GitDiffResult {
   files: ChangedFile[];
   hasUnstagedChanges: boolean;
   currentBranch: string;
+}
+
+export type OpenSpecCorpusSource =
+  | { kind: 'revision'; revision: string }
+  | { kind: 'directory'; directory: string };
+
+export interface MaterializeOpenSpecCorpusOptions {
+  /** Repository used to resolve a revision source. */
+  rootPath: string;
+  source: OpenSpecCorpusSource;
+  /** Repository-relative paths below `openspec/`; omitted means every corpus file. */
+  paths?: readonly string[];
+  /** Repository-relative corpus root; output keys are normalized under `openspec/`. */
+  corpusRoot?: string;
+}
+
+export interface OpenSpecCorpusMaterialization {
+  source:
+    | { kind: 'revision'; requested: string; resolved: string }
+    | { kind: 'directory'; requested: string; resolved: string };
+  /** Sorted repository-relative paths, matching the insertion order of `files`. */
+  paths: string[];
+  /** UTF-8 corpus content in deterministic path order. */
+  files: Map<string, string>;
 }
 
 // ============================================================================
@@ -126,15 +150,77 @@ export function isSkippableFile(filePath: string): boolean {
 // ============================================================================
 
 /**
- * Check if the given path is a git repository
+ * Check whether `rootPath` is inside a git work tree.
+ *
+ * Asks git (`rev-parse --is-inside-work-tree`) rather than testing for a `.git`
+ * entry at `rootPath`. The old `access(rootPath/.git)` test recognized only the
+ * repository ROOT: a monorepo package directory (`repo/packages/foo`) failed it and
+ * every git-derived signal (churn, coupling, provenance, structural diff) silently
+ * went empty there, even though every git shell-out with that cwd succeeds.
+ * `--is-inside-work-tree` is true for the root, any subdirectory, a worktree, and a
+ * submodule checkout alike; it is false inside the `.git` directory and outside any
+ * repository. (Worktrees/submodules previously passed only incidentally because
+ * their `.git` is a file.)
  */
 export async function isGitRepository(rootPath: string): Promise<boolean> {
   try {
-    await access(join(rootPath, '.git'));
-    return true;
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: rootPath });
+    return stdout.trim() === 'true';
   } catch {
     return false;
   }
+}
+
+/**
+ * Check whether `rootPath` is the ROOT of a git work tree (not a subdirectory of one).
+ *
+ * True iff {@link getRepoPrefix} is the empty string — i.e. inside a work tree AND at
+ * its top level. This is behaviorally identical to the pre-work-tree-aware
+ * `access(rootPath/.git)` test across every case (normal root, worktree/submodule
+ * root where `.git` is a file, subdirectory, `.git` dir, bare repo, non-repo), so it
+ * is the drop-in for git-signal callers that JOIN git's repo-root-relative path output
+ * against analyzed-root-relative data and are therefore only correct when the analyzed
+ * root IS the repository root (drift, decisions, staleness, review). Below-root support
+ * for those flows is out of scope for this change; pinning them here preserves their
+ * exact prior "root-only" behavior instead of silently joining mismatched path frames.
+ */
+export async function isGitRepositoryRoot(rootPath: string): Promise<boolean> {
+  return (await getRepoPrefix(rootPath)) === '';
+}
+
+/**
+ * The repo-root → analyzed-root path prefix, for re-framing git's path-list output.
+ *
+ * Git emits `diff`/`log --name-only` paths relative to the REPOSITORY ROOT
+ * regardless of cwd, while the analyzer's node paths are relative to the analyzed
+ * root. At the repo root the two agree; below it they diverge, so every churn /
+ * provenance / diff join must translate between them. Returns:
+ *   - `''` when `rootPath` IS the repository root (re-framing is a no-op),
+ *   - `'packages/foo/'` (trailing slash) when `rootPath` is a subdirectory,
+ *   - `null` when `rootPath` is not inside a work tree.
+ */
+export async function getRepoPrefix(rootPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--show-prefix'], { cwd: rootPath });
+    // --show-prefix ends with a newline (and '' at the root); strip line endings only.
+    return stdout.replace(/\r?\n/g, '');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-frame one repo-root-relative git path to be relative to the analyzed root,
+ * given a {@link getRepoPrefix} value. Returns `null` for a path OUTSIDE the analyzed
+ * subtree (the caller drops it) or for the analyzed directory itself. With an empty
+ * prefix (the repo root) it is the identity — so callers that re-frame unconditionally
+ * are byte-for-byte unchanged at the root.
+ */
+export function reframeRepoPath(repoRelPath: string, prefix: string): string | null {
+  if (!prefix) return repoRelPath;
+  if (!repoRelPath.startsWith(prefix)) return null;
+  const reframed = repoRelPath.slice(prefix.length);
+  return reframed.length > 0 ? reframed : null;
 }
 
 /**
@@ -154,12 +240,516 @@ export async function getCurrentBranch(rootPath: string): Promise<string> {
  * Validate a user-supplied git ref to prevent unexpected git argument injection.
  * Allows branch/tag names, SHA hashes, relative refs (HEAD~1, @{upstream}), and
  * the empty-tree SHA. Rejects refs containing shell metacharacters or null bytes.
+ *
+ * Argument-injection guard (mcp-security: Subprocess Argument Safety): a ref is
+ * always passed to git as a single argv element, which prevents shell injection but
+ * NOT flag interpretation — `--upload-pack=...` or `--output=x` would still be read
+ * by git as an OPTION. Real refs/branches/SHAs never begin with `-`, so a
+ * leading-dash ref is rejected outright; this is the validation half of the spec's
+ * "`--` separator OR allowlist" requirement (ref operands are also placed after `--`
+ * at the call sites where git supports it).
  */
 export function validateGitRef(ref: string): void {
   if (ref === GIT_EMPTY_TREE_SHA || ref === 'auto') return;
+  if (typeof ref !== 'string' || ref.length === 0) {
+    throw new Error('Invalid git ref: must be a non-empty string.');
+  }
+  if (ref.startsWith('-')) {
+    throw new Error(`Invalid git ref: "${ref}". A ref must not begin with "-" (argument-injection guard).`);
+  }
   // Allow: alphanumeric, -, _, ., /, ~, ^, @, {, }, :
   if (!/^[\w\-./~^@{}:]+$/.test(ref)) {
     throw new Error(`Invalid git ref: "${ref}". Refs must contain only alphanumeric characters and -_./ ~^@{}:`);
+  }
+}
+
+const CORPUS_PATH_PREFIX = 'openspec/';
+const CORPUS_MATERIALIZATION_LIMITS = {
+  fileBytes: 4 * 1024 * 1024,
+  totalBytes: 64 * 1024 * 1024,
+  directoryEntries: 20_000,
+} as const;
+
+function stablePathCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Validate one repository-relative OpenSpec corpus path before passing it to git
+ * or the filesystem. Git pathspec magic and filesystem traversal are both refused;
+ * callers receive the same normalized path they supplied rather than a guessed one.
+ */
+function validateOpenSpecCorpusPath(filePath: string): string {
+  if (
+    typeof filePath !== 'string'
+    || filePath.length === 0
+    || filePath.includes('\0')
+    || [...filePath].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+    || filePath.includes('\\')
+    || filePath.startsWith('-')
+    || filePath.startsWith(':')
+    || filePath !== posix.normalize(filePath)
+    || !filePath.startsWith(CORPUS_PATH_PREFIX)
+    || filePath.endsWith('/')
+  ) {
+    throw new Error(
+      `Invalid OpenSpec corpus path: "${filePath}". Paths must be normalized repository-relative files below "openspec/".`,
+    );
+  }
+  return filePath;
+}
+
+function sortedUniqueCorpusPaths(paths: readonly string[]): string[] {
+  const sorted = [...new Set(paths.map(validateOpenSpecCorpusPath))].sort(stablePathCompare);
+  if (sorted.length > CORPUS_MATERIALIZATION_LIMITS.directoryEntries) {
+    throw new Error(`OpenSpec corpus file limit exceeded (${CORPUS_MATERIALIZATION_LIMITS.directoryEntries}).`);
+  }
+  return sorted;
+}
+
+function validateCorpusRoot(corpusRoot = 'openspec'): string {
+  if (corpusRoot.length === 0) return 'openspec';
+  const normalized = corpusRoot.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (
+    normalized.length === 0
+    || normalized.includes('\0')
+    || normalized.includes('\\')
+    || normalized.startsWith('-')
+    || normalized.startsWith(':')
+    || normalized !== posix.normalize(normalized)
+    || posix.isAbsolute(normalized)
+    || normalized === '..'
+    || normalized.startsWith('../')
+  ) {
+    throw new Error(`Invalid OpenSpec corpus root: "${corpusRoot}".`);
+  }
+  return normalized;
+}
+
+function corpusRootFromConfig(content: string, sourceLabel: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new Error(
+      `Invalid OpenLore config at ${sourceLabel}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  const configured = parsed && typeof parsed === 'object'
+    ? (parsed as { openspecPath?: unknown }).openspecPath
+    : undefined;
+  if (configured !== undefined && typeof configured !== 'string') {
+    throw new Error(`Invalid openspecPath in OpenLore config at ${sourceLabel}.`);
+  }
+  return validateCorpusRoot(configured ?? 'openspec');
+}
+
+/** Resolve the corpus root from the configuration belonging to one source state. */
+export async function discoverOpenSpecCorpusRoot(
+  rootPath: string,
+  source: OpenSpecCorpusSource,
+): Promise<string> {
+  if (source.kind === 'directory') {
+    const directory = await realpath(resolve(source.directory));
+    try {
+      const content = await readFileConfined(directory, '.openlore/config.json', 1024 * 1024, true, true);
+      return corpusRootFromConfig(content, `${source.directory}/.openlore/config.json`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'openspec';
+      throw error;
+    }
+  }
+  if (source.revision === GIT_EMPTY_TREE_SHA) return 'openspec';
+  const commit = await resolveCommit(rootPath, source.revision);
+  const listed = await execFileAsync(
+    'git',
+    gitPathArgs('ls-tree', '-z', '--name-only', commit, '--', '.openlore/config.json'),
+    { cwd: rootPath, maxBuffer: 1024 },
+  );
+  if (listed.stdout.length === 0) return 'openspec';
+  const { stdout } = await execFileAsync(
+    'git',
+    ['cat-file', 'blob', `${commit}:.openlore/config.json`],
+    { cwd: rootPath, maxBuffer: 1024 * 1024 },
+  );
+  return corpusRootFromConfig(stdout, `${source.revision}:.openlore/config.json`);
+}
+
+/** Pin a symbolic revision once, then discover the corpus root from that immutable state. */
+export async function prepareOpenSpecCorpusSource(
+  rootPath: string,
+  source: OpenSpecCorpusSource,
+): Promise<{ source: OpenSpecCorpusSource; corpusRoot: string }> {
+  const stableSource: OpenSpecCorpusSource = source.kind === 'revision' && source.revision !== GIT_EMPTY_TREE_SHA
+    ? { kind: 'revision', revision: await resolveCommit(rootPath, source.revision) }
+    : source;
+  return {
+    source: stableSource,
+    corpusRoot: await discoverOpenSpecCorpusRoot(rootPath, stableSource),
+  };
+}
+
+function storageCorpusPath(canonicalPath: string, corpusRoot: string): string {
+  const suffix = canonicalPath.slice(CORPUS_PATH_PREFIX.length);
+  return corpusRoot === '.' ? suffix : `${corpusRoot}/${suffix}`;
+}
+
+function canonicalCorpusPath(storagePath: string, corpusRoot: string): string {
+  return `${CORPUS_PATH_PREFIX}${corpusRoot === '.' ? storagePath : storagePath.slice(corpusRoot.length + 1)}`;
+}
+
+async function listDirectoryCorpusPaths(rootPath: string, corpusRoot: string): Promise<string[]> {
+  const discovered: string[] = [];
+  let directoryEntries = 0;
+
+  const visit = async (relativeDirectory: string): Promise<void> => {
+    const absoluteDirectory = safeJoin(rootPath, relativeDirectory);
+    const directoryStat = await lstat(absoluteDirectory);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error(`Path escape blocked: corpus directory "${relativeDirectory}" must be a real directory.`);
+    }
+    const entries = [];
+    const directory = await opendir(absoluteDirectory);
+    for await (const entry of directory) {
+      directoryEntries++;
+      if (directoryEntries > CORPUS_MATERIALIZATION_LIMITS.directoryEntries) {
+        throw new Error(`OpenSpec corpus directory-entry limit exceeded (${CORPUS_MATERIALIZATION_LIMITS.directoryEntries}).`);
+      }
+      entries.push(entry);
+    }
+    entries.sort((left, right) => stablePathCompare(left.name, right.name));
+
+    for (const entry of entries) {
+      const relativePath = `${relativeDirectory}/${entry.name}`;
+      const entryStat = await lstat(safeJoin(rootPath, relativePath));
+      if (entryStat.isSymbolicLink()) {
+        throw new Error(`Path escape blocked: symbolic-link corpus entry "${relativePath}".`);
+      }
+      if (entryStat.isDirectory()) {
+        await visit(relativePath);
+      } else if (entryStat.isFile()) {
+        discovered.push(validateOpenSpecCorpusPath(canonicalCorpusPath(relativePath, corpusRoot)));
+      } else {
+        throw new Error(`OpenSpec corpus entry "${relativePath}" is not a regular file or directory.`);
+      }
+    }
+  };
+
+  const roots = corpusRoot === '.' ? ['specs', 'changes', 'decisions'] : [corpusRoot];
+  for (const root of roots) {
+    try {
+      await lstat(safeJoin(rootPath, root));
+      await visit(root);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  if (corpusRoot === '.') {
+    try {
+      const configStat = await lstat(safeJoin(rootPath, 'config.yaml'));
+      if (!configStat.isFile() || configStat.isSymbolicLink()) {
+        throw new Error('OpenSpec corpus entry "config.yaml" is not a regular file.');
+      }
+      discovered.push('openspec/config.yaml');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return sortedUniqueCorpusPaths(discovered);
+}
+
+async function assertRegularCorpusPath(rootPath: string, filePath: string): Promise<void> {
+  const components = filePath.split('/');
+  for (let index = 0; index < components.length; index++) {
+    const relativePath = components.slice(0, index + 1).join('/');
+    const entry = await lstat(safeJoin(rootPath, relativePath));
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Path escape blocked: symbolic-link corpus entry "${relativePath}".`);
+    }
+    const final = index === components.length - 1;
+    if ((!final && !entry.isDirectory()) || (final && !entry.isFile())) {
+      throw new Error(`OpenSpec corpus path "${filePath}" is not a regular file.`);
+    }
+  }
+}
+
+async function materializeDirectoryCorpus(
+  requestedDirectory: string,
+  selectedPaths: readonly string[] | undefined,
+  corpusRoot: string,
+): Promise<OpenSpecCorpusMaterialization> {
+  const resolvedDirectory = await realpath(resolve(requestedDirectory));
+  if (!(await stat(resolvedDirectory)).isDirectory()) {
+    throw new Error(`OpenSpec corpus directory is not a directory: "${requestedDirectory}".`);
+  }
+
+  const paths = selectedPaths === undefined
+    ? await listDirectoryCorpusPaths(resolvedDirectory, corpusRoot)
+    : sortedUniqueCorpusPaths(selectedPaths);
+  const files = new Map<string, string>();
+  let totalBytes = 0;
+  for (const filePath of paths) {
+    const storagePath = storageCorpusPath(filePath, corpusRoot);
+    await assertRegularCorpusPath(resolvedDirectory, storagePath);
+    const remaining = CORPUS_MATERIALIZATION_LIMITS.totalBytes - totalBytes;
+    const content = await readFileConfined(
+      resolvedDirectory,
+      storagePath,
+      Math.min(CORPUS_MATERIALIZATION_LIMITS.fileBytes, remaining),
+      true,
+      true,
+    );
+    totalBytes += Buffer.byteLength(content, 'utf8');
+    if (totalBytes > CORPUS_MATERIALIZATION_LIMITS.totalBytes) {
+      throw new Error(`OpenSpec corpus read limit exceeded (${CORPUS_MATERIALIZATION_LIMITS.totalBytes} bytes).`);
+    }
+    files.set(filePath, content);
+  }
+
+  return {
+    source: { kind: 'directory', requested: requestedDirectory, resolved: resolvedDirectory },
+    paths,
+    files,
+  };
+}
+
+async function resolveCommit(rootPath: string, requestedRevision: string): Promise<string> {
+  validateGitRef(requestedRevision);
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['rev-parse', '--verify', '--quiet', `${requestedRevision}^{commit}`],
+      { cwd: rootPath },
+    );
+    const resolved = stdout.trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(resolved)) throw new Error('git returned an invalid object id');
+    return resolved;
+  } catch (error) {
+    throw new Error(
+      `Git revision "${requestedRevision}" does not resolve to a commit.`,
+      { cause: error },
+    );
+  }
+}
+
+interface RevisionCorpusEntry {
+  path: string;
+  objectId: string;
+  bytes: number;
+}
+
+async function listRevisionCorpusEntries(
+  rootPath: string,
+  commit: string,
+  corpusRoot: string,
+  selectedPaths?: readonly string[],
+): Promise<RevisionCorpusEntry[]> {
+  if (selectedPaths?.length === 0) return [];
+  const rootPathspecs = selectedPaths
+    ? selectedPaths.map((path) => storageCorpusPath(path, corpusRoot))
+    : corpusRoot === '.'
+    ? ['specs/', 'changes/', 'decisions/', 'config.yaml']
+    : [`${corpusRoot}/`];
+  const { stdout } = await execFileAsync(
+    'git',
+    gitPathArgs('ls-tree', '-rz', '-l', '--full-tree', commit, '--', ...rootPathspecs),
+    { cwd: rootPath, maxBuffer: CORPUS_MATERIALIZATION_LIMITS.totalBytes, encoding: 'buffer' },
+  );
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const records: string[] = [];
+  let start = 0;
+  for (let index = 0; index < stdout.length; index++) {
+    if (stdout[index] !== 0) continue;
+    if (index > start) records.push(decoder.decode(stdout.subarray(start, index)));
+    start = index + 1;
+  }
+  const entries = records.map((record): RevisionCorpusEntry => {
+    const tab = record.indexOf('\t');
+    const metadata = tab === -1 ? [] : record.slice(0, tab).trim().split(/\s+/);
+    const storagePath = tab === -1 ? '' : record.slice(tab + 1);
+    const [mode, type, objectId, sizeText] = metadata;
+    if (!/^100(?:644|755)$/.test(mode ?? '') || type !== 'blob') {
+      throw new Error(`OpenSpec corpus path "${storagePath}" is not a regular committed file.`);
+    }
+    const bytes = Number(sizeText);
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new Error(`Git returned an invalid blob size for OpenSpec corpus path "${storagePath}".`);
+    }
+    return {
+      path: validateOpenSpecCorpusPath(canonicalCorpusPath(storagePath, corpusRoot)),
+      objectId,
+      bytes,
+    };
+  }).sort((left, right) => stablePathCompare(left.path, right.path));
+  sortedUniqueCorpusPaths(entries.map((entry) => entry.path));
+  return entries;
+}
+
+async function readRevisionBlobsBatch(
+  rootPath: string,
+  entries: readonly RevisionCorpusEntry[],
+): Promise<Map<string, string>> {
+  if (entries.length === 0) return new Map();
+  const maxOutput = entries.reduce((sum, entry) => sum + entry.bytes + 128, 0);
+  return new Promise((resolveBatch, rejectBatch) => {
+    const child = spawnGit('git', ['cat-file', '--batch'], { cwd: rootPath, stdio: ['pipe', 'pipe', 'pipe'] });
+    const errors: Buffer[] = [];
+    const files = new Map<string, string>();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let pending: Buffer = Buffer.alloc(0);
+    let entryIndex = 0;
+    let expectedBytes: number | null = null;
+    let settled = false;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      rejectBatch(error);
+    };
+    child.on('error', fail);
+    child.stdin.on('error', fail);
+    child.stdout.on('error', fail);
+    child.stderr.on('error', fail);
+    child.stdout.on('data', (chunk: Buffer) => {
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      if (pending.length > maxOutput) {
+        fail(new Error('Git batch output exceeded the bounded corpus size.'));
+        return;
+      }
+      try {
+        while (entryIndex < entries.length) {
+          const entry = entries[entryIndex];
+          if (expectedBytes === null) {
+            const newline = pending.indexOf(0x0a);
+            if (newline === -1) return;
+            const header = pending.subarray(0, newline).toString('ascii').trim().split(/\s+/);
+            const type = header.at(-2);
+            const bytes = Number(header.at(-1));
+            if (type !== 'blob' || bytes !== entry.bytes) {
+              throw new Error(`Git batch response did not match listed blob "${entry.path}".`);
+            }
+            expectedBytes = bytes;
+            pending = pending.subarray(newline + 1);
+          }
+          if (pending.length < expectedBytes + 1) return;
+          if (pending[expectedBytes] !== 0x0a) {
+            throw new Error(`Git batch response was truncated for "${entry.path}".`);
+          }
+          files.set(entry.path, decoder.decode(pending.subarray(0, expectedBytes)));
+          pending = pending.subarray(expectedBytes + 1);
+          expectedBytes = null;
+          entryIndex++;
+        }
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errors.reduce((sum, item) => sum + item.length, 0) < 64 * 1024) errors.push(chunk);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      if (code !== 0) {
+        fail(new Error(`Git batch corpus read failed: ${Buffer.concat(errors).toString('utf8').trim()}`));
+        return;
+      }
+      try {
+        if (entryIndex !== entries.length || expectedBytes !== null || pending.length !== 0) {
+          throw new Error('Git batch corpus response ended before all blobs were read.');
+        }
+        settled = true;
+        resolveBatch(files);
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    child.stdin.end(entries.map((entry) => `${entry.objectId}\n`).join(''));
+  });
+}
+
+async function materializeRevisionCorpus(
+  rootPath: string,
+  requestedRevision: string,
+  selectedPaths: readonly string[] | undefined,
+  corpusRoot: string,
+): Promise<OpenSpecCorpusMaterialization> {
+  const selected = selectedPaths === undefined ? undefined : sortedUniqueCorpusPaths(selectedPaths);
+  // resolveBaseRefDisclosed uses Git's canonical empty tree for repositories with
+  // no parent commit. It is intentionally a tree rather than a commit, so commit
+  // peeling would reject it; as a corpus source its exact meaning is simply empty.
+  if (requestedRevision === GIT_EMPTY_TREE_SHA) {
+    return {
+      source: {
+        kind: 'revision',
+        requested: requestedRevision,
+        resolved: GIT_EMPTY_TREE_SHA,
+      },
+      paths: [],
+      files: new Map(),
+    };
+  }
+  const commit = await resolveCommit(rootPath, requestedRevision);
+  const listed = await listRevisionCorpusEntries(rootPath, commit, corpusRoot, selected);
+  const listedByPath = new Map(listed.map((entry) => [entry.path, entry]));
+  const paths = selected ?? listed.map((entry) => entry.path);
+  const entries = paths.map((filePath) => {
+    const entry = listedByPath.get(filePath);
+    if (!entry) throw new Error(`OpenSpec corpus path "${filePath}" is not a file at revision "${requestedRevision}".`);
+    return entry;
+  });
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (entry.bytes > CORPUS_MATERIALIZATION_LIMITS.fileBytes) {
+      throw new Error(`${entry.path} exceeds corpus file limit (${CORPUS_MATERIALIZATION_LIMITS.fileBytes} bytes).`);
+    }
+    totalBytes += entry.bytes;
+    if (totalBytes > CORPUS_MATERIALIZATION_LIMITS.totalBytes) {
+      throw new Error(`OpenSpec corpus read limit exceeded (${CORPUS_MATERIALIZATION_LIMITS.totalBytes} bytes).`);
+    }
+  }
+  const files = await readRevisionBlobsBatch(rootPath, entries);
+
+  return {
+    source: { kind: 'revision', requested: requestedRevision, resolved: commit },
+    paths,
+    files,
+  };
+}
+
+/**
+ * Materialize an OpenSpec corpus without changing a repository's worktree, index,
+ * or HEAD. Revision reads address committed blobs directly; directory reads use
+ * symlink-aware confined descriptors. Both paths and map insertion order are stable,
+ * so independent and concurrent callers receive byte-identical materializations.
+ */
+export async function materializeOpenSpecCorpus(
+  options: MaterializeOpenSpecCorpusOptions,
+): Promise<OpenSpecCorpusMaterialization> {
+  const corpusRoot = validateCorpusRoot(options.corpusRoot);
+  if (options.source.kind === 'revision') {
+    return materializeRevisionCorpus(options.rootPath, options.source.revision, options.paths, corpusRoot);
+  }
+  return materializeDirectoryCorpus(options.source.directory, options.paths, corpusRoot);
+}
+
+/**
+ * True iff `ref` resolves to a commit in the repo at `rootPath`. Unlike
+ * `resolveBaseRef` (which silently falls back to main/master/HEAD~1), this answers
+ * the plain question "does the caller's ref exist?" so a consumer can disclose a
+ * fallback instead of briefing against a base the caller never asked for. Validates
+ * the ref first (argument-injection guard); any failure → false, never throws.
+ */
+export async function refExists(rootPath: string, ref: string): Promise<boolean> {
+  try {
+    validateGitRef(ref);
+    await execFileAsync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: rootPath });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -177,10 +767,12 @@ export async function resolveBaseRef(rootPath: string, preferredRef: string): Pr
     }
   }
 
-  // Try common default branches
-  for (const ref of ['main', 'master']) {
+  // Try common local and remote default branches. CI/PR clones frequently omit a
+  // local `main` while retaining `origin/main` or the remote HEAD symbolic ref;
+  // preferring those before HEAD~1 preserves the full branch comparison window.
+  for (const ref of ['main', 'master', 'refs/remotes/origin/HEAD', 'origin/main', 'origin/master']) {
     try {
-      await execFileAsync('git', ['rev-parse', '--verify', ref], { cwd: rootPath });
+      await execFileAsync('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd: rootPath });
       return ref;
     } catch {
       continue;
@@ -197,6 +789,42 @@ export async function resolveBaseRef(rootPath: string, preferredRef: string): Pr
     logger.debug(`HEAD~1 not available (single-commit repo?): ${(err as Error).message}`);
     return GIT_EMPTY_TREE_SHA;
   }
+}
+
+/**
+ * The disclosed resolution of a `--base` ref. `requested` is what the caller asked
+ * for (verbatim, or the command's default sentinel); `resolved` is the ref git will
+ * actually diff against after {@link resolveBaseRef}'s main → master → HEAD~1 fallback.
+ * `fellBack` is true exactly when the caller passed an EXPLICIT ref that git could not
+ * resolve — so `resolved` is a base the caller did not ask for. A conclusion command
+ * must never present a verdict over a fallback base without disclosing this.
+ */
+export interface BaseRefResolution {
+  requested: string;
+  resolved: string;
+  fellBack: boolean;
+}
+
+/**
+ * Resolve a base ref AND disclose whether the caller's requested ref actually
+ * resolved — the single "resolve-or-disclose" point every `--base` command shares
+ * (fix-cli-conclusion-honesty). Advisory commands surface `fellBack` as a caveat;
+ * certification commands treat it as fatal unless the caller opts into fallback.
+ *
+ * The `auto`/empty sentinel (the briefing default that explicitly REQUESTS the
+ * fallback chain) never counts as a fallback. For an explicit ref we confirm the
+ * fallback with {@link refExists}, so a ref that resolves to a differently-spelled
+ * commit (e.g. a short SHA, a tag) is correctly reported as resolved, not fallen-back.
+ */
+export async function resolveBaseRefDisclosed(
+  rootPath: string,
+  requestedRef: string,
+): Promise<BaseRefResolution> {
+  const resolved = await resolveBaseRef(rootPath, requestedRef);
+  const isAuto = !requestedRef || requestedRef === 'auto';
+  const fellBack =
+    !isAuto && resolved !== requestedRef && !(await refExists(rootPath, requestedRef));
+  return { requested: requestedRef, resolved, fellBack };
 }
 
 /**
@@ -275,6 +903,27 @@ function parseNumstat(output: string): Map<string, { additions: number; deletion
 }
 
 /**
+ * Merge a numstat map into an accumulator, summing per-path counts.
+ * A file that is both staged and modified in the working tree contributes both
+ * diffs; the summed count slightly over-counts overlapping lines, which is
+ * acceptable for the severity thresholds it feeds (never under-counts to zero).
+ */
+function mergeNumstat(
+  into: Map<string, { additions: number; deletions: number }>,
+  from: Map<string, { additions: number; deletions: number }>,
+): void {
+  for (const [path, stat] of from) {
+    const existing = into.get(path);
+    if (existing) {
+      existing.additions += stat.additions;
+      existing.deletions += stat.deletions;
+    } else {
+      into.set(path, { additions: stat.additions, deletions: stat.deletions });
+    }
+  }
+}
+
+/**
  * Get the unified diff content for a specific file against a base ref.
  * Returns the diff text, truncated to maxChars to fit LLM context windows.
  */
@@ -284,6 +933,7 @@ export async function getFileDiff(
   baseRef: string,
   maxChars: number = DIFF_MAX_CHARS,
 ): Promise<string> {
+  validateGitRef(baseRef); // argument-injection guard before interpolating into a git rev range
   // Try three-dot diff first (merge-base), fall back to two-dot
   for (const separator of ['...', '..']) {
     try {
@@ -326,6 +976,7 @@ export async function getFileDiff(
  * Returns empty string if no commits or git fails.
  */
 export async function getCommitMessages(rootPath: string, baseRef: string): Promise<string> {
+  validateGitRef(baseRef); // argument-injection guard before interpolating into a git rev range
   for (const separator of ['...', '..']) {
     try {
       const { stdout } = await execFileAsync(
@@ -354,7 +1005,7 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
   // Get committed changes on branch vs base
   try {
     const { stdout } = await execFileAsync(
-      'git', ['diff', '--name-status', '--diff-filter=ACDMR', `${resolvedBase}...HEAD`],
+      'git', gitPathArgs('diff', '--name-status', '--diff-filter=ACDMR', `${resolvedBase}...HEAD`),
       { cwd: rootPath }
     );
     for (const entry of parseNameStatus(stdout)) {
@@ -365,7 +1016,7 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
     logger.debug(`Three-dot diff failed, falling back to two-dot: ${(err as Error).message}`);
     try {
       const { stdout } = await execFileAsync(
-        'git', ['diff', '--name-status', '--diff-filter=ACDMR', `${resolvedBase}..HEAD`],
+        'git', gitPathArgs('diff', '--name-status', '--diff-filter=ACDMR', `${resolvedBase}..HEAD`),
         { cwd: rootPath }
       );
       for (const entry of parseNameStatus(stdout)) {
@@ -382,7 +1033,7 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
     // Staged changes
     try {
       const { stdout } = await execFileAsync(
-        'git', ['diff', '--cached', '--name-status', '--diff-filter=ACDMR'],
+        'git', gitPathArgs('diff', '--cached', '--name-status', '--diff-filter=ACDMR'),
         { cwd: rootPath }
       );
       for (const entry of parseNameStatus(stdout)) {
@@ -397,7 +1048,7 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
     // Unstaged working tree changes
     try {
       const { stdout } = await execFileAsync(
-        'git', ['diff', '--name-status', '--diff-filter=ACDMR'],
+        'git', gitPathArgs('diff', '--name-status', '--diff-filter=ACDMR'),
         { cwd: rootPath }
       );
       const unstaged = parseNameStatus(stdout);
@@ -418,7 +1069,7 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
   let numstatMap = new Map<string, { additions: number; deletions: number }>();
   try {
     const { stdout } = await execFileAsync(
-      'git', ['diff', '--numstat', `${resolvedBase}...HEAD`],
+      'git', gitPathArgs('diff', '--numstat', `${resolvedBase}...HEAD`),
       { cwd: rootPath }
     );
     numstatMap = parseNumstat(stdout);
@@ -426,12 +1077,37 @@ export async function getChangedFiles(options: GitDiffOptions): Promise<GitDiffR
     logger.debug(`Three-dot numstat failed, falling back to two-dot: ${(err as Error).message}`);
     try {
       const { stdout } = await execFileAsync(
-        'git', ['diff', '--numstat', `${resolvedBase}..HEAD`],
+        'git', gitPathArgs('diff', '--numstat', `${resolvedBase}..HEAD`),
         { cwd: rootPath }
       );
       numstatMap = parseNumstat(stdout);
     } catch (err2) {
       logger.debug(`Two-dot numstat also failed: ${(err2 as Error).message}`);
+    }
+  }
+
+  // When staged/working-tree files are part of the changeset, their line counts
+  // are not in the commit-range numstat above — gather them and merge per path so
+  // uncommitted work carries real counts into severity and messages (not +0/-0).
+  if (includeUnstaged) {
+    try {
+      const { stdout } = await execFileAsync(
+        'git', gitPathArgs('diff', '--cached', '--numstat'),
+        { cwd: rootPath }
+      );
+      mergeNumstat(numstatMap, parseNumstat(stdout));
+    } catch (err) {
+      logger.debug(`Could not get staged numstat: ${(err as Error).message}`);
+    }
+
+    try {
+      const { stdout } = await execFileAsync(
+        'git', gitPathArgs('diff', '--numstat'),
+        { cwd: rootPath }
+      );
+      mergeNumstat(numstatMap, parseNumstat(stdout));
+    } catch (err) {
+      logger.debug(`Could not get working-tree numstat: ${(err as Error).message}`);
     }
   }
 

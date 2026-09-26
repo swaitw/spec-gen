@@ -11,8 +11,13 @@
  *   - Angular: @Component decorator
  */
 
-import { readFile } from 'node:fs/promises';
 import { basename, extname, relative } from 'node:path';
+
+import {
+  mapFilesBounded,
+  readSourceCapped,
+  type OversizedFileObserver,
+} from './bounded-file-scan.js';
 
 // ============================================================================
 // TYPES
@@ -52,13 +57,22 @@ const REACT_FORWARD_REF = /^export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:forwa
 // const REACT_DEFAULT_EXPORT_ANON = /^export\s+default\s+(?:function|class)\s*\(/m; // reserved for future use
 
 // TypeScript interface/type props extraction: interface XxxProps { ... }
-const TS_PROPS_INTERFACE = /interface\s+\w*Props\s*\{([^}]+)\}/gs;
+// Bounded body: an unbounded `[^}]+` is quadratic on repeated `interface Props {`.
+const TS_PROPS_INTERFACE = /interface\s+\w*Props\s*\{([^}]{0,4000})\}/gs;
 const TS_PROP_LINE = /^\s+(\w+)(\?)?:\s*([^;,\n]+)/m;
 
 // Vue SFC
 const VUE_TEMPLATE_BLOCK = /<template[\s>]/;
 const VUE_SCRIPT_SETUP_PROPS = /defineProps\s*[<(]/;
-const VUE_OPTIONS_PROPS = /\bprops\s*:\s*\{([^}]+)\}/s;
+// Bounded like TS_PROPS_INTERFACE above: `[^}]+` rescans to EOF from every
+// `props:{` when the brace never closes (measured 5.5s on a 164KB .vue file).
+//
+// The bound has to stay modest rather than merely large. Unlike an import body, a
+// props block legitimately NESTS braces (`props: { x: { type: String } }`), so the
+// opener cannot be excluded from the class — which means the cost is O(n x bound),
+// linear but with the bound as its constant. 4000 characters is far past any real
+// props declaration while keeping a hostile file's cost in the low seconds.
+const VUE_OPTIONS_PROPS = /\bprops\s*:\s*\{([^}]{0,4000})\}/s;
 // const VUE_PROP_NAME = /^\s+(\w+)\s*:/m; // reserved for future use
 
 // Angular
@@ -100,7 +114,7 @@ function extractVueProps(source: string): ComponentProp[] {
   // Composition API: defineProps<{ name: string; ... }>()
   const setupMatch = VUE_SCRIPT_SETUP_PROPS.exec(source);
   if (setupMatch) {
-    const genericMatch = source.slice(setupMatch.index).match(/defineProps\s*<\s*\{([^}]+)\}>/s);
+    const genericMatch = source.slice(setupMatch.index).match(/defineProps\s*<\s*\{([^}]{0,4000})\}>/s);
     if (genericMatch) {
       const lines = genericMatch[1].split('\n');
       for (const line of lines) {
@@ -137,16 +151,15 @@ function lineOfIndex(source: string, index: number): number {
 // PER-FILE EXTRACTOR
 // ============================================================================
 
-async function extractFromFile(filePath: string, rootDir: string): Promise<UIComponent[]> {
+async function extractFromFile(
+  filePath: string,
+  rootDir: string,
+  onOversized?: OversizedFileObserver,
+): Promise<UIComponent[]> {
   const ext = extname(filePath).toLowerCase();
   const rel = relative(rootDir, filePath);
-  let source: string;
-
-  try {
-    source = await readFile(filePath, 'utf-8');
-  } catch {
-    return [];
-  }
+  const source = await readSourceCapped(filePath, undefined, onOversized);
+  if (source === null) return [];
 
   // ── Svelte ────────────────────────────────────────────────────────────────
   if (ext === '.svelte') {
@@ -272,15 +285,14 @@ async function extractFromFile(filePath: string, rootDir: string): Promise<UICom
  */
 export async function extractUIComponents(
   filePaths: string[],
-  rootDir: string
+  rootDir: string,
+  onOversized?: OversizedFileObserver,
 ): Promise<UIComponent[]> {
   const UI_EXTENSIONS = new Set(['.tsx', '.jsx', '.vue', '.svelte', '.ts', '.js']);
 
   const candidates = filePaths.filter(f => UI_EXTENSIONS.has(extname(f).toLowerCase()));
 
-  const results = await Promise.all(
-    candidates.map(f => extractFromFile(f, rootDir))
-  );
+  const results = await mapFilesBounded(candidates, f => extractFromFile(f, rootDir, onOversized));
 
   return results.flat();
 }

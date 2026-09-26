@@ -7,7 +7,7 @@
 
 import { access } from 'node:fs/promises';
 import { join, basename } from 'node:path';
-import { DRIFT_CLASSIFICATION_MAX_TOKENS, SPEC_GEN_DIR, OPENSPEC_DIR } from '../../constants.js';
+import { DRIFT_CLASSIFICATION_MAX_TOKENS, OPENLORE_DIR, OPENSPEC_DIR } from '../../constants.js';
 import type {
   ChangedFile,
   DriftIssue,
@@ -20,6 +20,12 @@ import { matchFileToDomains, getSpecContent, type ADRMap } from './spec-mapper.j
 import { getFileDiff } from './git-diff.js';
 import type { LLMService } from '../services/llm-service.js';
 import logger from '../../utils/logger.js';
+import { loadDecisionStore, INACTIVE_STATUSES } from '../decisions/store.js';
+import { loadMemoryStore } from '../decisions/memory-store.js';
+import { AnchorContext } from '../decisions/anchor-adapter.js';
+import { memoryFreshness, decisionAnchors, isStaleRegionOnly } from '../decisions/anchor.js';
+import type { StructuralAnchor, AnchorVerdict } from '../../types/index.js';
+import { createPromptBoundary } from '../../utils/prompt-boundary.js';
 
 // ============================================================================
 // TYPES
@@ -40,6 +46,16 @@ export interface DriftDetectorOptions {
   maxLlmCalls?: number;
   /** Optional ADR map for ADR drift detection. */
   adrMap?: ADRMap;
+  /**
+   * How far memory-staleness findings are enumerated
+   * (change: scope-advisory-noise-to-touched-code):
+   *   - `changed-files` (default): enumerate only anchors whose file is in the
+   *     reviewed changeset; the rest are counted as `memoryOutOfScope`.
+   *   - `repository`: enumerate every drifted anchor (today's behavior).
+   * A run with an empty changeset is repository-wide either way — there is no
+   * scope to narrow to, so nothing is hidden.
+   */
+  memoryScope?: 'changed-files' | 'repository';
 }
 
 // ============================================================================
@@ -66,7 +82,7 @@ export function isSpecRelevantChange(file: ChangedFile, openspecRelPath: string 
   // Normalize leading "./" from config paths to match git-reported paths
   const normalizedSpecPath = openspecRelPath.replace(/^\.\//, '').replace(/\/$/, '');
   const specPrefix = normalizedSpecPath + '/';
-  if (file.path.startsWith(specPrefix) || file.path.startsWith(`${SPEC_GEN_DIR}/`)) return false;
+  if (file.path.startsWith(specPrefix) || file.path.startsWith(`${OPENLORE_DIR}/`)) return false;
 
   // Skip markdown files: docs, changelogs, readmes, contributing guides, etc.
   // Only source-embedded .md in non-root src directories could be spec-relevant.
@@ -212,7 +228,7 @@ export function detectGaps(changedFiles: ChangedFile[], specMap: SpecMap, change
 }
 
 /**
- * Detect stale specs: spec references files that were deleted or heavily modified
+ * Detect stale specs: spec references files that were deleted or renamed.
  */
 export function detectStaleSpecs(changedFiles: ChangedFile[], specMap: SpecMap): DriftIssue[] {
   const issues: DriftIssue[] = [];
@@ -332,6 +348,18 @@ export async function detectOrphanedSpecs(specMap: SpecMap, rootPath: string): P
 // ============================================================================
 
 /**
+ * Canonical ADR id form so that zero-padded and unpadded spellings of the same
+ * decision ("ADR-23", "ADR-023", "ADR-0023") compare equal. Applied on BOTH sides
+ * of ADR drift detection — the ids extracted from changed files and the ids keyed
+ * in the ADR map — so a padding mismatch can never defeat adr-gap suppression.
+ */
+export function normalizeADRId(id: string): string {
+  const match = id.match(/ADR-0*(\d+)/i);
+  if (!match) return id;
+  return `ADR-${match[1]}`;
+}
+
+/**
  * Extract ADR IDs that were changed in this changeset.
  * Matches files like: openspec/decisions/adr-0001-foo.md
  */
@@ -342,7 +370,7 @@ export function extractChangedADRIds(changedFiles: ChangedFile[], openspecRelPat
   for (const file of changedFiles) {
     const match = file.path.match(pattern);
     if (match) {
-      ids.add(`ADR-${match[1].replace(/^0+/, '') || '0'}`);
+      ids.add(normalizeADRId(`ADR-${match[1]}`));
     }
   }
   return ids;
@@ -363,6 +391,12 @@ export function detectADRGaps(
   const issues: DriftIssue[] = [];
   const reportedADRs = new Set<string>();
 
+  // Normalize the changed-ADR ids so suppression compares canonical forms on both
+  // sides — a zero-padding mismatch (map key "ADR-0023" vs extracted "ADR-23") must
+  // not defeat the "you updated the ADR" suppression below.
+  const changedADRIdsNormalized = new Set<string>();
+  for (const cid of changedADRIds) changedADRIdsNormalized.add(normalizeADRId(cid));
+
   // Collect all domains that have changed code
   const changedDomains = new Set<string>();
   for (const file of changedFiles) {
@@ -374,7 +408,7 @@ export function detectADRGaps(
 
   // For each ADR, check if any of its related domains had code changes
   for (const [id, mapping] of adrMap.byId) {
-    if (changedADRIds.has(id)) continue;
+    if (changedADRIdsNormalized.has(normalizeADRId(id))) continue;
     if (reportedADRs.has(id)) continue;
 
     const affectedDomains = mapping.relatedDomains.filter(d => changedDomains.has(d));
@@ -521,10 +555,13 @@ export async function enhanceGapsWithLLM(
       }
 
       // Ask the LLM
-      const userPrompt = `## Code Diff\n\`\`\`diff\n${diff}\n\`\`\`\n\n## Specification (${issue.domain})\n${specContent}`;
+      const boundary = createPromptBoundary();
+      const userPrompt = boundary.wrap(
+        `## Code Diff\n${diff}\n\n## Specification (${issue.domain})\n${specContent}`,
+      );
 
       const response = await llm.complete({
-        systemPrompt: LLM_SYSTEM_PROMPT,
+        systemPrompt: `${LLM_SYSTEM_PROMPT}\n\n${boundary.instruction}`,
         userPrompt,
         temperature: 0.1,
         maxTokens: DRIFT_CLASSIFICATION_MAX_TOKENS,
@@ -540,19 +577,19 @@ export async function enhanceGapsWithLLM(
           enhancedGaps.push({
             ...issue,
             severity: 'info',
-            suggestion: `[LLM] Not spec-relevant: ${classification.reason}`,
+            suggestion: `[LLM-extracted] Not spec-relevant: ${classification.reason}`,
           });
         } else if (classification.relevant) {
           // Keep severity, enrich suggestion with LLM reasoning
           enhancedGaps.push({
             ...issue,
-            suggestion: `${issue.suggestion} [LLM: ${classification.reason}]`,
+            suggestion: `${issue.suggestion} [LLM-extracted: ${classification.reason}]`,
           });
         } else {
           // Low/medium confidence non-relevant — keep as-is but annotate
           enhancedGaps.push({
             ...issue,
-            suggestion: `${issue.suggestion} [LLM (${classification.confidence} confidence): possibly not spec-relevant — ${classification.reason}]`,
+            suggestion: `${issue.suggestion} [LLM-extracted (${classification.confidence} confidence): possibly not spec-relevant — ${classification.reason}]`,
           });
         }
       } else {
@@ -610,6 +647,122 @@ function parseLLMClassification(content: string): LLMClassification | null {
 /**
  * Run all drift detection algorithms and produce a combined result
  */
+/**
+ * Detect code-anchored memory that has gone stale against the current call graph
+ * (change: add-code-anchored-memory-staleness). Scans active decisions and
+ * `remember` notes, computing a deterministic freshness verdict per memory:
+ *   - orphaned (anchored code gone)    → `memory-orphaned` (warning)
+ *   - drifted  (anchored code changed) → `memory-drifted`  (info)
+ *   - fresh                            → no issue
+ *
+ * Unlike the diff-based detectors this is a full-store scan of the current state,
+ * not a function of the changeset — a memory is stale because the code moved,
+ * regardless of what this commit touched. Returns [] when no analysis exists
+ * (freshness is unverifiable without the graph) — never a false "stale".
+ */
+export async function detectMemoryStaleness(rootPath: string): Promise<DriftIssue[]> {
+  const ctx = AnchorContext.open(rootPath);
+  if (!ctx) return [];
+  try {
+    const view = ctx.freshnessView();
+    const [decisionStore, memStore] = await Promise.all([
+      loadDecisionStore(rootPath),
+      loadMemoryStore(rootPath),
+    ]);
+
+    const issues: DriftIssue[] = [];
+
+    for (const d of decisionStore.decisions) {
+      if (INACTIVE_STATUSES.has(d.status)) continue;
+      const anchors = decisionAnchors(d);
+      if (anchors.length === 0) continue;
+      const f = memoryFreshness(anchors, view);
+      if (f.freshness === 'fresh') continue;
+      // A pure stale-region downgrade is NOT code-drift — the anchored code is
+      // byte-identical; an incremental update just hasn't recomputed its topology
+      // yet (it self-heals). Reporting "the code changed" here would be a false
+      // claim, so skip it (recall surfaces the stale-region state separately).
+      if (isStaleRegionOnly(f.verdicts)) continue;
+      issues.push(makeMemoryStalenessIssue('decision', d.id, d.title, f.freshness, f.verdicts, d.affectedDomains[0] ?? null));
+    }
+
+    for (const m of memStore.memories) {
+      // Invalidated (superseded) notes are history, not current state — they have left
+      // the authoritative set per the memory-integrity invariant, exactly as recall and
+      // orient exclude them. Flagging a retired note as stale would tell the user to
+      // re-record or reject something already superseded.
+      // (add-bitemporal-typed-memory-operations)
+      if (m.invalidatedAt) continue;
+      if (m.anchors.length === 0) continue;
+      const f = memoryFreshness(m.anchors, view);
+      if (f.freshness === 'fresh') continue;
+      if (isStaleRegionOnly(f.verdicts)) continue; // not code-drift (see above)
+      issues.push(makeMemoryStalenessIssue('note', m.id, m.content, f.freshness, f.verdicts, null));
+    }
+
+    return issues;
+  } finally {
+    ctx.close();
+  }
+}
+
+/**
+ * Partition memory-staleness findings into those anchored inside the reviewed
+ * scope and a count of those outside it
+ * (change: scope-advisory-noise-to-touched-code).
+ *
+ * Partitioning happens AFTER the freshness verdict, never before: the same
+ * anchor gets the same verdict whether it is enumerated or counted. Scope
+ * changes what is shown, never what is true.
+ *
+ * Fails open — a finding whose file cannot be attributed (empty `filePath`) is
+ * enumerated rather than silently folded into a count.
+ */
+export function scopeMemoryFindings(
+  issues: DriftIssue[],
+  scopeFiles: Set<string>,
+): { inScope: DriftIssue[]; outOfScope: number } {
+  if (scopeFiles.size === 0) return { inScope: issues, outOfScope: 0 };
+  const inScope: DriftIssue[] = [];
+  let outOfScope = 0;
+  for (const issue of issues) {
+    if (!issue.filePath || scopeFiles.has(issue.filePath)) inScope.push(issue);
+    else outOfScope++;
+  }
+  return { inScope, outOfScope };
+}
+
+/** Build a DriftIssue for a stale (orphaned/drifted) memory. */
+function makeMemoryStalenessIssue(
+  memKind: 'decision' | 'note',
+  id: string,
+  text: string,
+  freshness: 'drifted' | 'orphaned',
+  verdicts: AnchorVerdict[],
+  domain: string | null,
+): DriftIssue {
+  const kind: DriftIssueKind = freshness === 'orphaned' ? 'memory-orphaned' : 'memory-drifted';
+  const offending = verdicts.find((v) => v.freshness === freshness)?.anchor as StructuralAnchor | undefined;
+  const label = text.length > 60 ? `${text.slice(0, 57)}…` : text;
+  const subject = offending?.symbolName ?? offending?.filePath ?? 'its anchored code';
+  return {
+    id: `${kind}:${memKind}:${id}`,
+    kind,
+    severity: freshness === 'orphaned' ? 'warning' : 'info',
+    message:
+      freshness === 'orphaned'
+        ? `${memKind === 'decision' ? 'Decision' : 'Memory'} "${label}" is anchored to ${subject}, which no longer exists.`
+        : `${memKind === 'decision' ? 'Decision' : 'Memory'} "${label}" is anchored to ${subject}, which changed since it was recorded.`,
+    filePath: offending?.filePath ?? '',
+    domain,
+    specPath: null,
+    suggestion:
+      freshness === 'orphaned'
+        ? `Re-record this ${memKind} against current code, or reject it — its subject was renamed, moved, or deleted.`
+        : `Verify this ${memKind} still holds and re-record it; the code it describes was modified.`,
+  };
+}
+
 export async function detectDrift(options: DriftDetectorOptions): Promise<DriftResult> {
   const startTime = Date.now();
   const { specMap, changedFiles, failOn, rootPath, domainFilter, openspecRelPath } = options;
@@ -634,8 +787,22 @@ export async function detectDrift(options: DriftDetectorOptions): Promise<DriftR
     adrOrphanedIssues = detectADROrphaned(options.adrMap, specMap);
   }
 
+  // Code-anchored memory staleness (full-state scan, independent of the diff).
+  const memoryStaleness = await detectMemoryStaleness(rootPath);
+
+  // …then scoped to the code under review. The scan stays repository-wide (a
+  // memory is stale because the code moved, whatever this commit touched), but a
+  // review of five files should not read seventeen findings about the other
+  // ninety-five: out-of-scope anchors are counted, not enumerated
+  // (change: scope-advisory-noise-to-touched-code).
+  const scopeFiles = (options.memoryScope ?? 'changed-files') === 'repository'
+    ? new Set<string>()
+    : new Set(changedFiles.flatMap(f => (f.oldPath ? [f.path, f.oldPath] : [f.path])));
+  const { inScope: scopedMemoryStaleness, outOfScope: memoryOutOfScope } =
+    scopeMemoryFindings(memoryStaleness, scopeFiles);
+
   // Combine all issues
-  let allIssues = [...gaps, ...stale, ...uncovered, ...orphaned, ...adrGaps, ...adrOrphanedIssues];
+  let allIssues = [...gaps, ...stale, ...uncovered, ...orphaned, ...adrGaps, ...adrOrphanedIssues, ...scopedMemoryStaleness];
 
   // Apply domain filter if provided — exclude null-domain issues too,
   // since the user only wants results for the specified domains
@@ -687,6 +854,8 @@ export async function detectDrift(options: DriftDetectorOptions): Promise<DriftR
     timestamp: new Date().toISOString(),
     baseRef: options.baseRef ?? '',
     totalChangedFiles: changedFiles.length,
+    analyzedFiles: changedFiles.length,
+    filesOmitted: 0,
     specRelevantFiles,
     issues: dedupedIssues,
     summary: {
@@ -696,6 +865,9 @@ export async function detectDrift(options: DriftDetectorOptions): Promise<DriftR
       orphanedSpecs: dedupedIssues.filter(i => i.kind === 'orphaned-spec').length,
       adrGaps: dedupedIssues.filter(i => i.kind === 'adr-gap').length,
       adrOrphaned: dedupedIssues.filter(i => i.kind === 'adr-orphaned').length,
+      memoryDrifted: dedupedIssues.filter(i => i.kind === 'memory-drifted').length,
+      memoryOrphaned: dedupedIssues.filter(i => i.kind === 'memory-orphaned').length,
+      memoryOutOfScope,
       total: dedupedIssues.length,
     },
     hasDrift,

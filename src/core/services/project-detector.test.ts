@@ -17,7 +17,7 @@ describe('project-detector', () => {
 
   beforeEach(async () => {
     // Create a unique temp directory for each test
-    testDir = join(tmpdir(), `spec-gen-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
 
@@ -138,6 +138,23 @@ describe('project-detector', () => {
       expect(result.confidence).toBe('low');
     });
 
+    it('detects a pure-TS project (tsconfig.json, no package.json) as Node.js, not Unknown (fix-cli-output-hygiene)', async () => {
+      await writeFile(join(testDir, 'tsconfig.json'), '{}');
+      const result = await detectProjectType(testDir);
+
+      expect(result.projectType).toBe('nodejs');
+      expect(result.manifestFile).toBe('tsconfig.json');
+    });
+
+    it('prefers package.json over a co-located tsconfig.json', async () => {
+      await writeFile(join(testDir, 'package.json'), '{}');
+      await writeFile(join(testDir, 'tsconfig.json'), '{}');
+      const result = await detectProjectType(testDir);
+
+      expect(result.projectType).toBe('nodejs');
+      expect(result.manifestFile).toBe('package.json');
+    });
+
     it('should prefer higher priority manifest files', async () => {
       // pyproject.toml has higher priority than setup.py
       await writeFile(join(testDir, 'pyproject.toml'), '');
@@ -170,6 +187,40 @@ describe('project-detector', () => {
       const result = await detectProjectType(testDir);
 
       expect(result.hasGit).toBe(false);
+    });
+  });
+
+  describe('nested manifest detection (Spec 26 B6A)', () => {
+    it('detects a manifest one directory deep when the root has none', async () => {
+      await mkdir(join(testDir, 'python'), { recursive: true });
+      await writeFile(join(testDir, 'python', 'pyproject.toml'), '[project]\n');
+      const result = await detectProjectType(testDir);
+      expect(result.projectType).toBe('python');
+      expect(result.manifestFile).toBe(join('python', 'pyproject.toml'));
+      expect(result.confidence).toBe('medium');
+    });
+
+    it('still reports unknown when no manifest exists at root or depth-1', async () => {
+      await mkdir(join(testDir, 'docs'), { recursive: true });
+      await writeFile(join(testDir, 'docs', 'README.md'), '# hi\n');
+      const result = await detectProjectType(testDir);
+      expect(result.projectType).toBe('unknown');
+    });
+
+    it('prefers the root manifest over a nested one', async () => {
+      await writeFile(join(testDir, 'package.json'), '{}');
+      await mkdir(join(testDir, 'backend'), { recursive: true });
+      await writeFile(join(testDir, 'backend', 'go.mod'), 'module x\n');
+      const result = await detectProjectType(testDir);
+      expect(result.projectType).toBe('nodejs');
+      expect(result.manifestFile).toBe('package.json');
+    });
+
+    it('ignores node_modules when scanning depth-1', async () => {
+      await mkdir(join(testDir, 'node_modules'), { recursive: true });
+      await writeFile(join(testDir, 'node_modules', 'package.json'), '{}');
+      const result = await detectProjectType(testDir);
+      expect(result.projectType).toBe('unknown');
     });
   });
 

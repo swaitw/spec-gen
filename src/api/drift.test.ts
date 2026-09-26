@@ -1,9 +1,10 @@
 /**
- * Tests for specGenDrift programmatic API
+ * Tests for openloreDrift programmatic API
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { specGenDrift } from './drift.js';
+import { resolve } from 'node:path';
+import { openloreDrift } from './drift.js';
 
 // ============================================================================
 // MOCKS
@@ -19,7 +20,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 vi.mock('../core/services/config-manager.js', () => ({
-  readSpecGenConfig: vi.fn(),
+  readOpenLoreConfig: vi.fn(),
 }));
 
 vi.mock('../core/services/llm-service.js', () => ({
@@ -27,7 +28,7 @@ vi.mock('../core/services/llm-service.js', () => ({
 }));
 
 vi.mock('../core/drift/git-diff.js', () => ({
-  isGitRepository: vi.fn(),
+  isGitRepositoryRoot: vi.fn(),
   getChangedFiles: vi.fn(),
 }));
 
@@ -41,17 +42,17 @@ vi.mock('../core/drift/drift-detector.js', () => ({
 }));
 
 import { access, readFile } from 'node:fs/promises';
-import { readSpecGenConfig } from '../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import { createLLMService } from '../core/services/llm-service.js';
-import { isGitRepository, getChangedFiles } from '../core/drift/git-diff.js';
+import { isGitRepositoryRoot, getChangedFiles } from '../core/drift/git-diff.js';
 import { buildSpecMap, buildADRMap } from '../core/drift/spec-mapper.js';
 import { detectDrift } from '../core/drift/drift-detector.js';
 
 const mockAccess = vi.mocked(access);
 const mockReadFile = vi.mocked(readFile);
-const mockReadSpecGenConfig = vi.mocked(readSpecGenConfig);
+const mockReadOpenLoreConfig = vi.mocked(readOpenLoreConfig);
 const mockCreateLLMService = vi.mocked(createLLMService);
-const mockIsGitRepository = vi.mocked(isGitRepository);
+const mockIsGitRepositoryRoot = vi.mocked(isGitRepositoryRoot);
 const mockGetChangedFiles = vi.mocked(getChangedFiles);
 const mockBuildSpecMap = vi.mocked(buildSpecMap);
 const mockBuildADRMap = vi.mocked(buildADRMap);
@@ -61,7 +62,7 @@ const mockDetectDrift = vi.mocked(detectDrift);
 // FIXTURES
 // ============================================================================
 
-const ROOT = '/test/project';
+const ROOT = resolve('/test/project');
 const MOCK_CONFIG = { version: '1.0.0', openspecPath: './openspec' };
 const MOCK_CHANGED_FILES = [
   { path: 'src/auth.ts', status: 'modified', additions: 10, deletions: 2, isTest: false, isConfig: false, isGenerated: false, extension: '.ts' },
@@ -71,9 +72,11 @@ const MOCK_DRIFT_RESULT = {
   timestamp: new Date().toISOString(),
   baseRef: 'main',
   totalChangedFiles: 2,
+  analyzedFiles: 2,
+  filesOmitted: 0,
   specRelevantFiles: 1,
   issues: [],
-  summary: { gaps: 0, stale: 0, uncovered: 1, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, total: 1 },
+  summary: { gaps: 0, stale: 0, uncovered: 1, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, memoryDrifted: 0, memoryOrphaned: 0, memoryOutOfScope: 0, total: 1 },
   hasDrift: true,
   mode: 'static' as const,
   duration: 500,
@@ -87,10 +90,10 @@ const MOCK_LLM_SERVICE = {
 };
 
 function setupMocks() {
-  mockReadSpecGenConfig.mockResolvedValue(MOCK_CONFIG as ReturnType<typeof readSpecGenConfig> extends Promise<infer T> ? T : never);
+  mockReadOpenLoreConfig.mockResolvedValue(MOCK_CONFIG as ReturnType<typeof readOpenLoreConfig> extends Promise<infer T> ? T : never);
   mockAccess.mockResolvedValue(undefined);
   mockReadFile.mockResolvedValue('{}');
-  mockIsGitRepository.mockResolvedValue(true);
+  mockIsGitRepositoryRoot.mockResolvedValue(true);
   mockGetChangedFiles.mockResolvedValue({ files: MOCK_CHANGED_FILES, resolvedBase: 'main', hasUnstagedChanges: false, currentBranch: 'main' } as Awaited<ReturnType<typeof getChangedFiles>>);
   mockBuildSpecMap.mockResolvedValue(MOCK_SPEC_MAP);
   mockBuildADRMap.mockResolvedValue(MOCK_ADR_MAP);
@@ -103,7 +106,7 @@ function setupMocks() {
 // TESTS
 // ============================================================================
 
-describe('specGenDrift', () => {
+describe('openloreDrift', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     setupMocks();
@@ -112,22 +115,36 @@ describe('specGenDrift', () => {
   afterEach(() => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.OPENAI_COMPAT_API_KEY;
+    delete process.env.OPENAI_COMPAT_BASE_URL;
   });
 
   describe('precondition checks', () => {
-    it('throws if not a git repository', async () => {
-      mockIsGitRepository.mockResolvedValue(false);
-      await expect(specGenDrift({ rootPath: ROOT })).rejects.toThrow(/git/i);
+    it('normalizes a relative root and honors the explicit config path', async () => {
+      await openloreDrift({ rootPath: 'relative-project', configPath: 'config/custom.json' });
+
+      expect(mockReadOpenLoreConfig).toHaveBeenCalledWith(resolve('relative-project'), 'config/custom.json');
     });
 
-    it('throws if no spec-gen config', async () => {
-      mockReadSpecGenConfig.mockResolvedValue(null as unknown as ReturnType<typeof readSpecGenConfig> extends Promise<infer T> ? T : never);
-      await expect(specGenDrift({ rootPath: ROOT })).rejects.toThrow();
+    it('throws if not a git repository', async () => {
+      mockIsGitRepositoryRoot.mockResolvedValue(false);
+      const error = await openloreDrift({ rootPath: ROOT }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code: 'pipeline-failed' });
+      expect((error as Error).cause).toBeInstanceOf(Error);
+      expect(((error as Error).cause as Error).message).toMatch(/git repository/i);
+    });
+
+    it('throws if no openlore config', async () => {
+      mockReadOpenLoreConfig.mockResolvedValue(null as unknown as ReturnType<typeof readOpenLoreConfig> extends Promise<infer T> ? T : never);
+      await expect(openloreDrift({ rootPath: ROOT, configPath: 'config/custom.json' })).rejects.toMatchObject({ code: 'no-config' });
+      expect(mockReadOpenLoreConfig).toHaveBeenCalledWith(ROOT, 'config/custom.json');
     });
 
     it('throws if no specs found', async () => {
       mockAccess.mockRejectedValue(new Error('ENOENT'));
-      await expect(specGenDrift({ rootPath: ROOT })).rejects.toThrow();
+      await expect(openloreDrift({ rootPath: ROOT })).rejects.toThrow();
     });
   });
 
@@ -135,9 +152,11 @@ describe('specGenDrift', () => {
     it('returns empty result without running drift detection', async () => {
       mockGetChangedFiles.mockResolvedValue({ files: [], resolvedBase: 'main', hasUnstagedChanges: false, currentBranch: 'main' } as Awaited<ReturnType<typeof getChangedFiles>>);
 
-      const result = await specGenDrift({ rootPath: ROOT });
+      const result = await openloreDrift({ rootPath: ROOT });
 
       expect(result.totalChangedFiles).toBe(0);
+      expect(result.analyzedFiles).toBe(0);
+      expect(result.filesOmitted).toBe(0);
       expect(result.issues).toHaveLength(0);
       expect(result.hasDrift).toBe(false);
       expect(mockDetectDrift).not.toHaveBeenCalled();
@@ -146,7 +165,7 @@ describe('specGenDrift', () => {
 
   describe('happy path — static mode', () => {
     it('returns drift result', async () => {
-      const result = await specGenDrift({ rootPath: ROOT });
+      const result = await openloreDrift({ rootPath: ROOT });
 
       expect(result.totalChangedFiles).toBe(2);
       expect(result.hasDrift).toBe(true);
@@ -154,7 +173,7 @@ describe('specGenDrift', () => {
     });
 
     it('does not create LLM service in static mode', async () => {
-      await specGenDrift({ rootPath: ROOT, llmEnhanced: false });
+      await openloreDrift({ rootPath: ROOT, llmEnhanced: false });
       expect(mockCreateLLMService).not.toHaveBeenCalled();
     });
   });
@@ -165,16 +184,62 @@ describe('specGenDrift', () => {
       delete process.env.OPENAI_API_KEY;
       delete process.env.GEMINI_API_KEY;
       delete process.env.OPENAI_COMPAT_API_KEY;
-      await expect(specGenDrift({ rootPath: ROOT, llmEnhanced: true })).rejects.toThrow(/API key/i);
+      await expect(openloreDrift({ rootPath: ROOT, llmEnhanced: true })).rejects.toMatchObject({ code: 'no-api-key' });
     });
 
     it('creates LLM service when llmEnhanced=true', async () => {
-      await specGenDrift({ rootPath: ROOT, llmEnhanced: true });
+      await openloreDrift({ rootPath: ROOT, llmEnhanced: true });
       expect(mockCreateLLMService).toHaveBeenCalled();
+    });
+
+    it.each(['codex-cli', 'antigravity-cli'] as const)('uses no-key provider %s', async (provider) => {
+      delete process.env.ANTHROPIC_API_KEY;
+      await openloreDrift({ rootPath: ROOT, llmEnhanced: true, provider });
+      expect(mockCreateLLMService).toHaveBeenCalledWith(expect.objectContaining({ provider, model: provider }));
+    });
+
+    it('requires the credential selected by the configured provider', async () => {
+      mockReadOpenLoreConfig.mockResolvedValue({
+        ...MOCK_CONFIG,
+        generation: { provider: 'openai', model: 'gpt-5' },
+      } as never);
+
+      await expect(openloreDrift({ rootPath: ROOT, llmEnhanced: true }))
+        .rejects.toMatchObject({ code: 'no-api-key' });
+      expect(mockCreateLLMService).not.toHaveBeenCalled();
+    });
+
+    it('uses configured model, compat base, timeout, and response-format policy', async () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      process.env.OPENAI_COMPAT_API_KEY = 'compat-key';
+      process.env.OPENAI_COMPAT_BASE_URL = 'https://compat.example/v1';
+      mockReadOpenLoreConfig.mockResolvedValue({
+        ...MOCK_CONFIG,
+        generation: {
+          provider: 'openai-compat', model: 'local-model',
+          openaiCompatBaseUrl: 'https://compat.example/v1', timeout: 45_000,
+          disableResponseFormat: true,
+        },
+      } as never);
+
+      await openloreDrift({ rootPath: ROOT, llmEnhanced: true });
+
+      expect(mockCreateLLMService).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'openai-compat',
+        model: 'local-model',
+        openaiCompatBaseUrl: 'https://compat.example/v1',
+        timeout: 45_000,
+        disableResponseFormat: true,
+      }));
     });
   });
 
   describe('maxFiles limit', () => {
+    it.each([0, -1, 1.5, Number.NaN])('rejects invalid maxFiles %s', async (maxFiles) => {
+      await expect(openloreDrift({ rootPath: ROOT, maxFiles })).rejects.toThrow(/positive integer/i);
+      expect(mockGetChangedFiles).not.toHaveBeenCalled();
+    });
+
     it('slices changed files to maxFiles', async () => {
       const manyFiles = Array.from({ length: 20 }, (_, i) => ({
         path: `src/file${i}.ts`, status: 'modified' as const,
@@ -182,11 +247,13 @@ describe('specGenDrift', () => {
       }));
       mockGetChangedFiles.mockResolvedValue({ files: manyFiles, resolvedBase: 'main', hasUnstagedChanges: false, currentBranch: 'main' } as Awaited<ReturnType<typeof getChangedFiles>>);
 
-      await specGenDrift({ rootPath: ROOT, maxFiles: 5 });
+      const result = await openloreDrift({ rootPath: ROOT, maxFiles: 5 });
 
       // detectDrift should be called with at most 5 files
       const callArgs = mockDetectDrift.mock.calls[0];
       expect(callArgs).toBeDefined();
+      expect(callArgs?.[0].changedFiles).toHaveLength(5);
+      expect(result).toMatchObject({ totalChangedFiles: 20, analyzedFiles: 5, filesOmitted: 15 });
     });
   });
 });

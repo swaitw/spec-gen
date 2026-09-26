@@ -1,8 +1,12 @@
-# Plan — spec-gen RAG improvements (Pistes 2, 3, 4 + orient)
+# Plan — openlore RAG improvements (Pistes 2, 3, 4 + orient)
+
+> **Historical planning sketch** (kept for the record). For current capabilities see the
+> [documentation index](README.md) — e.g. [semantic-search.md](semantic-search.md) and
+> [mcp-tools.md](mcp-tools.md).
 
 ## Problème concret
 
-Un agent coding reçoit une tâche sur spec-gen. Il appelle `orient`. `orient` retourne des fonctions et des fichiers — mais pas le contenu des specs. L'agent doit appeler `get_spec` séparément, s'il pense à le faire. Dans la pratique : il lit du code brut, infère les contrats de données lui-même, et manque les dépendances cross-domaines.
+Un agent coding reçoit une tâche sur openlore. Il appelle `orient`. `orient` retourne des fonctions et des fichiers — mais pas le contenu des specs. L'agent doit appeler `get_spec` séparément, s'il pense à le faire. Dans la pratique : il lit du code brut, infère les contrats de données lui-même, et manque les dépendances cross-domaines.
 
 Résultat : lectures exploratoires inutiles, hallucinations sur les contrats de données, impacts cross-domaines ratés.
 
@@ -165,7 +169,7 @@ Enrichit le contenu qu'`orient` va inliner.
 ## Dependencies
 
 ### Called by this domain
-- `api` → via `specGenGenerate()` · `generate.ts:220`
+- `api` → via `openloreGenerate()` · `generate.ts:220`
 
 ### Calls into
 - `analyzer` → `DependencyGraphResult`, `RepositoryMapper`
@@ -176,7 +180,7 @@ Enrichit le contenu qu'`orient` va inliner.
 
 ```typescript
 const formatGenerator = new OpenSpecFormatGenerator({
-  version: specGenConfig.version,
+  version: openloreConfig.version,
   includeConfidence: true,
   includeTechnicalNotes: true,
   depGraph,   // NOUVEAU
@@ -252,7 +256,7 @@ Enrichir aussi `DomainGroup.files` depuis le cluster depGraph (dans `groupByDoma
 
 1. `npm run build` — zéro erreur TypeScript
 2. `npm test` — tous les tests existants passent
-3. `spec-gen generate` sur le repo spec-gen :
+3. `openlore generate` sur le repo openlore :
    - `openspec/rag-manifest.json` créé avec 10+ domaines, `sourceFiles` et `dependsOn` remplis
    - `openspec/specs/generator/spec.md` contient `## Dependencies` avec `api` dans "Called by"
    - `openspec/specs/generator/spec.md` contient `> Implementation:` sur au moins un `### Requirement:`

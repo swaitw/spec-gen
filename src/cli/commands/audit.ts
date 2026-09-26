@@ -1,40 +1,57 @@
 /**
- * spec-gen audit command
+ * openlore audit command
  *
  * Reports spec coverage gaps: uncovered functions, orphan requirements,
  * hub gaps, and stale domains. No LLM required.
  */
 
 import { Command } from 'commander';
+import { sanitizeForTerminal as safe } from '../../utils/misc.js';
 import { join } from 'node:path';
+import { writeStdout } from '../output.js';
 import { formatDuration } from '../../utils/command-helpers.js';
-import { SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_AUDIT_REPORT } from '../../constants.js';
-import { specGenAudit } from '../../api/audit.js';
+import { OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_AUDIT_REPORT } from '../../constants.js';
+import { openloreAudit } from '../../api/audit.js';
 import type { AuditReport } from '../../types/index.js';
 
 // ============================================================================
 // FORMATTING
 // ============================================================================
 
+export function formatMappingCoverageStatus(report: AuditReport): string[] {
+  if (report.mappingCoverage.state === 'available') {
+    return [`Coverage:       ${report.summary.coveragePct}% (${report.summary.coveredFunctions}/${report.summary.totalFunctions} functions)`];
+  }
+  return [
+    `Coverage:       unavailable (${report.mappingCoverage.reason ?? 'unknown'})`,
+    ...(report.mappingCoverage.message ? [`Reason:         ${report.mappingCoverage.message}`] : []),
+    ...(report.mappingCoverage.remediation ? [`Refresh:        ${report.mappingCoverage.remediation}`] : []),
+  ];
+}
+
+/** The public v2 summary stays numeric; availability determines interpretation. */
+const metric = (value: number, available: boolean): string => (available ? String(value) : 'unknown');
+
 function printReport(report: AuditReport, rootPath: string): void {
   const { summary } = report;
+  const coverageAvailable = report.mappingCoverage.state === 'available';
 
   console.log('');
   console.log('   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('   Spec Coverage Audit');
   console.log('   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('');
-  console.log(`   Coverage:       ${summary.coveragePct}% (${summary.coveredFunctions}/${summary.totalFunctions} functions)`);
-  console.log(`   Uncovered:      ${summary.uncoveredCount} functions`);
-  console.log(`   Hub gaps:       ${summary.hubGapCount} hub functions without spec`);
-  console.log(`   Orphan reqs:    ${summary.orphanRequirementCount} requirements with no implementation found`);
+  for (const line of formatMappingCoverageStatus(report)) console.log(`   ${line}`);
+  console.log(`   Uncovered:      ${metric(summary.uncoveredCount, coverageAvailable)} functions`);
+  console.log(`   Hub gaps:       ${metric(summary.hubGapCount, coverageAvailable)} hub functions without spec`);
+  console.log(`   Orphan reqs:    ${metric(summary.orphanRequirementCount, coverageAvailable)} requirements with no implementation found`);
   console.log(`   Stale domains:  ${summary.staleDomainCount} domains with source changes since last spec`);
   console.log('');
 
   if (report.hubGaps.length > 0) {
     console.log('   ── Hub Gaps (high fan-in, no spec) ──────────');
     for (const fn of report.hubGaps) {
-      console.log(`   ✗ ${fn.name}  fanIn=${fn.fanIn}  ${fn.file}`);
+      console.log(`   ✗ ${safe(fn.name)}  fanIn=${fn.fanIn}  ${safe(fn.file)}`);
     }
     console.log('');
   }
@@ -42,7 +59,7 @@ function printReport(report: AuditReport, rootPath: string): void {
   if (report.staleDomains.length > 0) {
     console.log('   ── Stale Domains ────────────────────────────');
     for (const d of report.staleDomains) {
-      console.log(`   ⚠ ${d.name}  spec=${d.specModifiedAt.slice(0, 10)}  src=${d.sourcesModifiedAt.slice(0, 10)}`);
+      console.log(`   ⚠ ${safe(d.name)}  spec=${d.specModifiedAt.slice(0, 10)}  src=${d.sourcesModifiedAt.slice(0, 10)}`);
     }
     console.log('');
   }
@@ -50,7 +67,7 @@ function printReport(report: AuditReport, rootPath: string): void {
   if (report.orphanRequirements.length > 0) {
     console.log('   ── Orphan Requirements ──────────────────────');
     for (const r of report.orphanRequirements) {
-      console.log(`   → [${r.domain}] ${r.requirement}`);
+      console.log(`   → [${safe(r.domain)}] ${safe(r.requirement)}`);
     }
     console.log('');
   }
@@ -59,15 +76,15 @@ function printReport(report: AuditReport, rootPath: string): void {
     console.log('   ── Uncovered Functions (sample) ─────────────');
     for (const fn of report.uncoveredFunctions.slice(0, 20)) {
       const hub = fn.isHub ? ' [hub]' : '';
-      console.log(`   · ${fn.name}${hub}  ${fn.file}`);
+      console.log(`   · ${safe(fn.name)}${hub}  ${safe(fn.file)}`);
     }
-    if (summary.uncoveredCount > 20) {
+    if (coverageAvailable && summary.uncoveredCount > 20) {
       console.log(`   … and ${summary.uncoveredCount - 20} more`);
     }
     console.log('');
   }
 
-  const reportPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_AUDIT_REPORT);
+  const reportPath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_AUDIT_REPORT);
   console.log(`   Report saved to: ${reportPath}`);
   console.log('');
 }
@@ -95,7 +112,7 @@ export const auditCommand = new Command('audit')
         console.log('Running spec coverage audit…');
       }
 
-      const report = await specGenAudit({
+      const report = await openloreAudit({
         rootPath,
         maxUncovered: parseInt(opts.maxUncovered, 10),
         hubThreshold: parseInt(opts.hubThreshold, 10),
@@ -103,7 +120,7 @@ export const auditCommand = new Command('audit')
       });
 
       if (opts.json) {
-        process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+        await writeStdout(JSON.stringify(report, null, 2) + '\n');
         return;
       }
 

@@ -1,25 +1,31 @@
 /**
- * spec-gen drift — programmatic API
+ * openlore drift — programmatic API
  *
  * Detects spec drift: finds code changes not reflected in specs.
- * No side effects (no process.exit, no console.log).
+ * Never controls the process and is console-silent by default.
  */
 
-import { join } from 'node:path';
-import { DEFAULT_DRIFT_MAX_FILES, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_LOGS_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_REPO_STRUCTURE } from '../constants.js';
+import { join, resolve } from 'node:path';
+import { DEFAULT_DRIFT_MAX_FILES, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_LOGS_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_REPO_STRUCTURE } from '../constants.js';
 import { fileExists } from '../utils/command-helpers.js';
-import { readSpecGenConfig } from '../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import {
   getChangedFiles,
-  isGitRepository,
+  isGitRepositoryRoot,
   buildSpecMap,
   buildADRMap,
   detectDrift,
 } from '../core/drift/index.js';
 import { createLLMService } from '../core/services/llm-service.js';
+import { isLlmLoggingEnabled } from '../core/services/llm-logging-policy.js';
 import type { LLMService } from '../core/services/llm-service.js';
 import type { DriftResult } from '../types/index.js';
 import type { DriftApiOptions, ProgressCallback } from './types.js';
+import { resolveOpenspecDir } from '../utils/openspec-dir.js';
+import { resolveTrustedApiBase, resolveTrustedSslVerify } from '../core/services/repo-config-trust.js';
+import { errors, isOpenLoreError } from '../utils/errors.js';
+import { withLoggerOptions } from '../utils/logger.js';
+import { resolveGenerationProvider } from '../core/runtime/generation-core.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'drift', step, status, detail });
@@ -31,14 +37,11 @@ function progress(onProgress: ProgressCallback | undefined, step: string, status
  * Compares code changes against existing OpenSpec specifications
  * and reports gaps, stale specs, uncovered files, and orphaned specs.
  *
- * @throws Error if not a git repository
- * @throws Error if no spec-gen configuration found
- * @throws Error if no specs found
- * @throws Error if LLM enhanced mode requested but no API key
+ * @throws OpenLoreError with a stable API code when drift detection cannot complete
  */
-export async function specGenDrift(options: DriftApiOptions = {}): Promise<DriftResult> {
+async function drift(options: DriftApiOptions): Promise<DriftResult> {
   const startTime = Date.now();
-  const rootPath = options.rootPath ?? process.cwd();
+  const rootPath = resolve(options.rootPath ?? process.cwd());
   const baseRef = options.baseRef ?? 'auto';
   const files = options.files ?? [];
   const domains = options.domains ?? [];
@@ -47,54 +50,55 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
   const maxFiles = options.maxFiles ?? DEFAULT_DRIFT_MAX_FILES;
   const { onProgress } = options;
 
-  // Validate git repo
-  if (!(await isGitRepository(rootPath))) {
-    throw new Error('Not a git repository. Drift detection requires git.');
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1) {
+    throw new Error('maxFiles must be a positive integer');
+  }
+
+  // Validate git repo. Root-only: drift joins git's repo-root-relative changed-file
+  // paths against the analyzed-root-relative spec map, so it is correct only when the
+  // analyzed root IS the repository root. Below-root support is out of scope here;
+  // gating on the root preserves the exact prior refusal instead of silently joining
+  // mismatched path frames (which would miss real drift / invent phantom gaps).
+  if (!(await isGitRepositoryRoot(rootPath))) {
+    throw new Error('Not a git repository (or not at its root). Drift detection requires git and must run at the repository root.');
   }
 
   // Load config
-  const specGenConfig = await readSpecGenConfig(rootPath);
-  if (!specGenConfig) {
-    throw new Error('No spec-gen configuration found. Run specGenInit() first.');
+  const openloreConfig = await readOpenLoreConfig(rootPath, options.configPath);
+  if (!openloreConfig) {
+    throw errors.noConfig(options.configPath);
   }
 
   // Check specs exist
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
   const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
   if (!(await fileExists(specsPath))) {
-    throw new Error('No specs found. Run specGenGenerate() first.');
+    throw new Error('No specs found. Run openloreGenerate() first.');
   }
 
   // Create LLM service if needed — support all four providers
   let llm: LLMService | undefined;
   if (llmEnhanced) {
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
-    const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
-    const geminiKey = process.env.GEMINI_API_KEY;
-    if (!anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
-      throw new Error('No LLM API key found. LLM-enhanced drift requires ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY.');
-    }
-    const envDetectedProvider = anthropicKey ? 'anthropic'
-      : geminiKey ? 'gemini'
-      : openaiCompatKey ? 'openai-compat'
-      : 'openai';
-    const provider = options.provider ?? envDetectedProvider;
-    const defaultModels: Record<string, string> = {
-      anthropic: DEFAULT_ANTHROPIC_MODEL,
-      gemini: DEFAULT_GEMINI_MODEL,
-      'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
-      openai: DEFAULT_OPENAI_MODEL,
-    };
-    llm = createLLMService({
-      provider,
-      model: options.model ?? defaultModels[provider] ?? DEFAULT_ANTHROPIC_MODEL,
-      apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
+    const resolved = resolveGenerationProvider(openloreConfig, {
+      provider: options.provider,
+      model: options.model,
       openaiCompatBaseUrl: options.openaiCompatBaseUrl,
-      sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
-      timeout: options.timeout ?? specGenConfig.generation?.timeout,
-      enableLogging: true,
-      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
+    });
+    if (!resolved) throw errors.apiNoApiKey();
+    llm = createLLMService({
+      provider: resolved.provider,
+      model: resolved.model,
+      apiBase: resolveTrustedApiBase(options.apiBase, openloreConfig.llm?.apiBase),
+      openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
+      sslVerify: resolveTrustedSslVerify(
+        options.sslVerify === undefined ? undefined : !options.sslVerify,
+        openloreConfig.llm?.sslVerify,
+      ),
+      timeout: options.timeout ?? openloreConfig.generation?.timeout,
+      disableResponseFormat: openloreConfig.generation?.disableResponseFormat,
+      enableLogging: isLlmLoggingEnabled(),
+      logDir: join(rootPath, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR),
+      logRoot: rootPath,
     });
   }
 
@@ -113,9 +117,11 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
       timestamp: new Date().toISOString(),
       baseRef: gitResult.resolvedBase,
       totalChangedFiles: 0,
+      analyzedFiles: 0,
+      filesOmitted: 0,
       specRelevantFiles: 0,
       issues: [],
-      summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, total: 0 },
+      summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, memoryDrifted: 0, memoryOrphaned: 0, memoryOutOfScope: 0, total: 0 },
       hasDrift: false,
       duration: Date.now() - startTime,
       mode: 'static',
@@ -130,7 +136,7 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
 
   // Build spec map
   progress(onProgress, 'Loading spec mappings', 'start');
-  const repoStructurePath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
+  const repoStructurePath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
   const hasRepoStructure = await fileExists(repoStructurePath);
 
   const specMap = await buildSpecMap({
@@ -155,7 +161,7 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
     changedFiles: gitResult.files,
     failOn,
     domainFilter: domains.length > 0 ? domains : undefined,
-    openspecRelPath: specGenConfig.openspecPath ?? OPENSPEC_DIR,
+    openspecRelPath: openloreConfig.openspecPath ?? OPENSPEC_DIR,
     llm,
     baseRef: gitResult.resolvedBase,
     adrMap: adrMap ?? undefined,
@@ -163,6 +169,8 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
 
   result.baseRef = gitResult.resolvedBase;
   result.totalChangedFiles = actualChangedFiles;
+  result.analyzedFiles = gitResult.files.length;
+  result.filesOmitted = actualChangedFiles - gitResult.files.length;
   progress(onProgress, 'Detecting drift', 'complete', `${result.summary.total} issues`);
 
   // Save LLM logs if applicable
@@ -171,4 +179,13 @@ export async function specGenDrift(options: DriftApiOptions = {}): Promise<Drift
   }
 
   return result;
+}
+
+export async function openloreDrift(options: DriftApiOptions = {}): Promise<DriftResult> {
+  try {
+    return await withLoggerOptions({ quiet: options.quiet ?? true }, () => drift(options));
+  } catch (error) {
+    if (isOpenLoreError(error)) throw error;
+    throw errors.pipelineFailed(`Drift detection failed: ${(error as Error).message}`, error);
+  }
 }

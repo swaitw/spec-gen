@@ -6,11 +6,71 @@
  */
 
 import { readFile, writeFile, mkdir, access, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { join, resolve } from 'node:path';
+import { parse as parseYaml, stringify as stringifyYaml, parseDocument } from 'yaml';
 import logger from '../../utils/logger.js';
 import { OPENSPEC_DIR, OPENSPEC_CONFIG_FILENAME } from '../../constants.js';
 import type { ProjectSurveyResult } from './spec-pipeline.js';
+
+/**
+ * Top-level `config.yaml` keys OpenSpec (the host) owns when OpenLore runs as an
+ * OpenSpec plugin. Their presence marks the config as host-managed, in which case
+ * OpenLore writes ONLY its `openlore` key (the one it declares via
+ * `ownsConfigKeys`) and leaves every other key byte-for-byte unchanged — it never
+ * introduces or overwrites a host-owned key. When none of these are present the
+ * config is treated as standalone OpenLore's own, and OpenLore may create
+ * `schema`/`context` as before (it is then the legitimate creator).
+ */
+export const HOST_OWNED_CONFIG_KEYS = [
+  'version',
+  'profile',
+  'delivery',
+  'workflows',
+  'featureFlags',
+  'plugins',
+] as const;
+
+/**
+ * Replace (or append) a single top-level YAML block by name in `raw`, touching no
+ * other bytes. The block spans the `<key>:` line at column 0 through the LAST
+ * following indented (non-blank) line — blank lines *within* the body are kept as
+ * part of the block, while trailing blank lines that merely separate it from the
+ * next top-level key are preserved as host content. Replacement stops at the next
+ * column-0 non-blank line (a new top-level key or a column-0 comment) or EOF. When
+ * the key is absent the block is appended. This is a literal text edit — not a YAML
+ * re-serialization — so host content (other keys, comments, CRLF, folded scalars)
+ * is preserved byte-for-byte.
+ *
+ * @param blockText  the serialized `<key>: …` YAML (LF-separated)
+ * @param eol        the file's detected line ending (`\n` or `\r\n`)
+ */
+export function spliceTopLevelBlock(raw: string, key: string, blockText: string, eol: string): string {
+  const blockLines = blockText.replace(/\n+$/, '').split('\n');
+  const keyLine = new RegExp(`^${key}\\s*:`);
+  const lines = raw.split(/\r?\n/);
+  const startIdx = lines.findIndex((l) => keyLine.test(l));
+
+  // Key absent → append, keeping `raw` byte-for-byte and adding a newline separator
+  // only when it does not already end with one.
+  if (startIdx === -1) {
+    const block = blockLines.join(eol) + eol;
+    if (raw.length === 0) return block;
+    return raw + (raw.endsWith('\n') ? '' : eol) + block;
+  }
+
+  // Key present → replace the `<key>:` line plus its indented body. Scan forward
+  // until the next column-0 non-blank line (or EOF), tracking the last indented,
+  // non-blank line: that is the true end of the block. A blank line alone never
+  // ends a YAML mapping value, so blanks embedded in the body are absorbed; trailing
+  // blanks after the body stay with the following host content.
+  let lastBody = startIdx;
+  let scan = startIdx + 1;
+  while (scan < lines.length && !/^\S/.test(lines[scan])) {
+    if (/^[ \t]/.test(lines[scan]) && lines[scan].trim() !== '') lastBody = scan;
+    scan++;
+  }
+  return [...lines.slice(0, startIdx), ...blockLines, ...lines.slice(lastBody + 1)].join(eol);
+}
 
 // ============================================================================
 // TYPES
@@ -37,13 +97,13 @@ export interface OpenSpecConfig {
     design?: string[];
     tasks?: string[];
   };
-  'spec-gen'?: SpecGenMetadata;
+  'openlore'?: OpenLoreMetadata;
 }
 
 /**
- * spec-gen metadata added to config.yaml
+ * openlore metadata added to config.yaml
  */
-export interface SpecGenMetadata {
+export interface OpenLoreMetadata {
   version: string;
   generatedAt: string;
   domains: string[];
@@ -68,6 +128,152 @@ export interface ContextUpdateOptions {
   preserveUserContext: boolean;
   appendDetectedInfo: boolean;
   version: string;
+}
+
+export interface ParsedOpenSpecScenario {
+  name: string;
+  text: string;
+}
+
+export interface ParsedOpenSpecRequirement {
+  name: string;
+  /** Normative prose only; scenario blocks and provenance blockquotes are excluded. */
+  text: string;
+  scenarios: ParsedOpenSpecScenario[];
+  normativeKeyword: 'SHALL' | 'MUST' | 'SHOULD' | 'MAY' | null;
+  normativeRank: 0 | 1 | 2 | 3;
+  deltaKind: 'ADDED' | 'MODIFIED' | 'REMOVED' | null;
+}
+
+const NORMATIVE_RANK = {
+  MAY: 1,
+  SHOULD: 2,
+  SHALL: 3,
+  MUST: 3,
+} as const;
+
+/**
+ * Parse the requirement/scenario structure shared by baseline and delta specs.
+ *
+ * This intentionally parses only OpenSpec's declared heading grammar. It does
+ * not infer requirements from prose, and it excludes blockquote provenance from
+ * requirement text so an implementation hint cannot become normative content.
+ */
+export function parseOpenSpecRequirements(content: string): ParsedOpenSpecRequirement[] {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
+  const masked = markdownStructuralMask(lines);
+  const parsed: ParsedOpenSpecRequirement[] = [];
+  let deltaKind: ParsedOpenSpecRequirement['deltaKind'] = null;
+
+  for (let index = 0; index < lines.length;) {
+    const deltaHeading = masked[index]
+      ? null
+      : lines[index].match(/^##\s+(ADDED|MODIFIED|REMOVED)\s+Requirements\s*$/i);
+    if (!masked[index] && /^##\s+/.test(lines[index])) {
+      deltaKind = deltaHeading
+        ? deltaHeading[1].toUpperCase() as Exclude<typeof deltaKind, null>
+        : null;
+    }
+    const requirementHeading = masked[index]
+      ? null
+      : lines[index].match(/^###\s+Requirement:\s*(.+?)\s*$/);
+    if (!requirementHeading) {
+      index++;
+      continue;
+    }
+
+    const name = requirementHeading[1].trim();
+    const prose: string[] = [];
+    const scenarios: ParsedOpenSpecScenario[] = [];
+    index++;
+
+    while (index < lines.length && (masked[index] || !/^#{1,3}\s/.test(lines[index]))) {
+      const scenarioHeading = masked[index]
+        ? null
+        : lines[index].match(/^####\s+Scenario:\s*(.+?)\s*$/);
+      if (scenarioHeading) {
+        const scenarioLines: string[] = [];
+        index++;
+        while (index < lines.length && (masked[index] || !/^#{1,4}\s/.test(lines[index]))) {
+          if (!masked[index]) scenarioLines.push(lines[index]);
+          index++;
+        }
+        scenarios.push({
+          name: scenarioHeading[1].trim(),
+          text: trimBlankLines(scenarioLines).join('\n'),
+        });
+        continue;
+      }
+
+      // Provenance hints are metadata, not part of the normative statement.
+      if (!masked[index] && !/^\s*>/.test(lines[index])) prose.push(lines[index]);
+      index++;
+    }
+
+    const text = trimBlankLines(prose).join('\n').trim();
+    let normativeKeyword: ParsedOpenSpecRequirement['normativeKeyword'] = null;
+    let normativeRank: ParsedOpenSpecRequirement['normativeRank'] = 0;
+    for (const match of text.matchAll(/\b(SHALL|MUST|SHOULD|MAY)(?:\s+NOT)?\b/g)) {
+      const keyword = match[1] as Exclude<ParsedOpenSpecRequirement['normativeKeyword'], null>;
+      const rank = NORMATIVE_RANK[keyword];
+      if (rank > normativeRank) {
+        normativeKeyword = keyword;
+        normativeRank = rank;
+      }
+    }
+
+    parsed.push({ name, text, scenarios, normativeKeyword, normativeRank, deltaKind });
+  }
+
+  return parsed;
+}
+
+/** Markdown lines with fenced blocks and HTML comments blanked for structural metadata parsing. */
+export function structuralMarkdownLines(content: string): string[] {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
+  const masked = markdownStructuralMask(lines);
+  return lines.map((line, index) => masked[index] ? '' : line);
+}
+
+function markdownStructuralMask(lines: readonly string[]): boolean[] {
+  const masked: boolean[] = [];
+  let fence: { marker: '`' | '~'; length: number } | null = null;
+  let htmlComment = false;
+  for (const line of lines) {
+    const opening = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fence !== null) {
+      masked.push(true);
+      const closing = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (closing && closing[1][0] === fence.marker && closing[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (htmlComment) {
+      masked.push(true);
+      if (line.includes('-->')) htmlComment = false;
+      continue;
+    }
+    if (opening) {
+      masked.push(true);
+      fence = { marker: opening[1][0] as '`' | '~', length: opening[1].length };
+      continue;
+    }
+    const commentStart = line.indexOf('<!--');
+    if (commentStart !== -1) {
+      masked.push(true);
+      htmlComment = line.indexOf('-->', commentStart + 4) === -1;
+      continue;
+    }
+    masked.push(false);
+  }
+  return masked;
+}
+
+function trimBlankLines(lines: string[]): string[] {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start].trim() === '') start++;
+  while (end > start && lines[end - 1].trim() === '') end--;
+  return lines.slice(start, end);
 }
 
 // ============================================================================
@@ -248,21 +454,21 @@ export class OpenSpecValidator {
       }
     }
 
-    // Check spec-gen metadata if present
-    if (configObj['spec-gen'] !== undefined) {
-      const specGen = configObj['spec-gen'] as Record<string, unknown>;
+    // Check openlore metadata if present
+    if (configObj['openlore'] !== undefined) {
+      const openlore = configObj['openlore'] as Record<string, unknown>;
 
-      if (typeof specGen.version !== 'string') {
-        warnings.push('spec-gen.version should be a string');
+      if (typeof openlore.version !== 'string') {
+        warnings.push('openlore.version should be a string');
       }
-      if (typeof specGen.generatedAt !== 'string') {
-        warnings.push('spec-gen.generatedAt should be a string');
+      if (typeof openlore.generatedAt !== 'string') {
+        warnings.push('openlore.generatedAt should be a string');
       }
-      if (!Array.isArray(specGen.domains)) {
-        warnings.push('spec-gen.domains should be an array');
+      if (!Array.isArray(openlore.domains)) {
+        warnings.push('openlore.domains should be an array');
       }
-      if (typeof specGen.confidence !== 'number') {
-        warnings.push('spec-gen.confidence should be a number');
+      if (typeof openlore.confidence !== 'number') {
+        warnings.push('openlore.confidence should be a number');
       }
     }
 
@@ -302,7 +508,7 @@ export class OpenSpecValidator {
     const malformed: string[] = [];
 
     // Find all markdown links
-    const linkPattern = /\[([^\]]*)\]\(([^)]*)\)/g;
+    const linkPattern = /\[([^\]]{0,1000})\]\(([^)]{0,1000})\)/g;
     let match;
 
     while ((match = linkPattern.exec(content)) !== null) {
@@ -336,8 +542,8 @@ export class OpenSpecConfigManager {
   private configPath: string;
   private openspecRoot: string;
 
-  constructor(projectRoot: string) {
-    this.openspecRoot = join(projectRoot, OPENSPEC_DIR);
+  constructor(projectRoot: string, openspecRoot?: string) {
+    this.openspecRoot = openspecRoot ? resolve(openspecRoot) : join(projectRoot, OPENSPEC_DIR);
     this.configPath = join(this.openspecRoot, OPENSPEC_CONFIG_FILENAME);
   }
 
@@ -388,10 +594,19 @@ export class OpenSpecConfigManager {
   }
 
   /**
-   * Update config with spec-gen metadata while preserving user content
+   * Update config with openlore metadata while preserving user/host content.
+   *
+   * Write discipline (config-key ownership): OpenLore owns exactly the `openlore`
+   * key. When a config.yaml already exists, the update is performed surgically
+   * through the YAML Document API so every other key — and every comment — is
+   * preserved verbatim. If the existing config is host-managed (it carries any
+   * {@link HOST_OWNED_CONFIG_KEYS}, i.e. OpenSpec created it), OpenLore touches
+   * ONLY its `openlore` key and never introduces or overwrites a host-owned key
+   * (context auto-injection is skipped — the host owns `context`). When no config
+   * exists, OpenLore is the legitimate creator and may seed `schema`/`context`.
    */
-  async updateWithSpecGenMetadata(
-    metadata: SpecGenMetadata,
+  async updateWithOpenLoreMetadata(
+    metadata: OpenLoreMetadata,
     detectedContext?: DetectedContext,
     options: ContextUpdateOptions = {
       preserveUserContext: true,
@@ -399,20 +614,76 @@ export class OpenSpecConfigManager {
       version: '1.0.0',
     }
   ): Promise<OpenSpecConfig> {
-    let config = await this.readConfig();
-
-    if (!config) {
-      config = {
-        schema: 'spec-driven',
-      };
+    let raw: string | null;
+    try {
+      raw = await readFile(this.configPath, 'utf-8');
+    } catch {
+      raw = null;
     }
 
-    // Add spec-gen metadata
-    config['spec-gen'] = metadata;
+    if (raw !== null) {
+      const doc = parseDocument(raw);
+      if (doc.errors.length > 0) {
+        // Never clobber a host file we cannot parse — fail loudly instead of
+        // re-serializing (or truncating) malformed YAML.
+        throw new Error(
+          `Refusing to update ${this.configPath}: it is not valid YAML (${doc.errors[0].message}). ` +
+            `Fix the file and retry.`
+        );
+      }
+      const hostManaged = HOST_OWNED_CONFIG_KEYS.some((key) => doc.has(key));
 
-    // Update context if we have detected info and user approves
+      if (hostManaged) {
+        // Byte-exact: splice ONLY the top-level `openlore:` block into the raw
+        // text. Every other byte — host keys, comments, CRLF line endings, folded
+        // scalars — is left untouched. `context` is host-owned, so it is not
+        // injected here.
+        const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+        const block = stringifyYaml({ openlore: metadata }, { lineWidth: 100 });
+        const next = spliceTopLevelBlock(raw, 'openlore', block, eol);
+
+        // Safety net: never let a splice that produced invalid YAML reach disk.
+        // The on-disk file stays the (valid) original if anything is off.
+        const verified = parseDocument(next);
+        if (verified.errors.length > 0) {
+          throw new Error(
+            `Internal error updating ${this.configPath} (${verified.errors[0].message}); ` +
+              `left the file unchanged.`
+          );
+        }
+
+        await mkdir(this.openspecRoot, { recursive: true });
+        await writeFile(this.configPath, next, 'utf-8');
+        logger.success(`Updated ${this.configPath}`);
+        return verified.toJSON() as OpenSpecConfig;
+      }
+
+      // Standalone OpenLore-owned file (no host keys): re-serialization is fine —
+      // it is our file — and context auto-injection is allowed.
+      doc.set('openlore', metadata);
+      if (detectedContext && options.appendDetectedInfo) {
+        const existing = doc.get('context');
+        doc.set(
+          'context',
+          this.buildContext(
+            typeof existing === 'string' ? existing : undefined,
+            detectedContext,
+            options.preserveUserContext
+          )
+        );
+      }
+
+      await mkdir(this.openspecRoot, { recursive: true });
+      await writeFile(this.configPath, doc.toString(), 'utf-8');
+      logger.success(`Updated ${this.configPath}`);
+      return doc.toJSON() as OpenSpecConfig;
+    }
+
+    // No config yet → OpenLore is the legitimate creator (standalone mode).
+    const config: OpenSpecConfig = { schema: 'spec-driven' };
+    config['openlore'] = metadata;
     if (detectedContext && options.appendDetectedInfo) {
-      config.context = this.buildContext(config.context, detectedContext, options.preserveUserContext);
+      config.context = this.buildContext(undefined, detectedContext, options.preserveUserContext);
     }
 
     await this.writeConfig(config);
@@ -437,7 +708,7 @@ export class OpenSpecConfigManager {
     }
 
     // Add auto-detected context
-    lines.push('# Auto-detected by spec-gen');
+    lines.push('# Auto-detected by openlore');
     lines.push(`Tech stack: ${detected.techStack}`);
     lines.push(`Architecture: ${detected.architecture}`);
     lines.push(`Domains: ${detected.domains.join(', ')}`);
@@ -528,11 +799,12 @@ export function buildDetectedContext(survey: ProjectSurveyResult): DetectedConte
  * Normalize domain name to OpenSpec conventions
  */
 export function normalizeDomainName(name: string): string {
-  return name
+  const normalized = name
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/--+/g, '-');
+    .replace(/[^a-z0-9]+/g, '-');
+  const start = normalized.startsWith('-') ? 1 : 0;
+  const end = normalized.endsWith('-') ? -1 : undefined;
+  return normalized.slice(start, end);
 }
 
 /**

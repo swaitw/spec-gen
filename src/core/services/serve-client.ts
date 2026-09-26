@@ -1,0 +1,209 @@
+/**
+ * serve-client — discover, spawn, and call the `openlore serve` daemon.
+ *
+ * Lets in-process callers (notably the stdio MCP server) delegate tool dispatch
+ * to a shared warm daemon instead of running it locally. Delegation means a
+ * single process holds the warm caches and runs ONE watcher for a repo, so two
+ * agents (Pi + Claude Code, or Claude Code + Cline) don't each spin a watcher
+ * racing to write the same .openlore/analysis.
+ *
+ * Every call degrades gracefully: if no daemon can be reached or spawned, the
+ * caller falls back to in-process dispatch.
+ */
+
+import { spawn } from 'node:child_process';
+import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { join } from 'node:path';
+import { FULL_PRESET, OPENLORE_DIR } from '../../constants.js';
+import {
+  readServeDescriptor,
+  readServeDescriptorState,
+  incompatibleServeDescriptorIsLive,
+  serveHttpBaseUrl,
+  validateServeHealth,
+  type ServeDescriptor,
+} from '../../cli/commands/serve-descriptor.js';
+import { OPENLORE_TOKEN_HEADER } from '../../cli/commands/local-http-guard.js';
+import { safeJoin } from '../../utils/path-confinement.js';
+
+/** A resolved, reachable daemon. */
+export interface ServeEndpoint {
+  baseUrl: string;
+  token?: string;
+}
+
+/** A reachable daemon rejected a request at its HTTP policy/handler boundary. */
+export class ServeHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ServeHttpError';
+  }
+}
+
+export function isServePresetRejection(error: unknown): error is ServeHttpError {
+  return error instanceof ServeHttpError
+    && error.status === 403
+    && /not available in the active .* preset/i.test(error.message);
+}
+
+const SPAWN_HEALTH_TIMEOUT_MS = 30_000;
+const HEALTH_POLL_MS = 150;
+// Per-probe timeout for the reuse check. Generous so a cold Node HTTP server on
+// Windows isn't misread as dead — a false negative spawns a second daemon and
+// orphans the first (orphans pile up in RAM). Matches serve.ts / the Pi extension.
+const HEALTH_PROBE_TIMEOUT_MS = 2500;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function descriptorPath(directory: string): string {
+  return join(directory, OPENLORE_DIR, 'serve.json');
+}
+
+/**
+ * CLI args to spawn the daemon. Exported + asserted in tests because the daemon
+ * MUST accept exactly these — `serve` has only `--no-watch` (watch is the
+ * default), so passing a non-existent `--watch` flag makes commander reject and
+ * the daemon never starts. Keep this in lockstep with serve.ts's options.
+ */
+export function serveSpawnArgs(directory: string): string[] {
+  // This daemon is shared across clients whose advertised presets may differ.
+  // Keep the backing surface complete; each MCP session enforces its own preset
+  // before delegation, while direct HTTP callers remain bounded by this `full`.
+  return ['serve', '--directory', directory, '--preset', FULL_PRESET];
+}
+
+/**
+ * Discover the daemon descriptor. `.openlore/serve.json` is an untrusted,
+ * repo-writable artifact, so it is resolved through the shared validator
+ * ({@link readServeDescriptor}) — a poisoned descriptor (non-loopback host,
+ * bad port/pid, non-string token) is treated exactly as absent, so no field of
+ * it ever becomes a fetch target or request header (mcp-security:
+ * ServeDescriptorValidatedAtEveryReader).
+ */
+async function readDescriptor(directory: string): Promise<ServeDescriptor | null> {
+  return readServeDescriptor(descriptorPath(directory));
+}
+
+/** True when a descriptor points at a LIVE daemon (ok:true /health), not a stale
+ * file or a recycled port owned by an unrelated server. */
+async function healthy(desc: ServeDescriptor, expectedRoot: string): Promise<boolean> {
+  try {
+    const headers = desc.token ? { [OPENLORE_TOKEN_HEADER]: desc.token } : undefined;
+    // INTENTIONAL EGRESS: validated descriptors are loopback-only and redirects are disabled.
+    // codeql[js/file-access-to-http]
+    const res = await fetch(`${serveHttpBaseUrl(desc.host, desc.port)}/health`, {
+      headers,
+      signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+      // The descriptor is confined to loopback, but a local listener answering a
+      // redirect would otherwise pull this probe (and the call below, with its
+      // token and tool arguments) off the machine. A daemon never redirects.
+      redirect: 'error',
+    });
+    if (!res.ok) return false;
+    const body = await res.json().catch(() => null);
+    const health = validateServeHealth(body, expectedRoot, desc);
+    return health !== null && !health.draining;
+  } catch {
+    return false;
+  }
+}
+
+function endpointOf(desc: ServeDescriptor): ServeEndpoint {
+  return { baseUrl: serveHttpBaseUrl(desc.host, desc.port), token: desc.token };
+}
+
+/**
+ * Resolve a live daemon for `directory`: reuse an announced healthy one, else
+ * (when `spawn` is true) start `openlore serve` detached and poll until
+ * /health is ready. Returns null if none could be brought up — callers then run
+ * in-process. Never kills a daemon; it may serve other clients.
+ */
+export async function ensureServeDaemon(
+  directory: string,
+  opts: { spawn?: boolean } = {},
+): Promise<ServeEndpoint | null> {
+  const announced = await readServeDescriptorState(descriptorPath(directory));
+  if (announced.kind === 'incompatible' && await incompatibleServeDescriptorIsLive(announced.descriptor, directory)) return null;
+  const existing = await readDescriptor(directory);
+  if (existing && (await healthy(existing, directory))) return endpointOf(existing);
+
+  if (opts.spawn === false) return null;
+
+  // Spawn via the same CLI entry that's running us (works installed or in dev).
+  const cli = process.argv[1];
+  if (!cli) return null;
+  let logFd: number | undefined;
+  try {
+    const isWin = process.platform === 'win32';
+    if (isWin) {
+      const openloreDir = safeJoin(directory, OPENLORE_DIR);
+      mkdirSync(openloreDir, { recursive: true });
+      logFd = openSync(safeJoin(directory, join(OPENLORE_DIR, 'serve.log')), 'a');
+    }
+    const child = spawn(
+      process.execPath,
+      [cli, ...serveSpawnArgs(directory)],
+      {
+        cwd: directory,
+        stdio: isWin ? ['ignore', logFd!, logFd!] : 'ignore',
+        // Detach on EVERY platform: this daemon is shared, so it must outlive
+        // whichever agent happened to start it. Windows was excluded here on the
+        // belief that "Windows doesn't reap the child on parent exit anyway";
+        // the windows-smoke job disproved that — the daemon died with the MCP
+        // session that spawned it. `windowsHide` keeps DETACHED_PROCESS from
+        // surfacing a console. Caveat: libuv deliberately does NOT set
+        // CREATE_BREAKAWAY_FROM_JOB, so this does not escape a parent Job Object.
+        detached: true,
+        windowsHide: true,
+      },
+    );
+    child.on('error', () => {}); // swallow — caller falls back to in-process
+    child.unref();
+  } catch {
+    return null;
+  } finally {
+    if (logFd !== undefined) closeSync(logFd);
+  }
+
+  const deadline = Date.now() + SPAWN_HEALTH_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(HEALTH_POLL_MS);
+    const desc = await readDescriptor(directory);
+    if (desc && (await healthy(desc, directory))) return endpointOf(desc);
+  }
+  return null;
+}
+
+/**
+ * Call a tool on the daemon. Throws on transport failure so the caller can fall
+ * back to in-process dispatch; a tool-level error is returned in the body (the
+ * handler's own `{ error }`), not thrown.
+ */
+export async function callServeTool(
+  ep: ServeEndpoint,
+  name: string,
+  args: Record<string, unknown>,
+  directory: string,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (ep.token) headers['x-openlore-token'] = ep.token;
+  const res = await fetch(`${ep.baseUrl}/tool/${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ directory, args }),
+    signal,
+    // Never follow a redirect: this request carries `x-openlore-token` and the tool
+    // arguments, and Node's fetch re-sends custom headers cross-origin.
+    redirect: 'error',
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = (body as { error?: string } | null)?.error ?? `daemon HTTP ${res.status}`;
+    throw new ServeHttpError(res.status, msg);
+  }
+  return body;
+}

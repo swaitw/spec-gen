@@ -8,6 +8,15 @@
  * replacing the simple file-path list with language-aware summaries.
  */
 
+// `detectLanguage` comes from the single canonical source (change:
+// fix-language-detection-single-source) — used internally below and re-exported so this
+// module's existing importers keep working. The definition and its extension map live
+// once, in the dependency-free `language-detection.ts` leaf.
+import { detectLanguage } from './language-detection.js';
+import { extractScriptContainer } from './sfc-script-extractor.js';
+import { blankCommentsPreservingLayout } from './comment-blanking.js';
+export { detectLanguage };
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -22,7 +31,8 @@ export interface ExtractedSignature {
 
 export interface FileSignatureMap {
   path: string;        // relative path
-  language: string;    // 'Python', 'TypeScript', 'JavaScript', 'Go', 'Rust', 'Ruby', 'Swift', 'unknown'
+  language: string;    // 'Python', 'TypeScript', 'JavaScript', 'Go', 'Rust', 'Ruby', 'Java', 'C++', 'Swift',
+                       // 'C#', 'Kotlin', 'PHP', 'C', 'Scala', 'Dart', 'Lua', 'Elixir', 'Bash', IaC tags, or 'unknown'
   entries: ExtractedSignature[];
 }
 
@@ -32,28 +42,13 @@ const MAX_SIGS_PER_FILE = 25;
 // Max chars per Stage 1 chunk (~10k tokens, safe for all providers)
 export const STAGE1_MAX_CHARS = 40_000;
 
-// ============================================================================
-// LANGUAGE DETECTION
-// ============================================================================
-
-export function detectLanguage(filePath: string): string {
-  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
-  switch (ext) {
-    case 'py':           return 'Python';
-    case 'ts': case 'tsx': return 'TypeScript';
-    case 'js': case 'jsx': return 'JavaScript';
-    case 'go':           return 'Go';
-    case 'rs':           return 'Rust';
-    case 'rb':           return 'Ruby';
-    case 'java':         return 'Java';
-    case 'kt':           return 'Kotlin';
-    case 'php':          return 'PHP';
-    case 'cs':           return 'C#';
-    case 'cpp': case 'cc': case 'cxx': case 'h': case 'hpp': return 'C++';
-    case 'c':            return 'C';
-    case 'swift':        return 'Swift';
-    default:             return 'unknown';
-  }
+/**
+ * Resolve the language of a `.h` header (spec-08). `.h` is claimed by both C and
+ * C++. Rule: a project with `.c` files and no C++ sources → C; otherwise C++
+ * (the default / superset, which parses C headers acceptably).
+ */
+export function resolveHeaderLanguage(hasCSources: boolean, hasCppSources: boolean): 'C' | 'C++' {
+  return (!hasCppSources && hasCSources) ? 'C' : 'C++';
 }
 
 // ============================================================================
@@ -320,15 +315,69 @@ function extractTypeScript(content: string): ExtractedSignature[] {
   return entries;
 }
 
+/**
+ * Precomputed "nearest preceding line of interest" indices for one `lines` array.
+ *
+ * The doc-comment lookups below are called for EVERY line of the file and each walked
+ * BACKWARDS to find where the block above ends and begins. On a file of blank lines that
+ * walk reaches line 0 every time: O(n^2) `trim()` calls, no regex involved, and it sits on
+ * the hottest extractor in the repo. Measured on the real `extractSignatures`, 200 KB of
+ * newlines: `a.ts` cost 240 s (`.js`/`.tsx`/`.jsx`/`.mts` the same) and `a.java` likewise.
+ * A per-file size cap does not help a quadratic — 4 MB is 20x this payload for 400x the
+ * time.
+ *
+ * One forward pass computes all three, so every lookup is O(1). This is the same
+ * single-entry memo discipline as `getLineNumber` in import-parser.ts: parsing is
+ * per-file and sequential, so one entry hits effectively always, and what it retains is
+ * bounded by one file.
+ */
+interface DocScanIndex {
+  /** Nearest j < i whose line is non-blank, else -1. (JSDoc skips blanks.) */
+  prevNonBlank: Int32Array;
+  /** Nearest j < i whose line is non-blank and not an annotation, else -1. (Javadoc.) */
+  prevSignificant: Int32Array;
+  /** Greatest j <= i whose line opens a block comment (`/**`), else -1. */
+  prevBlockOpen: Int32Array;
+}
+
+let _docScanLines: string[] | undefined;
+let _docScanIndex: DocScanIndex | undefined;
+
+function docScanIndex(lines: string[]): DocScanIndex {
+  if (_docScanLines === lines && _docScanIndex) return _docScanIndex;
+  const n = lines.length;
+  const prevNonBlank = new Int32Array(n);
+  const prevSignificant = new Int32Array(n);
+  const prevBlockOpen = new Int32Array(n);
+  let nonBlank = -1;
+  let significant = -1;
+  let blockOpen = -1;
+  for (let i = 0; i < n; i++) {
+    // Written strictly BEFORE this line is inspected, so each entry means "before i".
+    prevNonBlank[i] = nonBlank;
+    prevSignificant[i] = significant;
+    const t = lines[i].trim();
+    if (t !== '') {
+      nonBlank = i;
+      if (!t.startsWith('@')) significant = i;
+    }
+    // …whereas a block opener at `i` is itself a candidate for `i`.
+    if (t.startsWith('/**')) blockOpen = i;
+    prevBlockOpen[i] = blockOpen;
+  }
+  _docScanLines = lines;
+  _docScanIndex = { prevNonBlank, prevSignificant, prevBlockOpen };
+  return _docScanIndex;
+}
+
 function extractJSDoc(lines: string[], declLineIdx: number): string | undefined {
-  // Walk backwards to find */ then /**
-  let endIdx = declLineIdx - 1;
+  // Walk backwards to find */ then /** — via the precomputed index, not a rescan.
+  const idx = docScanIndex(lines);
   // Skip blank lines
-  while (endIdx >= 0 && lines[endIdx].trim() === '') endIdx--;
+  const endIdx = declLineIdx > 0 ? idx.prevNonBlank[declLineIdx] : -1;
   if (endIdx < 0 || !lines[endIdx].trim().endsWith('*/')) return undefined;
 
-  let startIdx = endIdx;
-  while (startIdx >= 0 && !lines[startIdx].trim().startsWith('/**')) startIdx--;
+  const startIdx = idx.prevBlockOpen[endIdx];
   if (startIdx < 0) return undefined;
 
   // Find first meaningful @description or plain text line
@@ -473,7 +522,25 @@ function extractCpp(content: string): ExtractedSignature[] {
 
     // Function / method: look for Name(params) followed by qualifiers then { or :
     // This regex finds the last word before a ( that has content after closing )
-    const fnMatch = trimmed.match(/\b(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept[^{;]*)?\s*(?:override\s*)?(?:final\s*)?(?:->\s*[\w:*&<>, ]+\s*)?[{:]/);
+    // Every inter-token run and every inner class is BOUNDED. This pattern is
+    // unanchored, so it restarts at each of O(n) `\w` positions on the line, and the
+    // chain of optional groups each ending in an unbounded `\s*` multiplied the
+    // partitions it tried before the required `[{:]` failed to arrive. Measured on a
+    // `.cpp` file of `(a` repeated (unclosed parens, no brace): 4.5 s at 50 KB, 13 s at
+    // 100 KB. `trimmed` is one line, so `\n` cannot occur in it and `[ \t\r]` is the
+    // exact equivalent of `\s` here; the only recall difference is a parameter list over
+    // 4,000 characters on a single line, which is the bound already adopted for
+    // `TS_PROPS_INTERFACE` (ui-component-extractor.ts) and `helm.ts`.
+    //
+    // The parameter bound is 1,000 rather than that house 4,000, and the difference is
+    // measured, not stylistic: a bounded quantifier still costs O(n x bound), because
+    // `[^)]` cannot match `)` yet the engine gives the run back one character at a time
+    // anyway. At 4,000 a 240 KB hostile line still cost 3.0 s — linear, so invisible to a
+    // growth-ratio test, and close enough to the absolute ceiling to flake on a loaded
+    // box. 1,000 brings it to ~0.8 s. The recall cost is a parameter list over 1,000
+    // characters ON ONE LINE; unlike the C and Dart scanners, this pattern is
+    // single-line-only, so a wide generated signature is already wrapped past it.
+    const fnMatch = trimmed.match(/\b(\w+)[ \t\r]{0,80}\(([^)]{0,1000})\)[ \t\r]{0,80}(?:const[ \t\r]{0,80})?(?:noexcept[^{;\n]{0,200})?[ \t\r]{0,80}(?:override[ \t\r]{0,80})?(?:final[ \t\r]{0,80})?(?:->[ \t\r]{0,80}[\w:*&<>, ]{0,200}[ \t\r]{0,80})?[{:]/);
     if (fnMatch) {
       const name = fnMatch[1];
       if (!CPP_SKIP_NAMES.has(name) && /^[a-zA-Z_]/.test(name)) {
@@ -496,15 +563,31 @@ function extractSwift(content: string): ExtractedSignature[] {
   const entries: ExtractedSignature[] = [];
   const lines = content.split('\n');
 
+  /**
+   * Index of the nearest non-blank line strictly before the current one, carried forward
+   * instead of re-scanned.
+   *
+   * The doc-comment lookup used to walk backwards over blank lines from EVERY line, which
+   * is O(n^2) `trim()` calls on a file of blank lines — not a regex at all, and the one
+   * quadratic here that a regex audit would not catch. Measured on the real
+   * `extractSignatures('a.swift', …)`: 200 KB of newlines cost 291 s (4 min 51 s), now ~1 ms.
+   *
+   * Exactly equivalent: the loop runs forward, so if the immediately preceding line is
+   * non-blank it IS the nearest one, and otherwise the nearest one is unchanged from the
+   * previous iteration. Updated at the top of the body so the `continue`s below cannot
+   * skip it.
+   */
+  let prevNonBlank = -1;
+
   for (let i = 0; i < lines.length && entries.length < MAX_SIGS_PER_FILE; i++) {
+    if (i > 0 && lines[i - 1].trim() !== '') prevNonBlank = i - 1;
     const line = lines[i];
     const trimmed = line.trimStart();
 
     // Collect /// doc comment above the declaration
     let docstring: string | undefined;
     if (i > 0) {
-      let j = i - 1;
-      while (j >= 0 && lines[j].trim() === '') j--;
+      const j = prevNonBlank;
       if (j >= 0 && lines[j].trim().startsWith('///')) {
         docstring = lines[j].trim().slice(3).trim() || undefined;
       }
@@ -565,13 +648,38 @@ const JAVA_SKIP_NAMES = new Set([
   'new', 'throw', 'class', 'interface', 'enum', 'record',
 ]);
 
+/**
+ * Statement keywords that can appear in the "return type" position of the
+ * method regex on a body line (e.g. `return foo(args);`, `throw new X();`).
+ * Because signatures are extracted from raw source (bodies are not stripped),
+ * such lines must be rejected — they are calls, not declarations.
+ */
+const JAVA_STMT_KEYWORDS = new Set([
+  'return', 'throw', 'yield', 'assert', 'else', 'case', 'default', 'break',
+  'continue', 'new', 'this', 'super',
+]);
+
 function extractJava(content: string): ExtractedSignature[] {
   const entries: ExtractedSignature[] = [];
   const lines = content.split('\n');
+  let inBlockComment = false;
 
   for (let i = 0; i < lines.length && entries.length < MAX_SIGS_PER_FILE; i++) {
     const line = lines[i];
     const trimmed = line.trimStart();
+
+    // Track multi-line `/* … */` blocks. License headers (e.g. Apache's) wrap
+    // prose in a block comment whose continuation lines start with spaces, not
+    // `*`, so a line like "Licensed to the Apache Software Foundation (ASF)…"
+    // would otherwise be mis-parsed as a method declaration.
+    if (inBlockComment) {
+      if (trimmed.includes('*/')) inBlockComment = false;
+      continue;
+    }
+    if (trimmed.startsWith('/*') && !trimmed.includes('*/')) {
+      inBlockComment = true;
+      continue;
+    }
 
     // Skip lines that are clearly not declarations
     if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
@@ -595,23 +703,40 @@ function extractJava(content: string): ExtractedSignature[] {
       continue;
     }
 
-    // Method: `[modifiers] [<generics>] ReturnType name(params)` — return type
-    // may include generics, arrays, and dotted package-qualified names.
+    // Method: `[modifiers] [<generics>] ReturnType name(params) [throws …]`.
+    // Captured parts (modifiers, type parameters, throws) are preserved in the
+    // signature so the reader can see visibility, abstractness, and checked
+    // exceptions. The type-parameter sub-pattern allows one level of nested
+    // generics and `&` intersection bounds (`<T extends Number & Comparable<T>>`)
+    // so such methods are no longer dropped entirely. See #138.
     const methodMatch = trimmed.match(
       new RegExp(
-        '^' + JAVA_MODIFIER_PREFIX + '(?:<[^>]+>\\s+)?([\\w<>\\[\\], ?.]+?)\\s+(\\w+)\\s*\\(([^)]*)\\)'
+        '^(' + JAVA_MODIFIER_PREFIX + ')' +
+          '(<(?:[^<>]|<[^<>]*>)*>\\s+)?' +     // optional method type params
+          '([\\w<>\\[\\], ?.]+?)\\s+' +        // return type
+          '(\\w+)\\s*\\(((?:[^()]|\\([^()]*\\))*)\\)' + // name(params) — params may
+                                                       // contain annotations with
+                                                       // parens, e.g. @PathVariable(...)
+          '(?:\\s*throws\\s+([^{;]+))?'         // optional throws clause
       )
     );
     if (methodMatch) {
-      const returnType = methodMatch[1].trim();
-      const name = methodMatch[2];
+      const modifiers = methodMatch[1].trim().replace(/\s+/g, ' ');
+      const typeParams = (methodMatch[2] ?? '').trim();
+      const returnType = methodMatch[3].trim();
+      const name = methodMatch[4];
       if (JAVA_SKIP_NAMES.has(name)) continue;
+      // Reject body statements like `return foo(args);` that slipped into the
+      // declaration regex (signatures are extracted from un-skeletonized source).
+      if (JAVA_STMT_KEYWORDS.has(returnType.split(/[\s.]/)[0])) continue;
       // Skip obvious field declarations like `private final Foo bar = ...` —
       // fields don't have `(` so the regex wouldn't match. This path is
       // method-only by construction.
-      const params = compactParams(methodMatch[3]);
+      const params = compactParams(methodMatch[5]);
+      const throwsClause = methodMatch[6] ? ` throws ${methodMatch[6].trim().replace(/\s+/g, ' ')}` : '';
       const isMethod = line.startsWith('  ') || line.startsWith('\t');
-      const sig = `${returnType} ${name}(${params})`;
+      const head = [modifiers, typeParams, returnType].filter(Boolean).join(' ');
+      const sig = `${head} ${name}(${params})${throwsClause}`;
       entries.push({
         kind: isMethod ? 'method' : 'function',
         name,
@@ -631,17 +756,12 @@ function extractJava(content: string): ExtractedSignature[] {
  * line of the block, or undefined.
  */
 function extractJavadoc(lines: string[], declLineIdx: number): string | undefined {
-  let endIdx = declLineIdx - 1;
-  // Skip annotation lines and blanks
-  while (endIdx >= 0) {
-    const t = lines[endIdx].trim();
-    if (t === '' || t.startsWith('@')) { endIdx--; continue; }
-    break;
-  }
+  // Skip annotation lines and blanks — via the precomputed index, not a rescan.
+  const idx = docScanIndex(lines);
+  const endIdx = declLineIdx > 0 ? idx.prevSignificant[declLineIdx] : -1;
   if (endIdx < 0 || !lines[endIdx].trim().endsWith('*/')) return undefined;
 
-  let startIdx = endIdx;
-  while (startIdx >= 0 && !lines[startIdx].trim().startsWith('/**')) startIdx--;
+  const startIdx = idx.prevBlockOpen[endIdx];
   if (startIdx < 0) return undefined;
 
   for (let j = startIdx + 1; j <= endIdx; j++) {
@@ -662,7 +782,20 @@ function extractGeneric(content: string): ExtractedSignature[] {
   for (let i = 0; i < lines.length && entries.length < MAX_SIGS_PER_FILE; i++) {
     const line = lines[i];
     // Generic: lines that look like declarations (function/class/def keywords)
-    const match = line.match(/^\s*(?:public|private|protected|export|static|async)?\s*(?:function|class|def|func|fn|sub|procedure)\s+(\w+)/);
+    //
+    // The whitespace run belongs INSIDE the optional modifier group, not beside it. Written
+    // as `^\s*(?:MOD)?\s*KW`, the two runs are separated only by an OPTIONAL group, so a
+    // whitespace-only line can be partitioned n x n ways before the keyword fails to
+    // arrive — the same shape as the Spring annotation blob. This fallback handles every
+    // extension without a dedicated extractor, so a one-line `.pl` or `.erl` file of spaces
+    // reached it: measured on the real `extractSignatures` at 200 KB, `a.erl` cost 133 s and
+    // `a.pl` 127 s; both are now ~1 ms.
+    //
+    // EXACTLY equivalent: `\s* MOD? \s* KW` and `\s* (MOD \s*)? KW` describe the same
+    // language (including the degenerate `publicfunction f`, where the inner run is empty).
+    // Moving the run inside means the group can only be entered after a literal modifier
+    // matches, so on a run of pure whitespace there is only one variable-length run left.
+    const match = line.match(/^\s*(?:(?:public|private|protected|export|static|async)\s*)?(?:function|class|def|func|fn|sub|procedure)\s+(\w+)/);
     if (match) {
       entries.push({ kind: 'function', name: match[1], signature: line.trim().slice(0, 120) });
     }
@@ -672,12 +805,282 @@ function extractGeneric(content: string): ExtractedSignature[] {
 }
 
 // ============================================================================
+// TERRAFORM EXTRACTOR (spec-07)
+// ============================================================================
+
+function extractTerraformSignatures(content: string): ExtractedSignature[] {
+  const entries: ExtractedSignature[] = [];
+  // Indentation is `[ \t]`, NOT `\s`. `\s` matches `\n`, so `^\s*` under /m rescans
+  // every remaining newline to EOF from each of O(n) line starts and gives them back
+  // one at a time — quadratic on a `.tf` file of blank lines (measured: 7.9 s at 50 KB,
+  // 484 s at 200 KB, and the 4 MB file cap is 20x that again). `MAX_SIGS_PER_FILE` is no
+  // defence: the payload produces ZERO matches, so the capping loop never runs.
+  //
+  // A semantic no-op: a newline inside "the indentation of this line" is a
+  // contradiction — it means a different line, which `^` under /m already anchors. A
+  // Terraform block header is `keyword "label" "label" {` on one line, so the inner
+  // separators are spaces/tabs too.
+  const re = /^[ \t]*(resource|data|module|variable|output|provider)[ \t]+("[^"]+"(?:[ \t]+"[^"]+")?|\w+)/gm;
+  for (const m of content.matchAll(re)) {
+    if (entries.length >= MAX_SIGS_PER_FILE) break;
+    const block = m[1];
+    const labels = m[2].replace(/"/g, '');
+    entries.push({
+      kind: block === 'module' || block === 'provider' ? 'class' : 'const',
+      name: labels.split(/\s+/).join('.'),
+      signature: `${block} ${m[2]}`,
+    });
+  }
+  return entries;
+}
+
+// ============================================================================
+// BICEP EXTRACTOR (Azure IaC — add-bicep-iac-graph)
+// ============================================================================
+
+function extractBicepSignatures(content: string): ExtractedSignature[] {
+  const entries: ExtractedSignature[] = [];
+  // Top-level declarations only (depth 0): keyword, symbolic name, optional 'type' literal.
+  const re = /^(resource|module|param|var|output)\s+([A-Za-z_]\w*)\s*('[^']*')?/gm;
+  for (const m of content.matchAll(re)) {
+    if (entries.length >= MAX_SIGS_PER_FILE) break;
+    const keyword = m[1];
+    const name = m[2];
+    const typeLit = m[3] ? ` ${m[3]}` : '';
+    entries.push({
+      kind: keyword === 'resource' || keyword === 'module' ? 'class' : 'const',
+      name,
+      signature: `${keyword} ${name}${typeLit}`,
+    });
+  }
+  return entries;
+}
+
+// ============================================================================
+// ADDITIONAL GENERAL-PURPOSE LANGUAGES (spec-08) — best-effort Stage-1 regexes
+// ============================================================================
+//
+// Lightweight declaration regexes so these languages are searchable via BM25
+// even when their tree-sitter grammar fails to load (graceful degradation). The
+// call graph is the authoritative source when the grammar IS available.
+
+interface SigPattern { re: RegExp; kind: ExtractedSignature['kind']; }
+
+const EXTRA_LANG_PATTERNS: Record<string, SigPattern[]> = {
+  // Declaration whitespace is horizontal only. Letting `\s` consume newlines under /m
+  // makes the engine retry from every line start and rescan the remaining file. Each
+  // modifier also owns its trailing whitespace, so adjacent groups cannot repartition
+  // one whitespace run quadratically. See extractor-redos.test.ts.
+  'C#': [
+    { re: /^[ \t]*(?:(?:public|private|protected|internal|static|sealed|abstract|partial)[ \t]+)*\b(?:class|interface|struct|record|enum)[ \t]+(\w+)/gm, kind: 'class' },
+    { re: /^[ \t]*(?:(?:public|private|protected|internal|static|async|virtual|override)[ \t]+)*[\w<>[\],?]+[ \t]+(\w+)[ \t]*\(/gm, kind: 'method' },
+  ],
+  Kotlin: [
+    { re: /^[ \t]*(?:(?:public|private|internal|open|abstract|sealed|data)[ \t]+)*\b(?:class|object|interface)[ \t]+(\w+)/gm, kind: 'class' },
+    { re: /^[ \t]*(?:(?:public|private|internal|open|override|suspend)[ \t]+)*\bfun[ \t]+(?:[\w.<>]+\.)?(\w+)[ \t]*\(/gm, kind: 'function' },
+  ],
+  PHP: [
+    { re: /^[ \t]*(?:(?:abstract|final)[ \t]+)*\b(?:class|trait|interface|enum)[ \t]+(\w+)/gm, kind: 'class' },
+    { re: /^[ \t]*(?:(?:public|private|protected|static|abstract|final)[ \t]+)*\bfunction[ \t]+(\w+)[ \t]*\(/gm, kind: 'function' },
+  ],
+  C: [],
+  Scala: [
+    { re: /^[ \t]*(?:case[ \t]+)?\b(?:object|class|trait)[ \t]+(\w+)/gm, kind: 'class' },
+    { re: /^[ \t]*(?:(?:override|implicit|private|protected)[ \t]+)*\bdef[ \t]+(\w+)/gm, kind: 'function' },
+  ],
+  Dart: [
+    { re: /^[ \t]*(?:abstract[ \t]+)?\b(?:class|mixin|extension|enum)[ \t]+(\w+)/gm, kind: 'class' },
+  ],
+  Lua: [
+    { re: /^[ \t]*(?:local[ \t]+)?function[ \t]+([\w.:]+)/gm, kind: 'function' },
+  ],
+  Elixir: [
+    { re: /^[ \t]*defmodule[ \t]+([\w.]+)/gm, kind: 'class' },
+    { re: /^[ \t]*def(?:p|macro|macrop)?[ \t]+(\w+)/gm, kind: 'function' },
+  ],
+  Bash: [
+    { re: /^[ \t]*(?:function[ \t]+(\w+)|(\w+)[ \t]*\([ \t]*\))/gm, kind: 'function' },
+  ],
+};
+
+const NON_DECLARATION_NAMES = new Set(['if', 'for', 'while', 'switch', 'catch', 'return', 'new']);
+
+/**
+ * Scan C/Dart brace-bodied functions with one monotonic cursor. Parameter lists may
+ * be arbitrarily long and multiline; an unterminated opener consumes the remaining
+ * suffix once instead of being retried from every line start.
+ */
+function scanBraceFunctions(language: string, content: string): ExtractedSignature[] {
+  if (language !== 'C' && language !== 'Dart') return [];
+  const text = blankCommentsPreservingLayout(content);
+  const entries: ExtractedSignature[] = [];
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') lineStarts.push(i + 1);
+  }
+  const lineAt = (offset: number): number => {
+    let lo = 0;
+    let hi = lineStarts.length;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >> 1;
+      if (lineStarts[mid] <= offset) lo = mid;
+      else hi = mid;
+    }
+    return lo;
+  };
+  let cursor = 0;
+  let segmentStart = 0;
+
+  const skipQuoted = (start: number): number => {
+    const quote = text[start];
+    let i = start + 1;
+    while (i < text.length) {
+      if (text[i] === '\\') i += 2;
+      else if (text[i++] === quote) break;
+    }
+    return i;
+  };
+
+  while (cursor < text.length && entries.length < MAX_SIGS_PER_FILE) {
+    if (text[cursor] === '"' || text[cursor] === "'") {
+      cursor = skipQuoted(cursor);
+      continue;
+    }
+    if (text[cursor] !== '(') {
+      if (text[cursor] === ';' || text[cursor] === '{' || text[cursor] === '}') {
+        segmentStart = cursor + 1;
+      }
+      cursor++;
+      continue;
+    }
+
+    const open = cursor;
+    let nameEnd = open;
+    while (nameEnd > segmentStart && /\s/.test(text[nameEnd - 1])) nameEnd--;
+    let nameStart = nameEnd;
+    while (nameStart > 0 && /[\w$]/.test(text[nameStart - 1])) nameStart--;
+    const name = text.slice(nameStart, nameEnd);
+    if (!name || NON_DECLARATION_NAMES.has(name)) {
+      segmentStart = open + 1;
+      cursor++;
+      continue;
+    }
+
+    const nameLine = lineAt(nameStart);
+    let declarationStart = Math.max(lineStarts[nameLine], segmentStart);
+    let prefix = text.slice(declarationStart, nameStart).trim();
+    if (!prefix && nameLine > 0 && segmentStart <= lineStarts[nameLine - 1]) {
+      const previousEnd = lineStarts[nameLine] - 1;
+      const previousStart = lineStarts[nameLine - 1];
+      const previousLine = text.slice(previousStart, previousEnd).trim();
+      if (previousLine) {
+        declarationStart = previousStart;
+        prefix = previousLine;
+      }
+    }
+    const validPrefix = language === 'C'
+      ? prefix.length > 0 && /^[\w \t*]+$/.test(prefix)
+      : prefix.length === 0 || /^[\w<>,?.[\] \t]+$/.test(prefix);
+    if (!validPrefix) {
+      segmentStart = open + 1;
+      cursor++;
+      continue;
+    }
+
+    let i = open + 1;
+    let depth = 1;
+    while (i < text.length && depth > 0) {
+      const char = text[i];
+      if (char === '"' || char === "'") i = skipQuoted(i);
+      else {
+        if (char === '(') depth++;
+        else if (char === ')') depth--;
+        i++;
+      }
+    }
+    if (depth > 0) break;
+
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (language === 'Dart') {
+      const asyncKeyword = text.startsWith('async', i) ? 'async'
+        : text.startsWith('sync', i) ? 'sync'
+        : '';
+      const afterKeyword = i + asyncKeyword.length;
+      if (asyncKeyword && !/[\w$]/.test(text[afterKeyword] ?? '')) {
+        i = afterKeyword;
+        if (text[i] === '*') i++;
+        while (i < text.length && /\s/.test(text[i])) i++;
+      }
+    }
+    if (text[i] !== '{') {
+      segmentStart = i;
+      cursor = i;
+      continue;
+    }
+
+    entries.push({
+      kind: 'function',
+      name,
+      signature: text.slice(declarationStart, i + 1).trim().replace(/\s+/g, ' ').slice(0, 120),
+    });
+
+    // Resume inside the body so Dart local functions (and GCC nested C functions)
+    // remain discoverable, matching the former line-anchored extractor.
+    segmentStart = i + 1;
+    cursor = i + 1;
+  }
+  return entries;
+}
+
+function extractExtraLangSignatures(language: string, content: string): ExtractedSignature[] {
+  const patterns = EXTRA_LANG_PATTERNS[language];
+  if (!patterns) return [];
+  const entries: ExtractedSignature[] = [];
+  const seen = new Set<string>();
+  for (const entry of scanBraceFunctions(language, content)) {
+    entries.push(entry);
+    seen.add(`${entry.kind}:${entry.name}`);
+  }
+  for (const { re, kind } of patterns) {
+    for (const m of content.matchAll(re)) {
+      if (entries.length >= MAX_SIGS_PER_FILE) break;
+      const name = m[1] ?? m[2];
+      if (!name || seen.has(`${kind}:${name}`)) continue;
+      seen.add(`${kind}:${name}`);
+      entries.push({ kind, name, signature: m[0].trim().replace(/\s+/g, ' ').slice(0, 120) });
+    }
+  }
+  return entries;
+}
+
+// ============================================================================
 // MAIN EXTRACTOR
 // ============================================================================
+
+/**
+ * Languages with a DEDICATED signature extractor (vs. the best-effort `extractGeneric`
+ * fallback every other language receives). Authoritative source for the `signatures`
+ * capability flag in the declarative language-support registry (change:
+ * add-declarative-language-support-registry). MUST list exactly the non-`default` cases
+ * of the {@link extractSignatures} switch below; a behavioral test asserts a fixture in
+ * each member yields ≥1 signature entry.
+ */
+export const SIGNATURE_LANGUAGES: ReadonlySet<string> = new Set<string>([
+  'Python', 'TypeScript', 'JavaScript', 'Go', 'Rust', 'Ruby', 'C++', 'Swift', 'Java',
+  'Terraform', 'Bicep', 'C#', 'Kotlin', 'PHP', 'C', 'Scala', 'Dart', 'Lua', 'Elixir', 'Bash',
+]);
 
 export function extractSignatures(filePath: string, content: string): FileSignatureMap {
   const language = detectLanguage(filePath);
   let entries: ExtractedSignature[];
+
+  const container = extractScriptContainer(filePath, content);
+  if (container) {
+    entries = container.lanes
+      .flatMap(lane => extractTypeScript(lane.content))
+      .slice(0, MAX_SIGS_PER_FILE);
+    return { path: filePath, language, entries };
+  }
 
   switch (language) {
     case 'Python':
@@ -704,6 +1107,23 @@ export function extractSignatures(filePath: string, content: string): FileSignat
       break;
     case 'Java':
       entries = extractJava(content);
+      break;
+    case 'Terraform':
+      entries = extractTerraformSignatures(content);
+      break;
+    case 'Bicep':
+      entries = extractBicepSignatures(content);
+      break;
+    case 'C#':
+    case 'Kotlin':
+    case 'PHP':
+    case 'C':
+    case 'Scala':
+    case 'Dart':
+    case 'Lua':
+    case 'Elixir':
+    case 'Bash':
+      entries = extractExtraLangSignatures(language, content);
       break;
     default:
       entries = extractGeneric(content);

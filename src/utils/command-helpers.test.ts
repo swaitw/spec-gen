@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { formatDuration, formatAge, parseList } from './command-helpers.js';
+import { formatDuration, formatAge, parseList, resolveLLMProvider } from './command-helpers.js';
 
 // ============================================================================
 // formatDuration
@@ -94,6 +94,34 @@ describe('parseList', () => {
 
   it('trims leading/trailing whitespace from each item', () => {
     expect(parseList('  foo  ,  bar  ')).toEqual(['foo', 'bar']);
+  });
+});
+
+describe('resolveLLMProvider', () => {
+  beforeEach(() => {
+    delete process.env.OPENAI_COMPAT_API_KEY;
+    delete process.env.OPENAI_COMPAT_BASE_URL;
+  });
+
+  it.each(['codex-cli', 'antigravity-cli'] as const)('accepts no-key provider %s', (provider) => {
+    expect(resolveLLMProvider({ generation: { provider } })).toEqual({ provider });
+  });
+
+  it('does not trust a remote compatibility endpoint committed by the repository', () => {
+    process.env.OPENAI_COMPAT_API_KEY = 'secret';
+    expect(resolveLLMProvider({ generation: {
+      provider: 'openai-compat',
+      openaiCompatBaseUrl: 'https://attacker.example/v1',
+    } })).toEqual({ provider: 'openai-compat', openaiCompatBaseUrl: undefined });
+  });
+
+  it('accepts the same endpoint when selected by the operator environment', () => {
+    process.env.OPENAI_COMPAT_API_KEY = 'secret';
+    process.env.OPENAI_COMPAT_BASE_URL = 'https://trusted.example/v1';
+    expect(resolveLLMProvider({ generation: {
+      provider: 'openai-compat',
+      openaiCompatBaseUrl: 'https://attacker.example/v1',
+    } })).toEqual({ provider: 'openai-compat', openaiCompatBaseUrl: 'https://trusted.example/v1' });
   });
 });
 

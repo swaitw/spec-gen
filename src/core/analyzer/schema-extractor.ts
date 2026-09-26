@@ -10,9 +10,13 @@
  * Uses regex-based analysis without requiring tree-sitter.
  */
 
-import { readFile } from 'node:fs/promises';
 import { extname, relative } from 'node:path';
 import { getSkeletonContent } from './code-shaper.js';
+import {
+  mapFilesBounded,
+  readSourceCapped,
+  type OversizedFileObserver,
+} from './bounded-file-scan.js';
 
 // ============================================================================
 // TYPES
@@ -24,7 +28,7 @@ export interface SchemaField {
   nullable: boolean;
 }
 
-export type OrmType = 'prisma' | 'typeorm' | 'drizzle' | 'sqlalchemy' | 'unknown';
+export type OrmType = 'prisma' | 'typeorm' | 'drizzle' | 'sqlalchemy' | 'jpa' | 'unknown';
 
 export interface SchemaTable {
   /** Model / table name */
@@ -66,7 +70,11 @@ function lineOfIndex(source: string, index: number): number {
 // ============================================================================
 
 // model User { ... }
-const PRISMA_MODEL_RE = /^model\s+(\w+)\s*\{([^}]+)\}/gm;
+// Body EXCLUDES `{` rather than being length-bounded: a Prisma model body contains no
+// nested braces, so excluding the opener makes the scan stop at the next `model X {`
+// instead of running to EOF (measured 2ms vs 4.8s for the bounded form on a hostile
+// file) — and, unlike a bound, it cannot silently drop a genuinely large model.
+const PRISMA_MODEL_RE = /^model\s+(\w+)\s*\{([^{}]+)\}/gm;
 // field line: fieldName  FieldType? @...
 const PRISMA_FIELD_RE = /^\s{1,4}(\w+)\s+(\w+)(\?)?/m;
 
@@ -106,7 +114,7 @@ function parsePrisma(source: string, rel: string): SchemaTable[] {
 
 // @Entity() ... class ClassName { ... }
 // We capture class name after @Entity decorator region.
-const TYPEORM_ENTITY_RE = /@Entity\s*\([^)]*\)[^]*?class\s+(\w+)/g;
+const TYPEORM_ENTITY_RE = /@Entity\s*\([^)]{0,400}\)[^]{0,20000}?class\s+(\w+)/g;
 // @Column() / @PrimaryGeneratedColumn() etc before fieldName: FieldType
 const TYPEORM_COLUMN_RE = /@(?:Column|PrimaryGeneratedColumn|PrimaryColumn|CreateDateColumn|UpdateDateColumn|DeleteDateColumn|ManyToOne|OneToMany|ManyToMany|OneToOne|JoinColumn|JoinTable)\s*\([^)]*\)\s*\n\s*(\w+)\s*[?!]?\s*:\s*([^;\n]+)/g;
 const TYPEORM_CLASS_BODY_RE = /class\s+\w+[^{]*\{([^]*?)^}/m;
@@ -150,7 +158,7 @@ function parseTypeOrm(source: string, rel: string): SchemaTable[] {
 // ============================================================================
 
 // export const users = pgTable('users', { ... })
-const DRIZZLE_TABLE_RE = /(?:export\s+(?:const|let)\s+(\w+)\s*=\s*)?(?:pgTable|mysqlTable|sqliteTable)\s*\(\s*['"`](\w+)['"`]\s*,\s*\{([^}]+)\}/g;
+const DRIZZLE_TABLE_RE = /(?:export\s+(?:const|let)\s+(\w+)\s*=\s*)?(?:pgTable|mysqlTable|sqliteTable)\s*\(\s*['"`](\w+)['"`]\s*,\s*\{([^}]{0,20000})\}/g;
 // fieldName: columnType(...)
 const DRIZZLE_FIELD_RE = /^\s{1,6}(\w+)\s*:\s*([\w.]+)\s*\(/m;
 
@@ -232,6 +240,96 @@ function parseSqlAlchemy(source: string, rel: string): SchemaTable[] {
 }
 
 // ============================================================================
+// JPA / HIBERNATE PARSER (.java files)
+// ============================================================================
+
+// @Entity / @MappedSuperclass marks a persistent class. javax.* and jakarta.*
+// both use the bare annotation name at the use site.
+const JPA_ENTITY_CLASS_RE = /@(?:Entity|MappedSuperclass)\b[\s\S]*?\bclass\s+(\w+)/;
+// @Table(name = "owners") → explicit table name (otherwise the class name).
+const JPA_TABLE_RE = /@Table\s*\([^)]*\bname\s*=\s*"([^"]+)"/;
+// A persistent field: `[modifiers] Type name [= …];` at class-body level.
+// Methods never match because a `;`/`=` must follow the name (methods have `(`).
+// The type capture excludes SPACE. With ' ' inside the class and `\s+` immediately
+// after it, every space was claimable by either side — an ambiguity that, combined
+// with the `(?:final\s+|…)*` prefix, made a long `private final final …` line
+// quadratic. Multi-word generic types still match via the explicit space group.
+const JPA_FIELD_RE =
+  /^(?:private|protected|public)\s+(?:final\s+|transient\s+|volatile\s+)*([\w.<>[\],]+(?:\s+[\w.<>[\],]+)*?)\s+(\w+)\s*[;=]/;
+
+/**
+ * Parse JPA / Hibernate entities from a Java source file. Captures the table
+ * name (from @Table or the class name) and the declared instance fields, with
+ * a best-effort nullable flag (JPA columns default to nullable unless marked
+ * @Id / @NotNull / @NotBlank / nullable = false). @Transient and static fields
+ * are skipped — they are not persisted.
+ */
+function parseJpaEntity(source: string, rel: string): SchemaTable[] {
+  const classMatch = source.match(JPA_ENTITY_CLASS_RE);
+  if (!classMatch) return [];
+
+  const name = classMatch[1];
+  const tableMatch = source.match(JPA_TABLE_RE);
+  const line = lineOfIndex(source, classMatch.index ?? 0);
+
+  const lines = source.split('\n');
+  const startLine = source.slice(0, classMatch.index ?? 0).split('\n').length - 1;
+  const fields: SchemaField[] = [];
+  const seen = new Set<string>();
+
+  let depth = 0;
+  let started = false;
+  let pendingAnn: string[] = [];
+
+  for (let i = startLine; i < lines.length; i++) {
+    const lineText = lines[i];
+    const trimmed = lineText.trim();
+
+    // Only inspect declarations directly inside the class body (depth 1), so
+    // calls and locals inside method bodies (depth ≥ 2) are ignored.
+    if (depth === 1 && trimmed) {
+      // Peel leading annotations into pendingAnn. They may be on their own line
+      // OR inline with the declaration (`@Id private Long id;`), so we strip them
+      // and then test whatever remains as a field — otherwise inline-annotated
+      // fields (very common, e.g. the @Id primary key) would be lost.
+      let rest = trimmed;
+      let am: RegExpMatchArray | null;
+      while ((am = rest.match(/^@[\w.]+(?:\([^)]*\))?\s*/))) {
+        pendingAnn.push(am[0].trim());
+        rest = rest.slice(am[0].length);
+      }
+
+      if (rest) {
+        const fieldMatch = rest.match(JPA_FIELD_RE);
+        const isStatic = /\bstatic\b/.test(rest);
+        const isTransient = /@Transient\b/.test(pendingAnn.join(' '));
+        if (fieldMatch && !isStatic && !isTransient) {
+          const fieldName = fieldMatch[2];
+          if (!isAuditField(fieldName) && !seen.has(fieldName)) {
+            seen.add(fieldName);
+            const ann = pendingAnn.join(' ');
+            const nullable = !(
+              /@(?:Id|NotNull|NotBlank|NotEmpty)\b/.test(ann) || /nullable\s*=\s*false/.test(ann)
+            );
+            fields.push({ name: fieldName, type: fieldMatch[1].trim(), nullable });
+          }
+        }
+        pendingAnn = [];
+      }
+      // else: the line was pure annotation(s) — keep pendingAnn for the next line.
+    }
+
+    const opens = (lineText.match(/\{/g) ?? []).length;
+    const closes = (lineText.match(/\}/g) ?? []).length;
+    depth += opens - closes;
+    if (opens > 0) started = true;
+    if (started && depth <= 0) break;
+  }
+
+  return [{ name: tableMatch ? tableMatch[1] : name, file: rel, orm: 'jpa', fields, line }];
+}
+
+// ============================================================================
 // PUBLIC API
 // ============================================================================
 
@@ -243,37 +341,44 @@ function parseSqlAlchemy(source: string, rel: string): SchemaTable[] {
  */
 export async function extractSchemas(
   filePaths: string[],
-  rootDir: string
+  rootDir: string,
+  onOversized?: OversizedFileObserver,
 ): Promise<SchemaTable[]> {
-  const results: SchemaTable[] = [];
+  // Per-file-then-flatten, over a BOUNDED scan. Returning each file's tables and flattening in
+  // `filePaths` order keeps the inventory a pure function of the file list; pushing into a shared
+  // array from inside the callbacks appended in I/O-completion order, which made the artifact's
+  // bytes depend on disk timing (change: fix-artifact-output-determinism) and would additionally
+  // have made the order depend on the scan's concurrency.
+  const perFile = await mapFilesBounded(filePaths, async (filePath): Promise<SchemaTable[]> => {
+    const ext = extname(filePath).toLowerCase();
+    const rel = relative(rootDir, filePath);
 
-  await Promise.all(
-    filePaths.map(async filePath => {
-      const ext = extname(filePath).toLowerCase();
-      const rel = relative(rootDir, filePath);
-      let source: string;
+    const raw = await readSourceCapped(filePath, undefined, onOversized);
+    if (raw === null) return [];
 
-      try {
-        source = getSkeletonContent(await readFile(filePath, 'utf-8'), ext === '.py' ? 'python' : 'typescript');
-      } catch {
-        return;
+    // Java entities are parsed from raw source — annotations and field
+    // declarations must survive intact (the TS/Py skeletonizer would mangle them).
+    if (ext === '.java') {
+      return /@(?:Entity|MappedSuperclass)\b/.test(raw) ? parseJpaEntity(raw, rel) : [];
+    }
+
+    const source = getSkeletonContent(raw, ext === '.py' ? 'python' : 'typescript');
+
+    if (ext === '.prisma') {
+      return parsePrisma(source, rel);
+    } else if (ext === '.py' && (source.includes('Column(') || source.includes('mapped_column('))) {
+      return parseSqlAlchemy(source, rel);
+    } else if (ext === '.ts' || ext === '.tsx') {
+      if (source.includes('@Entity(') || source.includes('@Entity()')) {
+        return parseTypeOrm(source, rel);
+      } else if (/pgTable|mysqlTable|sqliteTable/.test(source)) {
+        return parseDrizzle(source, rel);
       }
+    }
+    return [];
+  });
 
-      if (ext === '.prisma') {
-        results.push(...parsePrisma(source, rel));
-      } else if (ext === '.py' && (source.includes('Column(') || source.includes('mapped_column('))) {
-        results.push(...parseSqlAlchemy(source, rel));
-      } else if (ext === '.ts' || ext === '.tsx') {
-        if (source.includes('@Entity(') || source.includes('@Entity()')) {
-          results.push(...parseTypeOrm(source, rel));
-        } else if (/pgTable|mysqlTable|sqliteTable/.test(source)) {
-          results.push(...parseDrizzle(source, rel));
-        }
-      }
-    })
-  );
-
-  return results;
+  return perFile.flat();
 }
 
 /**

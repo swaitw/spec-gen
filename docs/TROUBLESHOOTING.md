@@ -1,28 +1,32 @@
 # Troubleshooting Guide
 
-Common issues and solutions when using spec-gen.
+Common issues and solutions when using openlore.
+
+> **Start here:** run `openlore doctor`. It checks your Node version, git repo, config,
+> index freshness, MCP wiring, and LLM/embedding setup,
+> and prints the exact command to fix anything that is missing.
 
 ## Installation Issues
 
 ### CLI Not Found
 
-**Problem**: `spec-gen` command not recognized after install
+**Problem**: `openlore` command not recognized after install
 
 **Solution**:
 ```bash
-cd spec-gen
+cd openlore
 npm install && npm run build && npm link
 ```
 If `npm link` requires permissions: `sudo npm link`
 
 ### Skill Not Found (Claude Code)
 
-**Problem**: `/spec-gen` command not recognized in Claude Code
+**Problem**: `/openlore` command not recognized in Claude Code
 
 **Solution**:
 1. Verify the skill file exists:
    ```bash
-   ls -la .claude/skills/spec-gen.md
+   ls -la .claude/skills/openlore.md
    ```
 2. Check file permissions are readable
 3. Restart Claude Code session
@@ -62,15 +66,15 @@ Only `generate`, `verify`, and `drift --use-llm` require an API key. Commands li
 1. **Verify the URL is valid and includes the version path**:
    ```bash
    # Correct:
-   spec-gen generate --api-base http://localhost:8000/v1
+   openlore generate --api-base http://localhost:8000/v1
 
    # Wrong (missing /v1):
-   spec-gen generate --api-base http://localhost:8000
+   openlore generate --api-base http://localhost:8000
    ```
 
 2. **For self-signed certificates**:
    ```bash
-   spec-gen generate --api-base https://internal.corp.net/v1 --insecure
+   openlore generate --api-base https://internal.corp.net/v1 --insecure
    ```
 
 3. **Check that the server is running and reachable**:
@@ -81,7 +85,7 @@ Only `generate`, `verify`, and `drift --use-llm` require an API key. Commands li
 4. **Local servers often need a dummy API key**:
    ```bash
    export OPENAI_API_KEY=dummy-key
-   spec-gen generate --api-base http://localhost:8000/v1
+   openlore generate --api-base http://localhost:8000/v1
    ```
 
 ### SSL Certificate Error
@@ -90,9 +94,9 @@ Only `generate`, `verify`, and `drift --use-llm` require an API key. Commands li
 
 **Solution**: Use the `--insecure` flag or set `sslVerify: false` in config:
 ```bash
-spec-gen generate --insecure
+openlore generate --insecure
 ```
-Or in `.spec-gen/config.json`:
+Or in `.openlore/config.json`:
 ```json
 {
   "llm": {
@@ -105,7 +109,7 @@ Or in `.spec-gen/config.json`:
 
 ### Wrong Provider Selected
 
-**Problem**: spec-gen is using Anthropic when you want OpenAI (or vice versa)
+**Problem**: openlore is using Anthropic when you want OpenAI (or vice versa)
 
 **How provider selection works**: If `ANTHROPIC_API_KEY` is set, Anthropic is used. Otherwise, if `OPENAI_API_KEY` is set, OpenAI is used. To force a specific provider, only set that provider's API key.
 
@@ -115,7 +119,7 @@ Settings are resolved in this order (first match wins):
 
 1. CLI flags (`--api-base`, `--insecure`)
 2. Environment variables (`OPENAI_API_BASE`, `ANTHROPIC_API_BASE`)
-3. Config file (`.spec-gen/config.json` → `llm.apiBase`, `llm.sslVerify`)
+3. Config file (`.openlore/config.json` → `llm.apiBase`, `llm.sslVerify`)
 4. Provider defaults (`https://api.anthropic.com/v1` or `https://api.openai.com/v1`)
 
 ## Generation Issues
@@ -128,12 +132,12 @@ Settings are resolved in this order (first match wins):
 
 **Solution**: Upgrade to v1.2.7+:
 ```bash
-npm install -g spec-gen-cli@latest
+npm install -g openlore@latest
 ```
 
 ### No Domains Detected
 
-**Problem**: spec-gen says "Could not identify any domains"
+**Problem**: openlore says "Could not identify any domains"
 
 **Possible Causes**:
 1. Very flat project structure
@@ -145,17 +149,17 @@ npm install -g spec-gen-cli@latest
 - Check that source files aren't all in root
 - Consider manual domain hints in instructions:
   ```
-  /spec-gen
+  /openlore
   Consider these domains: user, order, payment
   ```
 
 ### Too Many Domains Generated
 
-**Problem**: spec-gen creates specs for every directory
+**Problem**: openlore creates specs for every directory
 
 **Solution**: Add guidance to limit scope:
 ```
-/spec-gen
+/openlore
 Focus on core business domains only. Ignore utilities, helpers, and infrastructure.
 ```
 
@@ -235,7 +239,7 @@ Focus on core business domains only. Ignore utilities, helpers, and infrastructu
 
 ### Generation Takes Too Long
 
-**Problem**: spec-gen seems stuck or very slow
+**Problem**: openlore seems stuck or very slow
 
 **Possible Causes**:
 1. Very large codebase
@@ -245,12 +249,12 @@ Focus on core business domains only. Ignore utilities, helpers, and infrastructu
 **Solutions**:
 - Add exclusions for large directories:
   ```
-  /spec-gen
+  /openlore
   Exclude: node_modules, dist, build, coverage, .git
   ```
 - Focus on specific directories:
   ```
-  /spec-gen
+  /openlore
   Focus on src/core and src/services only
   ```
 
@@ -263,6 +267,34 @@ Focus on core business domains only. Ignore utilities, helpers, and infrastructu
 2. Reduce scope per run
 3. Use the agents.md approach which can work incrementally
 
+### Watch Mode Reports a Stale Region
+
+**Problem**: A watcher debug line reports files as stale, or a recalled anchor has
+`staleRegion: true`.
+
+**Cause**: One edit affected more reverse dependencies than the incremental closure budget can
+recompute without stalling the watcher. OpenLore recomputes the most structurally significant
+files first and explicitly marks every deferred file stale. The reported hub/chokepoint counts
+and top symbol describe the affected region; they do not make a low-significance stale result
+authoritative.
+
+**Solution**: Let the scheduled background rebuild converge. If it cannot run, execute:
+
+```bash
+openlore analyze --reanalyze
+```
+
+The ordering uses fan-in/fan-out from the graph being updated, so it is a best-effort priority
+signal and may temporarily be a lower bound after recent edits. Files with no usable signal fall
+back to stable path order. Test callers receive a bounded budget slot so test-to-production
+reachability is not systematically deferred.
+
+If a closure phase has only one remaining budget slot, it cannot reserve work for both production
+and test callers. This can happen with an explicitly small `closureBudget`, or when direct callers
+consume most of the default budget before Class-P rebind candidates are discovered. OpenLore keeps
+the highest-significance production caller, and the debug summary discloses that test reachability
+was deferred.
+
 ## Drift Detection Issues
 
 ### No Base Branch Detected
@@ -271,9 +303,9 @@ Focus on core business domains only. Ignore utilities, helpers, and infrastructu
 
 **Solution**: Specify the base branch explicitly:
 ```bash
-spec-gen drift --base main
+openlore drift --base main
 # or
-spec-gen drift --base develop
+openlore drift --base develop
 ```
 
 ### Too Many False Positives
@@ -282,7 +314,7 @@ spec-gen drift --base develop
 
 **Solution**: Use LLM-enhanced mode to filter non-relevant changes:
 ```bash
-spec-gen drift --use-llm
+openlore drift --use-llm
 ```
 This sends each diff to the LLM for semantic analysis, classifying changes as relevant or not.
 
@@ -291,10 +323,10 @@ This sends each diff to the LLM for semantic analysis, classifying changes as re
 **Problem**: Pre-commit hook blocks commits unexpectedly
 
 **Solutions**:
-1. Check current drift status: `spec-gen drift`
+1. Check current drift status: `openlore drift`
 2. Lower the fail threshold: edit the hook to use `--fail-on error` instead of `--fail-on warning`
 3. Temporarily bypass: `git commit --no-verify` (use sparingly)
-4. Remove the hook: `spec-gen drift --uninstall-hook`
+4. Remove the hook: `openlore drift --uninstall-hook`
 
 ### Drift Not Detecting Changes
 
@@ -307,28 +339,28 @@ This sends each diff to the LLM for semantic analysis, classifying changes as re
 
 **Debug**: Run with `--verbose` to see what's being analyzed:
 ```bash
-spec-gen drift --verbose
+openlore drift --verbose
 ```
 
 ## Integration Issues
 
 ### Existing OpenSpec Conflict
 
-**Problem**: spec-gen overwrites existing specs
+**Problem**: openlore overwrites existing specs
 
 **Solution**: The tool should backup existing files, but you can also:
 ```
-/spec-gen
+/openlore
 Do not overwrite existing specs. Only create new ones.
 ```
 
 ### Config.yaml Conflicts
 
-**Problem**: spec-gen changes break existing config
+**Problem**: openlore changes break existing config
 
 **Solution**: Review changes before accepting:
 ```
-/spec-gen
+/openlore
 Show me what you would add to config.yaml before making changes.
 ```
 
@@ -338,7 +370,7 @@ Show me what you would add to config.yaml before making changes.
 
 Set `DEBUG=1` for stack traces on errors:
 ```bash
-DEBUG=1 spec-gen generate
+DEBUG=1 openlore generate
 ```
 
 ### Still Stuck?
@@ -349,14 +381,14 @@ DEBUG=1 spec-gen generate
    - [Architecture](./ARCHITECTURE.md) — Internal design
    - [OpenSpec Integration](./OPENSPEC-INTEGRATION.md) — Ecosystem integration
 
-2. **File an issue** on [GitHub](https://github.com/clay-good/spec-gen/issues):
+2. **File an issue** on [GitHub](https://github.com/clay-good/openlore/issues):
    - Include: Project type, error message, relevant code structure, Node.js version
    - Don't include: Sensitive code, API keys, or credentials
 
 3. **Try manual approach**:
    - Use the spec format reference
    - Write specs manually for problematic areas
-   - Let spec-gen handle the clearer parts
+   - Let openlore handle the clearer parts
 
 ## Known Limitations
 

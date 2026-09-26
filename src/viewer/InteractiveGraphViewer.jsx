@@ -7,6 +7,7 @@ import {
   parseGraph,
   enrichGraphWithRefactors,
   computeBlast,
+  selectionBelongsToCluster,
 } from './utils/graph-helpers.js';
 import { FlatGraph } from './components/FlatGraph.jsx';
 import { ClusterGraph } from './components/ClusterGraph.jsx';
@@ -15,13 +16,16 @@ import { FilterBar } from './components/FilterBar.jsx';
 import { ArchitectureView } from './components/ArchitectureView.jsx';
 import { Hint, SL, Row, Chip, KindBadge } from './components/MicroComponents.jsx';
 import { ChatPanel } from './components/ChatPanel.jsx';
+import { FreshnessBanner } from './components/FreshnessBanner.jsx';
 import { THEMES, THEME_KEYS, DEFAULT_THEME } from './utils/themes.js';
+import { freshnessFromResponse, mergeFreshness } from './utils/freshness.js';
 
 export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '/api/spec' }) {
   const [rawGraph, setRawGraph] = useState(null);
   const [llmCtx, setLlmCtx] = useState(null);
   const [refReport, setRefReport] = useState(null);
   const [classData, setClassData] = useState(null);
+  const [freshness, setFreshness] = useState(null);
   const [selectedClass, setSelectedClass] = useState(null); // full class object
   const selectedClassId = selectedClass?.id ?? null;
   const [focusedPaths, setFocusedPaths] = useState([]);
@@ -49,7 +53,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   const [loaded, setLoaded] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [themeName, setThemeName] = useState(
-    () => localStorage.getItem('spec-gen-theme') || DEFAULT_THEME
+    () => localStorage.getItem('openlore-theme') || DEFAULT_THEME
   );
   const theme = THEMES[themeName] ?? THEMES[DEFAULT_THEME];
   const clusterPalette = themeName === 'light' ? CLUSTER_PALETTE_LIGHT : CLUSTER_PALETTE;
@@ -64,7 +68,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   const cycleTheme = () => setThemeName((prev) => {
     const idx = THEME_KEYS.indexOf(prev);
     const next = THEME_KEYS[(idx + 1) % THEME_KEYS.length];
-    localStorage.setItem('spec-gen-theme', next);
+    localStorage.setItem('openlore-theme', next);
     return next;
   });
   const fileRef = useRef();
@@ -110,6 +114,11 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
     setSpecReqs(parseSpecRequirements(mdStr));
   }, []);
 
+  const observeFreshness = useCallback((response) => {
+    const observed = freshnessFromResponse(response);
+    if (observed) setFreshness((current) => mergeFreshness(current, observed));
+  }, []);
+
   const mappingRef = useRef();
   const specRef = useRef();
 
@@ -120,22 +129,24 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
       try {
         const res = await fetch(graphUrl);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        observeFreshness(res);
         const text = await res.text();
         loadGraph(text);
 
         try {
           const ctxRes = await fetch('/api/llm-context');
-          if (ctxRes.ok) setLlmCtx(await ctxRes.json());
+          if (ctxRes.ok) { observeFreshness(ctxRes); setLlmCtx(await ctxRes.json()); }
         } catch { /* ignore */ }
 
         try {
           const cgRes = await fetch('/api/class-graph');
-          if (cgRes.ok) setClassData(await cgRes.json());
+          if (cgRes.ok) { observeFreshness(cgRes); setClassData(await cgRes.json()); }
         } catch { /* ignore */ }
 
         try {
           const refRes = await fetch('/api/refactor-priorities');
           if (refRes.ok) {
+            observeFreshness(refRes);
             const report = await refRes.json();
             setRefReport(report);
           }
@@ -143,7 +154,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
 
         try {
           const mRes = await fetch('/api/mapping');
-          if (mRes.ok) loadMapping(await mRes.text());
+          if (mRes.ok) { observeFreshness(mRes); loadMapping(await mRes.text()); }
         } catch { /* ignore */ }
         try {
           const srRes = await fetch('/api/spec-requirements');
@@ -161,7 +172,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
         console.error('Failed to load graph from', graphUrl, e);
       }
     })();
-  }, [graphUrl, mappingUrl, specUrl, loadGraph]);
+  }, [graphUrl, mappingUrl, specUrl, loadGraph, observeFreshness]);
 
   const handleFile = (e) => {
     const f = e.target.files[0];
@@ -268,12 +279,20 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
   );
 
   const toggleCluster = useCallback((cid) => {
+    const collapsing = expandedClusters.has(cid);
+    // If we're collapsing the cluster that holds the selected node, clear the
+    // selection — otherwise its edges keep rendering from the (now empty)
+    // cluster center as ghost edges. Mirrors the chat-collapse guard above.
+    if (collapsing && selectionBelongsToCluster(graph, selectedId, cid)) {
+      setSelectedId(null);
+      setAffectedIds([]);
+    }
     setExpandedClusters((prev) => {
       const next = new Set(prev);
       next.has(cid) ? next.delete(cid) : next.add(cid);
       return next;
     });
-  }, []);
+  }, [expandedClusters, selectedId, graph]);
 
   const clearSelection = useCallback(() => {
     setSelectedId(null);
@@ -798,6 +817,8 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
           }}
         />
       </div>
+
+      <FreshnessBanner freshness={freshness} />
 
       {/* Filter bar */}
       {viewMode !== 'architecture' && viewMode !== 'classes' && (
@@ -1374,7 +1395,7 @@ export default function App({ graphUrl, mappingUrl = '/api/mapping', specUrl = '
                             <div style={{ padding: '7px 9px', fontSize: 8, color: 'var(--tx-faint)' }}>
                               {req
                                 ? 'Requirement title mismatch — spec section not found in the spec file.'
-                                : <>Spec not loaded — run <code style={{ color: 'var(--ac-primary)' }}>spec-gen view</code> or load <code style={{ color: 'var(--ac-primary)' }}>spec.md</code> manually.</>}
+                                : <>Spec not loaded — run <code style={{ color: 'var(--ac-primary)' }}>openlore view</code> or load <code style={{ color: 'var(--ac-primary)' }}>spec.md</code> manually.</>}
                             </div>
                           )}
                           <div

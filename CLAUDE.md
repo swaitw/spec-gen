@@ -1,66 +1,125 @@
-@.spec-gen/analysis/CODEBASE.md
+@.openlore/analysis/CODEBASE.md
 @openspec/specs/overview/spec.md
 
-# spec-gen MCP tools — when to use them
+# openlore MCP tools — when to use them
 
 | Situation | Tool |
 |-----------|------|
 | Starting any new task | `orient` — returns functions, files, specs, call paths, and insertion points in one call |
 | Don't know which file/function handles a concept | `search_code` |
 | Need call topology across many files | `get_subgraph` / `analyze_impact` |
+| "Which tests must I run for this change?" | `select_tests` — backward reachability to the reaching tests, plus changed and new test files, each with a reason |
+| "Which important code has NO test reaching it?" / "is the risky part of this change untested?" | `report_coverage_gaps` (opt-in `--preset full`) — the structural inverse of `select_tests` over the whole graph: functions in no test's reachable set, ranked by hub/chokepoint significance (no runtime, no coverage tool). SOUND DIRECTION ONLY — reports "no reaching test", never claims a symbol is "tested" (reachable-from-a-test ≠ behavior-verified). A gap with no caller at all is labeled also-dead (distinct from `find_dead_code`); an untested entry point is untested-not-dead. Scope to a diff (`changedSymbols`/`diffRef`) or region (`filePattern`). Distinct from `get_test_coverage` (spec-tag based). CLI: `openlore coverage-gaps` |
+| "What's the blast radius of my diff before I commit?" | `blast_radius` — one advisory briefing: callers/layers, tests to run, anchored memories/decisions that will drift, stale specs |
+| "Post a deterministic structural review on a PR" (CLI, no MCP/agent) | `openlore review` — composes `structural_diff` + `blast_radius` into a Markdown/JSON briefing; bundled GitHub Action posts it as one sticky comment. Advisory by default; opt-in gating via `blastRadius.block`. No new MCP tool |
+| "What's unreachable / what dies if I delete X?" | `find_dead_code` — cross-language reachability (candidates) |
+| Reviewing a change: structural delta + stale callers | `structural_diff` |
+| "Did my diff escape its declared write-footprint, and what conflict did that open?" | `structural_diff` with an opt-in `declaredFootprint` (+ `peerFootprints`) — the back-side of `plan_parallel_work`: flags symbols modified outside the declared write-set (out-of-scope / read-set-intrusion / scope-creep), names peers an escape newly conflicts with, and verifies declared `append`s against the realized diff. Advisory; opt-in blocking via `enforcement.policy`. No new tool (change: add-footprint-escape-detection) |
+| "What changes together with this / what's volatile?" | `get_change_coupling` — co-change + churn from git |
+| Lay of the land / where do regions connect? | `get_map` (region view; pass a communityId to drill in) |
+| Find the route from A to B (by name, role, or landmark) | `find_path` (cheapest call path + alternates) |
 | Planning where to add a feature | `suggest_insertion_points` |
 | Reading a spec before writing code | `get_spec` |
+| "Which requirements actually link to code, and which are unmapped/ambiguous/stale?" | `get_mapping` — the deterministic spec link index: requirement→code links derived from the exact `- **Implementation**: \`symbol::path\`` anchors written in the specs, resolved against the current graph. NO LLM, no embeddings, no name similarity: an anchor resolving to one symbol is `linked`, to several is `ambiguous` (candidates disclosed, none selected), to none is `stale`, and a requirement with no exact anchor is `unmapped`. A file-only reference is domain-footprint evidence and NEVER function coverage. `mapping.json` is a rebuildable CACHE, never a prerequisite — an absent, legacy, corrupt, or provenance-mismatched cache is re-derived in memory, so Repair works on a repo that never ran standalone generation. CLI: `openlore mapping refresh` (change: harden-spec-workflow-lifecycle) |
 | Checking if code still matches spec | `check_spec_drift` |
 | Finding spec requirements by meaning | `search_specs` |
 | Checking spec coverage before starting a feature | `audit_spec_coverage` |
 | Recording an architectural decision before writing code | `record_decision` |
+| Persisting a durable, code-anchored fact for later sessions | `remember` (opt-in `memory` preset) — anchors a note to a symbol/file so it self-invalidates; optional `type` (invariant/gotcha/rationale/…, default note) and `supersedes=<id>` to retire a prior memory (kept queryable via `asOf`); re-recording the same content+anchor updates in place |
+| Recalling what's known about code you're touching | `recall` (opt-in `memory` preset) — returns memories with a freshness verdict and a factual served-content provenance class (`local-unreviewed` for locally recorded notes; reviewed decisions are `reviewed-corpus`); recorded text is never rewritten. It never serves orphaned records as authoritative; two authoritative memories on one symbol surface in `unreconciled`; an authoritative memory that cites a superseded decision carries a `staleDecisionRef` signal (and is not presented as cleanly fresh); optional `asOf`/`changedSince` (commit-ish) for history and a `type` filter. A memory whose anchored symbol was renamed/moved is carried forward at the next `openlore analyze` (change `add-symbol-identity-continuity`): recall re-points it and surfaces `carriedAcross` provenance instead of orphaning it; an ambiguous move stays orphaned but discloses `possiblyMovedTo` candidates |
+| About to assert a structural fact to a user ("X is dead", "Y calls Z", "this is safe to change") — or cite a decision ("ADR abc12345 governs this") | `verify_claim` (opt-in `verify` preset) — verify the claim against the graph, then cite the receipt to the human; an `unverifiable` verdict means hedge or read the source. The `decision-current` kind (subject = an 8-char decision id) verifies a decision is still authoritative against the decision store: `refuted` (with the live superseder to cite instead) if it was superseded/rejected — catch a stale citation before it reaches the human |
+| "Is my external spec store's binding to its code repos healthy?" | `spec_store_status` (opt-in `federation` preset) — read-only health of the `.openlore/config.json` `specStore` binding: per-target resolution + index freshness, reference presence, conclusion-shaped findings with stable codes and `local-unreviewed` provenance for config-derived names; never blocks |
+| "Assemble the structural context an active change needs across its target repos" | `working_set_context` (opt-in `federation` preset) — `orient` generalized from one repo to a change's spec-store targets: reads the change's proposal, orients each indexed target on that intent, returns ONE token-budgeted, per-target-attributed briefing (symbols, callers, spec domains, insertion points) + fresh in-scope anchored intent (orphaned withheld, drifted flagged); read-only, never blocks |
+| "Certify what my change touches before it lands — does it open a new path into a sensitive boundary?" | `change_impact_certificate` (opt-in `federation` preset) — ONE conclusion-shaped certificate for the current diff: blast radius, the paths the change NEWLY OPENS into each declared covering surface (reachable after but not before — differential, no LLM), drifted specs, tests to run. Decays via the freshness lease (anchored to touched symbols; the spec-store health check re-fires a stale one). Advisory; opt-in blocking only on a configured surface severity. Declare surfaces under `impactCertificate.surfaces` in `.openlore/config.json`. Also `openlore impact-certificate [--base <ref>] [--change <id>] [--json] [--hook] [--save]` |
+| "Did my change break my consumers' public API contract?" | `certify_public_surface` (opt-in `--preset full`) — with NO base ref returns the PUBLIC SURFACE (exported symbols + signatures); with a base ref returns a deterministic breaking-change VERDICT for the working-tree diff: each changed export classified `breaking | non-breaking | potentially-breaking` (removed/renamed export, added required param, narrowed param/return type) with stable rule codes on breaking/potentially-breaking changes and added exports (`export-removed`, `param-type-narrowed`, …) and a `suggestedBump` (major/minor/patch, withheld when compatibility is unproven); each breaking rule code and `signature-unprovable` is a registered governance finding (`findings[]`) the caller that runs the tool can gate per rule with `enforcement.policy` (`openlore enforce` does not run it), each breaking one paired with the consumers it breaks and split into `breaking-consumed` / `breaking-unconsumed-in-index` (never "safe"; `federation` also counts indexed sibling repos), plus an overall summary; breakages accepted with a justification in the checked-in `.openlore/public-surface-baseline.jsonl` (`--accept`) are listed as accepted, not findings, until their anchored decision is superseded. Conservative by construction — a change it cannot PROVE compatible is `potentially-breaking`, never silently safe (no type checker, no build). A renamed export is reported as a rename (not remove+add) via symbol-identity continuity. External/unindexed consumers are disclosed as a known-unknowable boundary, not implied absent. Signature classification: TypeScript/JavaScript/Python (others fail-soft, surface membership only). Distinct from `change_impact_certificate` (paths into a surface) — this certifies the exported contract's *shape*. Also `openlore certify-public-surface [--base <ref>] [--max <n>] [--federation] [--accept --justification <why> [--decision <id>]] [--json]` (changes: add-public-api-surface-contract, add-public-surface-acceptance-baseline) |
+| "How does this codebase actually write code — so my edit matches the house style?" | `get_style_fingerprint` (opt-in `--preset full`) — a DESCRIPTIVE, deterministic idiom profile measured during the AST walk (no second parse, no LLM): per language, the dominant choice for a fixed set of idioms (arrow vs. declared function, `const` vs. `let`, ternary vs. `if`, `await` vs. `.then`, template vs. concatenation, function-naming case) as `{ dominant, ratio, samples }`. Repository profile by default; `communityId` for a region (from `get_map`) or `filePath` for one file. HONEST: an idiom below a fixed evidence floor, or one the language/formatter enforces (e.g. Go ties identifier case to visibility → `enforced` null), reports a null signal, never a guess or a `1.0` tautology. Descriptive, not prescriptive — no lint judgment, no composite style score. Languages: TypeScript/JavaScript/Python/Go (others fail-soft, no counters). `orient` also carries a compact `regionStyle` summary for the touched region. Also `openlore style-fingerprint [--community <id>] [--file <path>] [--language <name>] [--json]` (change: add-codebase-style-fingerprint) |
+| "I'm about to write this function — does a near-duplicate already exist that I should reuse?" | `find_clones` (opt-in `--preset full`) — the edit-time, SCOPED companion to `get_duplicate_report` (which is the whole-repo audit of every clone group). Takes ONE query: a `symbol` (a function in the index, `name` or `name::path`) or a `snippet` (raw code NOT necessarily indexed — the pre-write "does this already exist?" check the whole-repo report structurally cannot do). Returns the existing clones ranked exact > structural > near (each naming the file, function, line range, type, similarity, and language — a cross-language `near` match is flagged) — the canonical implementation to reuse. Reuses the same detector as `get_duplicate_report` (no new algorithm/constant), but ONE-VS-ALL (O(n)), so it finds near-clones even where the whole-repo O(n²) pass is skipped. HONEST: unknown symbol → explicit not-found (+candidates), never an empty "unique"; ambiguous bare name → `name::path` candidates; below-evidence-floor query → "too small to compare", not "no clones"; the query never matches itself; a symbol with no comparable body (HTML inline-script / external) says so. Computed live from the cached graph + a re-read of the source it spans (no new artifact). Also `openlore find-clones [--symbol <name> | --snippet <code>] [--min <ratio>] [--max <n>] [--json]` (change: add-clone-query-tool) |
+| "What exceptions can blow out of this function — and is any already handled?" / "I changed this to throw; who's exposed and where is it caught?" | `analyze_error_propagation` (opt-in `--preset full`) — the error-handling analogue of `analyze_impact`: given a `symbol` (`name` or `name::path`), returns `escapes` (the exception types that can propagate OUT to callers — each with origin function/file/line, direct-vs-propagated, and the call path) and `handledInternally` (exceptions thrown in the reachable subtree but caught within this function, so callers are shielded). SCOPE: TypeScript/JavaScript/Python; a symbol in any other language returns an explicit `unsupported` result, NEVER an empty escape set. HONEST — a SOUND LOWER BOUND: an un-analyzable callee (external/bodyless/unsupported/over-bound) is disclosed in `boundaries`, never assumed exception-free; an intra-object `this.`/`super.`/`self.`/`cls.` call the call graph could not resolve to an indexed method is disclosed too (the one call shape that gets neither a resolved nor an `external::` edge — never silently assumed exception-free); a re-raise/throw of unknowable static type is `<dynamic>`, never dropped; Python typed `except` is matched by exact name only (no subclass hierarchy), disclosed; `maxDepth`/function-cap truncation is disclosed. Reuses the CFG overlay's throw/try node-type knowledge (no new grammar) and is computed live from the cached graph + a source re-read (no new artifact, no schema change). Also `openlore error-propagation [--symbol <name>] [--max-depth <n>] [--json]` (change: add-error-propagation-graph) |
+| "What breaks if I remove or rename this env var?" / "who reads `DATABASE_URL` and what's the blast radius?" | `analyze_env_impact` (opt-in `--preset full`) — the configuration analogue of `analyze_impact`: given an env var `name`, returns the line-precise `readSites` (file/line/enclosing function; a read outside any function is reported module-level), `affectedFunctions` (upstream callers that transitively reach a read — the blast radius), `reachingTests` to run, `declaredInEnvFile`, and per-site `required` (a read with no site-local fallback `??`/`||`/strict subscript is a hard break; a read with a fallback is soft). SCOPE: environment-variable reads in TypeScript/JavaScript/Python/Go/Ruby (exactly what the env extractor scans) — config-object key reads (`config.x.y`) are a disclosed OUT-OF-SCOPE boundary, never guessed. HONEST: an unknown var returns not-found + candidates (never an empty "unused"); module-level reads, the call graph's resolution limits, and a stale index (read-site lines from current source vs. cached spans → a `staleness` marker + boundary) are disclosed in `boundaries`, so the blast radius is a SOUND LOWER BOUND. Reuses the existing env-var patterns (no new grammar) + the cached graph's backward reachability; computed live from a re-read of the var's files (no new artifact). The conclusion companion to the `get_env_vars` inventory. Also `openlore env-impact [--name <var>] [--max-depth <n>] [--json]` (change: add-env-config-impact-graph) |
+| "A lot changed in this repo since I last looked — what actually matters?" (review / catch-up / onboarding) | `briefing_since` (opt-in `--preset full`) — the catch-up counterpart to `blast_radius`/`change_impact_certificate` (which brief *your own* pending diff): given a base ref, returns the changed production symbols SINCE it, ranked into a fixed tier order — `surprising-change` (a high-fan-in hub whose file rarely changed before) > `hub-change` (a broad high-fan-in/high-fan-out hub) > `chokepoint-change` (a high-fan-in funnel) > `ordinary-change`. Tiers come ENTIRELY from existing classifiers (`landmark-signals` hub/orchestrator/chokepoint + the `volatilityLevel` churn classifier) plus raw evidence (fan-in, fan-out, prior churn) — NO weighted score, NO new tuning constant. HONEST: changed symbols are exact where both revisions hash cleanly (a formatting- or comment-only edit is not a change; a rename is listed under `carried`), and a file kept whole names its reason in `changeGranularity` (change: add-symbol-content-hashes); the `surprising-change` label is WITHHELD when history is too shallow (`< 2` non-bulk commits) to say "rarely changed before"; a bounded briefing carries a truncation receipt (omitted count + lowest tier) and NEVER drops a higher tier for a lower one; a silent base-ref fallback is disclosed (a `baseRef` git can't resolve reports `baseRefFallback`, not a quiet brief against `main`); the file-path-exact churn join (git doesn't follow renames) is caveated when it could over-flag a renamed file; scope is hand-authored source code (IaC/generated/vendored excluded — same candidate set as `report_coverage_gaps`). Grouped by region, with the tests to run for the whole change set (via `select_tests`). The cursor is the base ref, never wall-clock time. Also `openlore briefing-since [--base <ref>] [--file-pattern <substr>] [--max <n>] [--json]` (change: add-change-significance-briefing) |
+| "Which of these N tasks can I run in parallel across agents/worktrees, and in what order?" | `plan_parallel_work` (opt-in `coordination` preset) — given a caller-supplied task list (`{ id, seedSymbols?, seedFiles?, writeMode? }`), returns the computed plan: a hazard-typed conflict graph (WAW / shared-append / RAW / WAR / soft-coupling), a wave schedule (wave 1 = dispatch now), and the critical path (minimum sequential rounds with unlimited agents). Stateless and advisory — re-invoke with the remaining tasks to re-plan; no lease, no dispatch. Mark registration-site touches (a dispatcher case, a registry array) `writeMode:"append"` so they are not falsely serialized. WAW conflicts and unorderable RAW cycles surface as policy-shaped governance findings (`parallel-work-conflict` / `parallel-work-cycle`) the invoking caller can gate on via `resolveEnforcementClass`; the bundled `openlore enforce` commit gate does not run the planner, so it never blocks on them |
+| "Which changes already in flight — humans' branches/PRs and my agents' tasks — collide right now, within or across the federation?" | `map_in_flight_conflicts` (opt-in `coordination`/`federation` preset) — the *team* version of `plan_parallel_work`: instead of a caller-supplied task list it harvests every in-flight change (local branches, open PRs via `gh`, plus any supplied agent task descriptors) and runs the same hazard classifier across all of them. Each footprint is derived from the change's ACTUAL diff — per-symbol `append` vs `modify` read off the hunks — so two PRs appending disjoint registry entries resolve to `shared-append`, not a false WAW, with no `writeMode` declaration. Returns per conflict: the two actors, hazard class, shared symbols, a suggested landing order ("land #210 first; it shares `resolveCallSite`'s write-set"), and a `textualMerge` verdict from a read-only `git merge-tree` simulation (`textual-conflict` / `clean-automerge` / `not-assessed`). A change whose diff can't be fetched or whose symbols don't resolve is labeled "not assessed", never "no conflict". Read-only, stateless (no watcher/poll/store), advisory; opt-in `federation` matches across repo boundaries by stable id. WAW pairs surface as the policy-shaped `cross-actor-conflict` finding a CI check can gate on |
+| "A structural result for a file looks empty — is the language even supported for that?" / "what does OpenLore extract for language L?" | `get_language_support` (opt-in `--preset full`) — the deterministic per-language capability matrix (`signatures`, `callGraph`, `imports`, `cfgOverlay`, `typeInference`, `receiverResolution`, `styleFingerprint`, `iacProjection`, `crossServiceHttp`, `errorPropagation`) for the repo's detected languages, or a named language (a pure registry lookup; an unknown language returns an honest all-unsupported record). Makes a quiet result interpretable — "calls unsupported for L" vs. "no callers". Fail-soft: an unsupported capability yields nothing, never a guess. Registry is DERIVED from the live extractors so the matrix can't over-claim. See `docs/language-support.md` for the "add a language" checklist |
 
 For all other cases (reading a file, grepping, listing files) use native tools directly.
 
-<!-- spec-gen-decisions-instructions -->
-## Architectural decisions
+> **The default MCP surface is the `substrate` preset (change `refine-happy-path-and-defaults`):** a bare
+> `openlore mcp` / `openlore install` wires the 15-tool `substrate` preset — the navigation core, spec-workflow composites, and governance reads
+> (`prepare_spec_generation` + `prepare_spec_repair` + `recall` + `verify_claim` + `blast_radius`) — not all 76 tools. It cleared the
+> DefaultSurfaceRevealsAllFaces benchmark (no task-completion or selection regression across two models /
+> both tiers; decision c79ec7ca / ADR-0023, superseding ADR-0022). Narrower/wider is opt-in: the lean
+> navigate-only `navigation` preset (10 tools, the one-flag escape), `--minimal` (governance core),
+> `--preset memory` / `verify` / `federation` / `coordination`, or the full surface via `--preset full`
+> (`--all-tools`). The `record_decision` MCP tool is **not** in the default; on any preset, record a
+> decision for the commit gate with `openlore decisions record --title "…" --rationale "…"`, or
+> install with `--preset full` (or `--minimal`) to expose the MCP tool.
 
-When making a significant design choice, call `record_decision` **before** writing the code.
+> **OpenLore is one substrate with two faces (change `unify-navigation-and-governance-substrate`).**
+> Navigation (read the graph) and governance/memory (anchor facts, weigh changes) share one graph, one
+> anchored-fact store, one freshness lease (`architecture` `UnifiedStructuralSubstrate`). Every tool
+> declares exactly one of six **closed capability families** — `navigate` · `change` · `remember` ·
+> `verify` · `coordinate` · `federate` — in `TOOL_CAPABILITY_FAMILY` (`tool-contract.ts`), emitted in
+> each tool's MCP `annotations.family` so the full surface is discoverable by family, not as a flat
+> list. Adjacent tools in one family are NOT merged when each returns a distinct conclusion; each names
+> its near-sibling instead (`NoRedundantConclusions`). `tool-contract.test.ts` fails CI if a new tool
+> forgets a family, or an adjacent tool fails to cross-reference its sibling. The active out-of-box
+> default is `substrate` (navigation core + governance reads) — flipped from `navigation` on benchmark evidence (ADR-0023,
+> superseding ADR-0022); `--preset navigation` remains the lean navigate-only escape.
 
-Significant choices: data structure, library/dependency, API contract, auth strategy,
-module boundary, database schema, caching approach, error handling pattern.
+> **Memory tools (`remember`/`recall`) are opt-in:** they ship in the `memory` preset
+> (`openlore mcp --preset memory`), not the default or `minimal` surface, per the
+> `mcp-quality` minimize-tool-surface rule.
 
-```
-record_decision({
-  title: "Use JWTs for stateless auth",
-  rationale: "Avoids session store in infra",
-  consequences: "Tokens can't be revoked early",
-  affectedFiles: ["src/auth/middleware.ts"],
-  supersedes: "a1b2c3d4"  // 8-char ID of prior decision being reversed
-})
-```
+> **Authoring a new MCP tool?** Classify it `conclusion` or `explicit-topology` in
+> `src/core/services/mcp-handlers/tool-contract.ts` — `tool-contract.test.ts` fails until you do.
+> Conclusion tools must return the computed answer, not a graph for the agent to traverse.
 
-Decisions are consolidated in the background immediately after `record_decision` is called — the pre-commit gate reads the already-consolidated store and adds no LLM latency.
+> **Authoring a new governance finding?** Register its stable `code` (with a source-declared default
+> class + description) in `FINDING_CODE_REGISTRY` in `src/core/services/mcp-handlers/enforcement-policy.ts`,
+> and emit it in the unified `GovernanceFinding` shape (`{ code, severity, source, subject, message }`).
+> A registered code is one an operator's `enforcement.policy` can name and `openlore enforce` can govern;
+> the source owns the finding's intrinsic `severity`, the policy owns its enforcement class. Findings stay
+> advisory by default — blocking is always opt-in (change: add-finding-enforcement-policy).
+[95 more lines]
+## Agent skills
 
-**Performance note**: if you skip `record_decision`, the gate detects unrecorded source changes at commit time and triggers a slow LLM extraction on the *next* commit (~10-30s). Calling `record_decision` proactively keeps every commit instant.
+### Issue tracker
 
-## When git commit is blocked by the decisions gate
+Issues live as GitHub issues on this repository, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
-If `git commit` fails and the output is JSON with `"gated": true`, do NOT retry silently.
-Check the `reason` field and act accordingly:
+### Triage labels
 
-**`reason: "verified"` — decisions await review:**
-Present each decision to the user:
-> "The commit is blocked — I found N architectural decision(s) to validate:
-> 1. **[id]** Title — rationale
-> Do you approve? (yes/no)"
-For each approval call `approve_decision`, for rejections call `reject_decision`.
-Then run `spec-gen decisions --sync` and retry `git commit`.
+Stock GitHub labels only — `needs-info`→`question`, `ready-for-human`→`help wanted`, `wontfix`→`wontfix`; `needs-triage` and `ready-for-agent` are stated in a comment. See `docs/agents/triage-labels.md`.
 
-**`reason: "drafts_pending_consolidation"` — drafts were recorded but not yet consolidated:**
-Present to the user:
-> "N decision draft(s) were recorded but never consolidated. Run consolidation now? (~10-30s)"
-If yes: run `spec-gen decisions --consolidate --gate` and handle the result.
-If no: retry with `git commit --no-verify` to skip the gate.
+### Domain docs
 
-**`reason: "no_decisions_recorded"` — source files staged but nothing recorded:**
-Present to the user:
-> "Source files are staged but no architectural decisions were recorded. Run fallback extraction to check for undocumented decisions? (~10-30s)"
-If yes: run `spec-gen decisions --consolidate --gate` and handle the result.
-If no: retry with `git commit --no-verify` to skip the gate.
-<!-- end-spec-gen-decisions-instructions -->
+Single-context; no `CONTEXT.md` yet, and ADRs live in `openspec/decisions/`, not `docs/adr/`. See `docs/agents/domain.md`.
+
+# Chat reply standard
+
+Use this standard for your chat replies: **ASD-STE100 Simplified Technical English** (**STE**). Also consider ELI18 and TLDR. Apart from that: silence is gold
+
+<!-- BEGIN OPENLORE (managed — edits inside this block will be overwritten) -->
+<!-- openlore-fingerprint: 4731c9a87556f8e1 -->
+This project uses OpenLore for persistent architectural memory.
+
+Call `orient "<task description>"` (via the openlore MCP server, or
+`npx openlore orient --json`) **before touching a module you have not yet read in
+this session**, and when a task spans several modules. It returns the relevant
+functions, callers, spec sections, and insertion points in one structural lookup
+instead of file-by-file rediscovery.
+
+Skip it for work you are already inside: repeated edits to a file you have read
+this session do not need re-orientation. Reach for it again when the task moves
+to unfamiliar code.
+
+OpenLore prefixes tool responses with a brief, factual freshness note (the
+Epistemic Lease) once your cached context has aged or the repo has moved since
+your last `orient()`. It is informational — re-`orient()` if you are relying on
+cached cross-module structure; otherwise carry on.
+
+For the MCP setup, ensure `openlore mcp` is configured as an MCP server.
+See https://github.com/clay-good/OpenLore for details.
+
+Wired MCP surface: `substrate`. This guidance is written for that surface; re-run `openlore install --preset <name>` to change it and regenerate these instructions.
+<!-- END OPENLORE -->

@@ -5,7 +5,7 @@ Drift detection is the core of ongoing spec maintenance. It runs in milliseconds
 > **Drift vs. Decisions**: these address different failure modes. Drift asks *"is this spec's source file coverage still accurate?"* — it fires when a spec-covered file changes without the spec being updated. The [decisions workflow](#what-it-does) asks *"has this architectural choice been reviewed?"* — it gates commits until recorded decisions are approved and written back as new requirements. Syncing a decision appends a requirement but does not update a spec's source file list, so drift can still fire on the same commit. Run both: they catch different things.
 
 ```bash
-$ spec-gen drift
+$ openlore drift
 
   Spec Drift Detection
 
@@ -49,16 +49,16 @@ Static drift detection catches structural changes but cannot tell whether a chan
 `--use-llm` post-processes gap issues by sending each file's diff and its matching spec to the LLM. The LLM classifies each gap as relevant (keeps the alert) or not relevant (downgrades to info). This reduces false positives.
 
 ```bash
-spec-gen drift              # Static mode: fast, deterministic
-spec-gen drift --use-llm    # LLM-enhanced: fewer false positives
+openlore drift              # Static mode: fast, deterministic
+openlore drift --use-llm    # LLM-enhanced: fewer false positives
 ```
 
 ### Drift → Tests
 
-When drift is detected, `--suggest-tests` finds the test files that cover the affected domains and prints a ready-to-run command. It scans for `// spec-gen: {}` metadata tags written by `spec-gen test` — no LLM required.
+When drift is detected, `--suggest-tests` finds and lists the test files that cover the affected domains. It scans for `// openlore: {}` metadata tags written by `openlore test` — no LLM required. Pass the listed paths to your project's test runner.
 
 ```bash
-$ spec-gen drift --suggest-tests
+$ openlore drift --suggest-tests
 
    [ERROR] gap: src/auth/session.ts
       Spec: openspec/specs/auth/spec.md
@@ -69,8 +69,19 @@ $ spec-gen drift --suggest-tests
      → spec-tests/auth/Login.test.ts
      → spec-tests/auth/Session.test.ts
 
-   Run: npx vitest spec-tests/auth/Login.test.ts spec-tests/auth/Session.test.ts
+   Run the listed files with your project test runner.
 ```
 
-If no tests with spec-gen annotation tags exist yet for the affected domain, run the `spec-gen-write-tests` skill to write them.
+If no tests with openlore annotation tags exist yet for the affected domain, run the `openlore-write-tests` skill to write them.
 
+### Bounded Results and Exit Codes
+
+Drift analyzes at most 100 changed files by default. Increase the limit with `--max-files`. JSON,
+MCP, and API results include `totalChangedFiles`, `analyzedFiles`, and `filesOmitted`; do not rely on
+`hasDrift: false` when `filesOmitted` is nonzero. `specRelevantFiles` counts only the analyzed
+subset.
+
+The CLI exits `0` when no drift reaches the configured threshold, `1` when drift is found, and `2`
+when drift could not be checked. Installed pre-commit hooks block only confirmed drift. A missing
+configuration, missing specs, invalid repository, internal failure, or incomplete capped result is
+reported explicitly but does not block the commit.

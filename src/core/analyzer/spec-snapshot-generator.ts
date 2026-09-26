@@ -6,13 +6,12 @@
  * to produce spec-snapshot.json.
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readFile, stat, readdir, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { ANALYSIS_ARTIFACT_MAX_BYTES, readArtifactBounded } from '../../utils/bounded-artifact-read.js';
 import {
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
   ARTIFACT_LLM_CONTEXT,
   ARTIFACT_MAPPING,
   ARTIFACT_SPEC_SNAPSHOT,
@@ -23,8 +22,8 @@ import type { SpecSnapshot, SpecSnapshotDomain, SpecSnapshotHub } from '../../ty
 import type { LLMContext } from './artifact-generator.js';
 import type { MappingArtifact } from '../generator/mapping-generator.js';
 import type { SerializedCallGraph, FunctionNode } from './call-graph.js';
+import { execFileGit as execFileAsync } from '../../utils/git-exec.js';
 
-const execFileAsync = promisify(execFile);
 
 // ============================================================================
 // GIT HELPERS
@@ -140,14 +139,16 @@ export class SpecSnapshotGenerator {
     private readonly openspecRelPath: string = OPENSPEC_DIR,
   ) {}
 
-  async generate(): Promise<SpecSnapshot> {
-    const analysisDir = join(this.rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  async generate(options: { persist?: boolean } = {}): Promise<SpecSnapshot> {
+    const analysisDir = join(this.rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
     const openspecPath = join(this.rootPath, this.openspecRelPath);
 
     // Load artifacts in parallel
     const [llmContextRaw, mappingRaw, git, specDomains] = await Promise.all([
-      readFile(join(analysisDir, ARTIFACT_LLM_CONTEXT), 'utf-8').catch(() => null),
-      readFile(join(analysisDir, ARTIFACT_MAPPING), 'utf-8').catch(() => null),
+      // Bounded reads: these are repository-controlled files, so a committed FIFO must not hang
+      // the generator and a symlink must not redirect the read out of the analysis directory.
+      readArtifactBounded(join(analysisDir, ARTIFACT_LLM_CONTEXT), ANALYSIS_ARTIFACT_MAX_BYTES).then(r => r?.text ?? null),
+      readArtifactBounded(join(analysisDir, ARTIFACT_MAPPING), ANALYSIS_ARTIFACT_MAX_BYTES).then(r => r?.text ?? null),
       getGitState(this.rootPath),
       discoverSpecDomains(openspecPath, this.rootPath),
     ]);
@@ -223,11 +224,12 @@ export class SpecSnapshotGenerator {
       hubs,
     };
 
-    // Persist
-    await writeFile(
-      join(analysisDir, ARTIFACT_SPEC_SNAPSHOT),
-      JSON.stringify(snapshot, null, 2),
-    );
+    if (options.persist ?? true) {
+      await writeFile(
+        join(analysisDir, ARTIFACT_SPEC_SNAPSHOT),
+        JSON.stringify(snapshot, null, 2),
+      );
+    }
 
     return snapshot;
   }
@@ -236,7 +238,7 @@ export class SpecSnapshotGenerator {
   static async load(rootPath: string): Promise<SpecSnapshot | null> {
     try {
       const raw = await readFile(
-        join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_SPEC_SNAPSHOT),
+        join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_SPEC_SNAPSHOT),
         'utf-8',
       );
       return JSON.parse(raw) as SpecSnapshot;

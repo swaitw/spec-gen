@@ -14,9 +14,10 @@
  */
 
 import { join } from 'node:path';
-import type { EmbeddingService } from './embedding-service.js';
+import type { Embedder } from './embedding-service.js';
 import type { SearchResult as CodeSearchResult } from './vector-index.js';
 import type { SpecSearchResult } from './spec-vector-index.js';
+import { requireMatchEvidence, type MatchEvidence } from './retrieval-evidence.js';
 
 // ============================================================================
 // TYPES
@@ -28,6 +29,7 @@ export interface UnifiedSearchResult {
   score: number;
   baseScore: number;
   mappingBoost: number;
+  matchEvidence: MatchEvidence;
   source: {
     filePath?: string;
     functionName?: string;
@@ -239,16 +241,17 @@ export class UnifiedSearch {
   static async unifiedSearch(
     outputDir: string,
     query: string,
-    embedSvc: EmbeddingService | null | undefined,
+    embedSvc: Embedder | null | undefined,
     opts: {
       limit?: number;
       language?: string;
       domain?: string;
       section?: string;
       config?: Partial<CrossScoringConfig>;
+      vocabularyExpansion?: boolean;
     } = {}
   ): Promise<UnifiedSearchResult[]> {
-    const { limit = 10, language, domain, section, config = {} } = opts;
+    const { limit = 10, language, domain, section, config = {}, vocabularyExpansion = true } = opts;
     const scoringConfig = { ...DEFAULT_CONFIG, ...config };
 
     // Import index classes dynamically
@@ -273,9 +276,11 @@ export class UnifiedSearch {
     // Execute parallel searches
     const svc = embedSvc ?? null;
     const [codeResults, specResults] = await Promise.all([
-      VectorIndex.search(outputDir, query, svc, { limit: limit * 3, language }).catch(() => []),
+      VectorIndex.search(outputDir, query, svc, { limit: limit * 3, language, vocabularyExpansion }).catch(() => []),
       svc
-        ? SpecVectorIndex.search(outputDir, query, svc, { limit: limit * 3, domain, section }).catch(() => [])
+        ? SpecVectorIndex.search(outputDir, query, svc, {
+            limit: limit * 3, domain, section, vocabularyExpansion,
+          }).catch(() => [])
         : Promise.resolve([]),
     ]);
 
@@ -299,6 +304,7 @@ export class UnifiedSearch {
           score: finalScore,
           baseScore: result.score,
           mappingBoost,
+          matchEvidence: requireMatchEvidence(result.matchEvidence),
           source: extractSourceMetadata(result),
           linkedArtifacts,
         },
@@ -319,6 +325,7 @@ export class UnifiedSearch {
           score: finalScore,
           baseScore: result.score,
           mappingBoost,
+          matchEvidence: requireMatchEvidence(result.matchEvidence),
           source: extractSourceMetadata(result),
           linkedArtifacts,
         },

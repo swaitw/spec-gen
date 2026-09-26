@@ -10,8 +10,9 @@
  *   existing ones are skipped (no duplicate detection by content hash).
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { readFile, mkdir } from 'node:fs/promises';
+import { confinedAtomicWriteFile } from '../../utils/path-confinement.js';
+import { dirname, resolve, sep } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
 import type { GeneratedTestFile } from '../../types/test-generator.js';
 
@@ -30,10 +31,10 @@ export interface WriteResult {
 // MERGE HELPERS
 // ============================================================================
 
-/** Extract scenario keys already present in a file via spec-gen: tags */
+/** Extract scenario keys already present in a file via openlore: tags */
 function extractExistingScenarioKeys(content: string): Set<string> {
   const keys = new Set<string>();
-  const tagRegex = /(?:\/\/|#)\s*spec-gen:\s*(\{[^\n]+\})/g;
+  const tagRegex = /(?:\/\/|#)\s*openlore:\s*(\{[^\n]+\})/g;
   let m: RegExpExecArray | null;
   while ((m = tagRegex.exec(content)) !== null) {
     try {
@@ -50,11 +51,11 @@ function extractExistingScenarioKeys(content: string): Set<string> {
 
 /**
  * Extract the "blocks" (one per scenario) from generated content.
- * Each block starts with a spec-gen: tag comment line.
+ * Each block starts with a openlore: tag comment line.
  */
 function splitIntoBlocks(content: string): string[] {
-  // Split on spec-gen: tag lines, keeping the delimiter
-  const parts = content.split(/(?=(?:\/\/|#)\s*spec-gen:\s*\{)/);
+  // Split on openlore: tag lines, keeping the delimiter
+  const parts = content.split(/(?=(?:\/\/|#)\s*openlore:\s*\{)/);
   // First part is the import header (before any tags)
   return parts;
 }
@@ -71,7 +72,7 @@ function buildMergedContent(
   const newBlocks: string[] = [];
 
   for (const block of scenarioBlocks) {
-    const tagMatch = block.match(/(?:\/\/|#)\s*spec-gen:\s*(\{[^\n]+\})/);
+    const tagMatch = block.match(/(?:\/\/|#)\s*openlore:\s*(\{[^\n]+\})/);
     if (!tagMatch) continue;
     try {
       const tag = JSON.parse(tagMatch[1]);
@@ -111,6 +112,15 @@ export async function writeTestFiles(opts: {
 
   for (const file of files) {
     const absPath = resolve(rootPath, file.outputPath);
+    // Write confinement (mcp-security): outputPath is derived from spec domain /
+    // requirement names — repo content. Most case-converters strip separators,
+    // but the junit path (toPascalCase) does not, so a crafted requirement title
+    // ("../../etc/x") could otherwise escape the root on write. Refuse any path
+    // that resolves outside the project root.
+    if (absPath !== rootPath && !absPath.startsWith(rootPath + sep)) {
+      result.skipped++;
+      continue;
+    }
     const exists = await fileExists(absPath);
 
     if (dryRun) {
@@ -123,7 +133,7 @@ export async function writeTestFiles(opts: {
       if (firstScenario) {
         const preview = file.content
           .split('\n')
-          .filter((l) => l.trim() && !l.startsWith('import') && !l.includes('spec-gen:'))
+          .filter((l) => l.trim() && !l.startsWith('import') && !l.includes('openlore:'))
           .slice(0, 8)
           .map((l) => `      ${l}`)
           .join('\n');
@@ -149,7 +159,11 @@ export async function writeTestFiles(opts: {
         continue;
       }
 
-      await writeFile(absPath, content, 'utf-8');
+      // The lexical check above cannot see a symlinked path COMPONENT, and a plain `writeFile`
+      // follows one — so a repo committing a link here had generated content written wherever it
+      // pointed. The confined atomic writer re-checks on the real path and refuses a non-regular
+      // target, like every other file OpenLore writes into a repository.
+      await confinedAtomicWriteFile(rootPath, absPath, content);
       file.isNew = false;
       result.merged++;
       continue;
@@ -157,7 +171,7 @@ export async function writeTestFiles(opts: {
 
     // New file
     await mkdir(dirname(absPath), { recursive: true });
-    await writeFile(absPath, file.content, 'utf-8');
+    await confinedAtomicWriteFile(rootPath, absPath, file.content);
     file.isNew = true;
     result.written++;
   }

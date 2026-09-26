@@ -1,41 +1,305 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { createRequire } from 'node:module';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { CallEdge, FunctionNode, ClassNode, InheritanceEdge } from '../analyzer/call-graph.js';
-import { ARTIFACT_CALL_GRAPH_DB } from '../../constants.js';
+import { EDGE_CONFIDENCE_VALUES } from '../analyzer/call-graph-types.js';
+import { recordPerfWork } from '../analyzer/perf-counters.js';
+import type { FunctionCfg } from '../analyzer/cfg.js';
+import type { DecisionNode, DecisionAffectsEdge } from '../decisions/project.js';
+import type { FileProvenance } from '../provenance/git-provenance.js';
+import type { FileChangeCoupling, CoupledFile, ChangeCouplingResult } from '../provenance/change-coupling.js';
+import type { DecisionStatus } from '../../types/index.js';
+import { ARTIFACT_CALL_GRAPH_DB, HUB_THRESHOLD } from '../../constants.js';
+import { quarantineCorruptSync } from '../decisions/atomic-store.js';
+import {
+  combineStaleFileCompositions,
+  type StaleFileComposition,
+  type StaleRegionComposition,
+  type StaleRegionSymbol,
+} from '../analyzer/incremental-closure.js';
 
-const require = createRequire(import.meta.url);
+/**
+ * Why a just-opened graph store cannot be trusted to answer a read (change:
+ * harden-index-store-lifecycle):
+ *  - `schema-mismatch` — the on-disk store was built by a different OpenLore
+ *    (a SCHEMA_VERSION bump). A read leaves it byte-untouched and reports this,
+ *    rather than the old drop-and-rebuild-on-read that destroyed the index.
+ *  - `quarantined`     — the DB file failed to open (corrupt/truncated); it was
+ *    moved aside to `*.corrupt-<n>` and this handle wraps an ephemeral empty DB,
+ *    never a silently recreated on-disk store presented as healthy.
+ * In both cases the recovery is the same single command: `openlore analyze`.
+ */
+export interface StoreLifecycleFault {
+  reason: 'schema-mismatch' | 'quarantined';
+  /** Human-readable, names the recovery command. */
+  message: string;
+  /** Present for `quarantined`: where the corrupt bytes were preserved (null if unmovable). */
+  quarantinePath?: string | null;
+  /** Present for `schema-mismatch`: the SCHEMA_VERSION found on disk. */
+  onDiskVersion?: number;
+}
 
-function openDatabase(dbPath: string): import('better-sqlite3').Database {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const DatabaseCtor = require('better-sqlite3') as any;
-  const db: import('better-sqlite3').Database = new DatabaseCtor(dbPath) as import('better-sqlite3').Database;
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
+/**
+ * Distinguish genuine store corruption (quarantine + rebuild) from a transient lock
+ * (surface it — the store is fine, the caller is racing a writer). Only corruption is
+ * quarantined; a `SQLITE_BUSY`/locked open error is re-thrown for the caller to retry.
+ */
+function isCorruptionError(err: unknown): boolean {
+  const m = ((err as Error | undefined)?.message ?? '').toLowerCase();
+  if (m.includes('locked') || m.includes('busy')) return false;
+  return /malformed|not a database|file is encrypted|disk image|not a valid|corrupt/.test(m);
+}
+
+function missingSchemaVersionFault(): StoreLifecycleFault {
+  return {
+    reason: 'schema-mismatch',
+    message: `graph index has no valid schema version — run \`openlore analyze\` to rebuild it`,
+  };
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isStaleRegionSymbol(value: unknown): value is StaleRegionSymbol {
+  if (typeof value !== 'object' || value === null) return false;
+  const symbol = value as Partial<StaleRegionSymbol>;
+  return typeof symbol.id === 'string' && symbol.id.length > 0 &&
+    typeof symbol.name === 'string' && symbol.name.length > 0 &&
+    typeof symbol.filePath === 'string' && symbol.filePath.length > 0 &&
+    isNonNegativeSafeInteger(symbol.fanIn) &&
+    isNonNegativeSafeInteger(symbol.fanOut);
+}
+
+function schemaMismatchFault(onDiskVersion: number): StoreLifecycleFault {
+  return {
+    reason: 'schema-mismatch',
+    onDiskVersion,
+    message:
+      `graph index was built by a different OpenLore (schema v${onDiskVersion}, ` +
+      `expected v${SCHEMA_VERSION}) — run \`openlore analyze\` to rebuild it`,
+  };
+}
+
+/** Counts every prepared statement on an EdgeStore handle, including helper calls. */
+class EdgeStoreDatabase extends DatabaseSync {
+  override prepare(...args: Parameters<DatabaseSync['prepare']>): StatementSync {
+    const statement = super.prepare(...args);
+    recordPerfWork('edgeStoreStatementPrepares');
+    return statement;
+  }
+}
+
+function openDatabase(dbPath: string, readOnly = false): DatabaseSync {
+  // `new DatabaseSync` SUCCEEDS on a corrupt file — SQLite does not read the header until
+  // the first statement — so the throw below comes from a handle that is already open. If it
+  // escapes without a close, that handle leaks for the lifetime of the process, and the
+  // caller's corrupt-store quarantine then cannot move the file aside: Windows refuses to
+  // unlink anything still open. The observable was a quarantine that reported
+  // "could not be moved aside (EBUSY)" and started from an empty store — the silent-empty
+  // substitute the quarantine invariant exists to prevent. POSIX unlinks an open file
+  // regardless, so the leak was real there too but never showed.
+  const db = new EdgeStoreDatabase(dbPath, { readOnly });
+  try {
+    // journal_mode and synchronous can rewrite a database header even when no
+    // application rows change. A read handle must therefore set neither pragma.
+    if (!readOnly) {
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+    }
+    // Wait (don't immediately throw "database is locked") when another process
+    // holds the write lock — e.g. the incremental watcher marking files stale
+    // while a post-commit `analyze --force` rebuilds the store. Without this the
+    // loser of the race throws on open/write and silently drops its work
+    // (fix-transitive-incremental-staleness widened this contention).
+    db.exec('PRAGMA busy_timeout = 5000');
+  } catch (err) {
+    try { db.close(); } catch { /* already gone; the original error is the one that matters */ }
+    throw err;
+  }
   return db;
 }
 
-/** Bump when schema changes. Old DBs are dropped and rebuilt on next analyze --force. */
-const SCHEMA_VERSION = 2;
+// Track nesting depth per db instance to support nested transactions via SAVEPOINT
+const txDepth = new WeakMap<DatabaseSync, number>();
+
+function runTransaction(db: DatabaseSync, fn: () => void): void {
+  const depth = txDepth.get(db) ?? 0;
+  const sp = `sp${depth}`;
+  if (depth === 0) {
+    db.exec('BEGIN');
+  } else {
+    db.exec(`SAVEPOINT ${sp}`);
+  }
+  txDepth.set(db, depth + 1);
+  try {
+    fn();
+    if (depth === 0) {
+      db.exec('COMMIT');
+    } else {
+      db.exec(`RELEASE ${sp}`);
+    }
+  } catch (err) {
+    if (depth === 0) {
+      db.exec('ROLLBACK');
+    } else {
+      // ROLLBACK TO reverts the savepoint's work but leaves it on the stack;
+      // RELEASE pops it so a caught nested-tx error doesn't orphan a savepoint.
+      db.exec(`ROLLBACK TO ${sp}`);
+      db.exec(`RELEASE ${sp}`);
+    }
+    throw err;
+  } finally {
+    txDepth.set(db, depth);
+  }
+}
+
+async function runTransactionAsync<T>(db: DatabaseSync, fn: () => Promise<T>): Promise<T> {
+  const depth = txDepth.get(db) ?? 0;
+  const sp = `sp${depth}`;
+  if (depth === 0) {
+    db.exec('BEGIN');
+  } else {
+    db.exec(`SAVEPOINT ${sp}`);
+  }
+  txDepth.set(db, depth + 1);
+  try {
+    const result = await fn();
+    if (depth === 0) {
+      db.exec('COMMIT');
+    } else {
+      db.exec(`RELEASE ${sp}`);
+    }
+    return result;
+  } catch (err) {
+    if (depth === 0) {
+      db.exec('ROLLBACK');
+    } else {
+      db.exec(`ROLLBACK TO ${sp}`);
+      db.exec(`RELEASE ${sp}`);
+    }
+    throw err;
+  } finally {
+    txDepth.set(db, depth);
+  }
+}
+
+/**
+ * Bump when schema changes. Old DBs are dropped and rebuilt on next analyze --force.
+ *
+ * v12 adds no column — it marks the `receiver_inferred` confidence value (change:
+ * shrink-receiver-resolution-boundary). `edges.confidence` is an unconstrained TEXT column, so a
+ * NEWER database opened by an OLDER OpenLore would otherwise pass the version gate and then have
+ * every `receiver_inferred` row silently dropped by that build's validator — and, worse, an
+ * `.olbundle` import would recompute its digest through the same dropping reader and reject a
+ * perfectly valid bundle as TAMPERED. A version bump turns both into the honest
+ * `schema-mismatch` + rebuild path this store already documents.
+ */
+export const SCHEMA_VERSION = 12;
+
+/**
+ * Bound on the number of bound parameters in one generated `IN (…)` list.
+ *
+ * SQLite refuses a statement with more bound variables than `SQLITE_MAX_VARIABLE_NUMBER`
+ * — 999 on builds compiled before 3.32, 32766 after. Node's bundled SQLite is the newer
+ * one, but the ceiling is a *compile-time* property of whatever libsqlite the running
+ * Node was built against, so a caller-supplied array that is graph-sized (a whole BFS
+ * frontier; a hub's fan-out) must not be trusted to fit. 900 sits under the lowest
+ * ceiling with room for the handful of other bound values a statement may carry.
+ *
+ * Chunking is transparent: the caller sees one concatenated result, in per-chunk order.
+ * (change: optimize-serving-hot-path-caches)
+ */
+const SQL_MAX_BOUND_PARAMS = 900;
+
+/** Split `values` into consecutive chunks of at most {@link SQL_MAX_BOUND_PARAMS}. */
+function chunkForSqlIn<T>(values: readonly T[]): T[][] {
+  if (values.length <= SQL_MAX_BOUND_PARAMS) return [values as T[]];
+  const chunks: T[][] = [];
+  for (let i = 0; i < values.length; i += SQL_MAX_BOUND_PARAMS) {
+    chunks.push(values.slice(i, i + SQL_MAX_BOUND_PARAMS) as T[]);
+  }
+  return chunks;
+}
 
 export class EdgeStore {
-  private constructor(private readonly db: import('better-sqlite3').Database) {
-    this.initSchema();
+  /**
+   * True when opening this DB found a stale SCHEMA_VERSION and wiped it (rebuild-on-bump).
+   * The data is gone until the next analyze repopulates it — callers that READ
+   * (vs. analyze, which repopulates) should treat the store as unavailable so they
+   * can tell the user to re-run analyze instead of serving an empty graph.
+   */
+  private _wasReset = false;
+  get wasReset(): boolean { return this._wasReset; }
+
+  /**
+   * Non-null when this handle must NOT answer reads: a schema-version mismatch met on a
+   * read-mode open (the store is left intact on disk) or a corrupt DB quarantined at open.
+   * Read consumers MUST check this before querying and surface the not-ready conclusion —
+   * never an empty graph served as current fact (change: harden-index-store-lifecycle).
+   */
+  private _fault: StoreLifecycleFault | null = null;
+  get notReady(): StoreLifecycleFault | null { return this._fault; }
+
+  private constructor(
+    private readonly db: DatabaseSync,
+    mode: 'read' | 'analyze',
+    bootstrapMissingRead = false,
+  ) {
+    this.initSchema(mode, bootstrapMissingRead);
   }
 
-  private initSchema(): void {
-    // Version check — if schema changed, wipe and rebuild (analyze --force repopulates).
+  private initSchema(mode: 'read' | 'analyze', bootstrapMissingRead: boolean): void {
+    // Existing read targets are opened read-only and inspected before any DDL.
+    // Keep bootstrapping a path that did not exist for legacy programmatic callers;
+    // an existing zero-byte or partially initialized file is never stamped healthy.
+    if (mode === 'read' && !bootstrapMissingRead) {
+      const hasVersionTable = this.db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version' LIMIT 1",
+      ).get() !== undefined;
+      if (!hasVersionTable) {
+        this._fault = missingSchemaVersionFault();
+        return;
+      }
+      const row = this.db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: unknown } | undefined;
+      if (row === undefined || !Number.isSafeInteger(row.version)) {
+        this._fault = missingSchemaVersionFault();
+        return;
+      }
+      if (row.version !== SCHEMA_VERSION) {
+        this._fault = schemaMismatchFault(row.version as number);
+      }
+      return;
+    }
+
     this.db.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`);
     const row = this.db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number } | undefined;
     if (row === undefined) {
       this.db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SCHEMA_VERSION);
     } else if (row.version !== SCHEMA_VERSION) {
+      if (mode === 'read') {
+        // ReadPathsNeverDestroyTheIndex: a read NEVER runs the destructive migration.
+        // Record the mismatch and STOP before any CREATE/INDEX statement, so the
+        // on-disk store is byte-identical — the next `analyze` (write path) rebuilds it.
+        this._fault = schemaMismatchFault(row.version);
+        return;
+      }
+      // analyze/write path only — rebuild-on-bump, repopulated immediately by the caller.
+      this._wasReset = true;
       this.db.exec(`
         DROP TABLE IF EXISTS edges;
         DROP TABLE IF EXISTS inheritance_edges;
         DROP TABLE IF EXISTS nodes;
         DROP TABLE IF EXISTS classes;
         DROP TABLE IF EXISTS file_hashes;
+        DROP TABLE IF EXISTS pass1_facts;
+        DROP TABLE IF EXISTS decisions;
+        DROP TABLE IF EXISTS decision_edges;
+        DROP TABLE IF EXISTS provenance;
+        DROP TABLE IF EXISTS change_coupling;
+        DROP TABLE IF EXISTS cfg_overlay;
+        DROP TABLE IF EXISTS stale_files;
+        DROP TABLE IF EXISTS stale_file_composition;
         DROP TABLE IF EXISTS schema_version;
         CREATE TABLE schema_version (version INTEGER NOT NULL);
       `);
@@ -44,20 +308,43 @@ export class EdgeStore {
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS edges (
-        caller_id   TEXT NOT NULL,
-        caller_file TEXT NOT NULL,
-        callee_id   TEXT NOT NULL,
-        callee_file TEXT,
-        callee_name TEXT NOT NULL,
-        line        INTEGER,
-        confidence  TEXT,
-        kind        TEXT,
-        call_type   TEXT
+        caller_id      TEXT NOT NULL,
+        caller_file    TEXT NOT NULL,
+        callee_id      TEXT NOT NULL,
+        callee_file    TEXT,
+        callee_name    TEXT NOT NULL,
+        line           INTEGER,
+        confidence     TEXT,
+        kind           TEXT,
+        call_type      TEXT,
+        synthesized_by TEXT,
+        arg_count      INTEGER,
+        arg_count_lower_bound INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_caller_id   ON edges(caller_id);
       CREATE INDEX IF NOT EXISTS idx_callee_id   ON edges(callee_id);
       CREATE INDEX IF NOT EXISTS idx_caller_file ON edges(caller_file);
       CREATE INDEX IF NOT EXISTS idx_callee_file ON edges(callee_file);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity ON edges(
+        caller_id,
+        callee_id,
+        callee_name,
+        COALESCE(line, -1),
+        COALESCE(confidence, ''),
+        COALESCE(kind, ''),
+        COALESCE(call_type, ''),
+        COALESCE(synthesized_by, ''),
+        COALESCE(arg_count, -1),
+        COALESCE(arg_count_lower_bound, 0)
+      );
+      -- callee_name is filtered by the incremental closure's consumer lookups
+      -- (getExternalConsumerFiles / getNameOnlyConsumers / getExternalConsumers)
+      -- on the hot watch path. Without this index each is a full scan of edges,
+      -- making one save O(edges × addedSymbols) — seconds on a large repo. Index
+      -- build is ~28ms / +2MB and keeps those lookups sub-millisecond. Additive
+      -- (IF NOT EXISTS), so existing stores gain it on next open with no schema
+      -- bump (fix-transitive-incremental-staleness).
+      CREATE INDEX IF NOT EXISTS idx_callee_name ON edges(callee_name);
 
       CREATE TABLE IF NOT EXISTS inheritance_edges (
         parent_id TEXT NOT NULL,
@@ -83,10 +370,15 @@ export class EdgeStore {
         is_external   INTEGER NOT NULL DEFAULT 0,
         external_kind TEXT,
         is_hub        INTEGER NOT NULL DEFAULT 0,
-        is_entry_point INTEGER NOT NULL DEFAULT 0
+        is_entry_point INTEGER NOT NULL DEFAULT 0,
+        -- Content-addressed location-independent identity (add-content-addressed-stable-symbol-ids).
+        -- Nullable: anonymous/synthetic symbols and pre-bump stores carry none. Additive: id stays PK.
+        stable_id     TEXT,
+        call_arity    TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_node_file ON nodes(file_path);
       CREATE INDEX IF NOT EXISTS idx_node_name ON nodes(name);
+      CREATE INDEX IF NOT EXISTS idx_node_stable ON nodes(stable_id);
 
       CREATE TABLE IF NOT EXISTS classes (
         id             TEXT PRIMARY KEY,
@@ -98,7 +390,8 @@ export class EdgeStore {
         method_ids     TEXT NOT NULL DEFAULT '[]',
         fan_in         INTEGER NOT NULL DEFAULT 0,
         fan_out        INTEGER NOT NULL DEFAULT 0,
-        is_module      INTEGER NOT NULL DEFAULT 0
+        is_module      INTEGER NOT NULL DEFAULT 0,
+        stable_id      TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_class_file ON classes(file_path);
       CREATE INDEX IF NOT EXISTS idx_class_name ON classes(name);
@@ -110,7 +403,120 @@ export class EdgeStore {
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(node_id UNINDEXED, name, tokenize='trigram');
+
+      -- Architectural decisions projected as first-class graph nodes (spec-16).
+      -- Derived from .openlore/decisions/pending.json; the JSON store stays
+      -- authoritative. Held in dedicated tables so code-node stats (hubs,
+      -- entry points, countNodes) and call-edge BFS are untouched.
+      CREATE TABLE IF NOT EXISTS decisions (
+        id               TEXT PRIMARY KEY,  -- graph node id "decision::<id>"
+        decision_id      TEXT NOT NULL,     -- original 8-char store id
+        title            TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        rationale        TEXT NOT NULL DEFAULT '',
+        consequences     TEXT NOT NULL DEFAULT '',
+        affected_domains TEXT NOT NULL DEFAULT '[]',
+        affected_files   TEXT NOT NULL DEFAULT '[]',
+        confidence       TEXT,
+        supersedes       TEXT
+      );
+
+      -- affects edges: decision node -> governed file path.
+      CREATE TABLE IF NOT EXISTS decision_edges (
+        decision_id TEXT NOT NULL,  -- graph node id "decision::<id>"
+        file_path   TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_decision_edge_file ON decision_edges(file_path);
+      CREATE INDEX IF NOT EXISTS idx_decision_edge_dec  ON decision_edges(decision_id);
+
+      -- Local provenance (spec-18): per-file last-author + recent authors + PRs,
+      -- derived from local git/gh. Capped upstream; one row per file, no graph bloat.
+      CREATE TABLE IF NOT EXISTS provenance (
+        file_path      TEXT PRIMARY KEY,
+        last_author    TEXT NOT NULL,           -- JSON {name,email}
+        last_date      TEXT,
+        last_commit    TEXT,
+        last_subject   TEXT,
+        recent_authors TEXT NOT NULL DEFAULT '[]', -- JSON Author[]
+        prs            TEXT NOT NULL DEFAULT '[]'   -- JSON PullRequest[]
+      );
+
+      -- Change coupling & volatility (spec-22): per-file churn + co-change pairs,
+      -- mined from local git history. One row per file; advisory caution signals.
+      CREATE TABLE IF NOT EXISTS change_coupling (
+        file_path    TEXT PRIMARY KEY,
+        churn        INTEGER NOT NULL DEFAULT 0,
+        coupled_with TEXT NOT NULL DEFAULT '[]'  -- JSON CoupledFile[]
+      );
+
+      -- Intra-procedural control-flow + reaching-definitions overlay
+      -- (spec: add-intraprocedural-cfg-dataflow-overlay). One compact JSON blob
+      -- per function id: basic blocks + adjacency + labeled def-use edges, NOT a
+      -- row per statement. DB-only and lazily loaded — never added to the
+      -- resident SerializedCallGraph or the hot cached context, so in-memory
+      -- footprint is unchanged. file_path is denormalized for per-file
+      -- incremental delete in the watcher's per-file swap.
+      CREATE TABLE IF NOT EXISTS cfg_overlay (
+        function_id TEXT PRIMARY KEY,
+        file_path   TEXT NOT NULL,
+        cfg         TEXT NOT NULL  -- JSON FunctionCfg
+      );
+      CREATE INDEX IF NOT EXISTS idx_cfg_file ON cfg_overlay(file_path);
+
+      -- Explicitly-stale region (change: fix-transitive-incremental-staleness).
+      -- A file lands here when a budget-exceeded incremental update could not
+      -- afford to re-resolve its edges against a changed symbol — the honest
+      -- "told when stale" fallback. Membership means: do NOT serve this file's
+      -- topology as current; freshness verdicts over its symbols report
+      -- non-authoritative. Cleared when the file is next recomputed
+      -- (opportunistic self-heal) or by a full analyze --force (clearAll).
+      -- Additive table, so an existing store gains it without a schema wipe.
+      CREATE TABLE IF NOT EXISTS stale_files (
+        file_path  TEXT PRIMARY KEY,
+        marked_at  INTEGER NOT NULL
+      );
+
+      -- Per-file structural receipt for the stale region. One row per stale
+      -- file lets self-healing DELETE the file and its contribution together
+      -- instead of leaving a stale aggregate behind. The schema-version bump
+      -- rebuilds older stores before a watcher can write this receipt.
+      CREATE TABLE IF NOT EXISTS stale_file_composition (
+        file_path        TEXT PRIMARY KEY,
+        symbol_count     INTEGER NOT NULL,
+        hub_count        INTEGER NOT NULL,
+        chokepoint_count INTEGER NOT NULL,
+        top_symbol       TEXT
+      );
     `);
+
+    // Memoized Pass-1 extraction facts (change: optimize-hash-keyed-analyze). One row per
+    // file: the extractor's own output for EXACTLY this content, under EXACTLY this extractor
+    // stamp. A row is served only on a three-way key match, so a changed file, a changed
+    // extractor, or a changed grammar set all miss and re-extract.
+    //
+    // This is a CACHE, not graph data: it is deliberately excluded from clearAll() (a rebuild
+    // patches the memo rather than destroying the thing that makes it cheap), and dropping it
+    // costs only time. Every analyze REPLACES the rows for files it re-extracted and PRUNES
+    // the rows for files that left the analyzed set. A SCHEMA_VERSION bump drops it with
+    // everything else, which is the conservative direction.
+    //
+    // Created on the ANALYZE path only, and deliberately outside the block above. Adding a
+    // table that a store built by a previous OpenLore does not have would make the FIRST
+    // read-mode open after an upgrade take SQLite's write lock — turning a read into a
+    // writer, contradicting `EdgeStore.open`'s "never mutates the store" contract, and
+    // letting a tool call fail with `database is locked` while a rebuild holds it. A legacy
+    // store simply has no table to read; the memo treats that as a miss (see
+    // `BufferedPass1FactCache.lookup`) and the next analyze creates it.
+    if (mode === 'analyze') {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pass1_facts (
+          file_path       TEXT PRIMARY KEY,
+          content_hash    TEXT NOT NULL,
+          extractor_stamp TEXT NOT NULL,
+          facts           TEXT NOT NULL  -- JSON FileExtractResult, or the JSON literal null
+        );
+      `);
+    }
   }
 
   // ── Edge queries ──────────────────────────────────────────────────────────────
@@ -119,51 +525,140 @@ export class EdgeStore {
   getCallerFiles(calleeFile: string): string[] {
     const rows = this.db
       .prepare('SELECT DISTINCT caller_file FROM edges WHERE callee_file = ?')
-      .all(calleeFile) as Array<{ caller_file: string }>;
+      .all(calleeFile) as unknown as Array<{ caller_file: string }>;
     return rows.map(r => r.caller_file);
   }
 
   /** All outgoing + incoming edges touching a file. */
   getEdgesForFile(file: string): { outgoing: CallEdge[]; incoming: CallEdge[] } {
     const outgoing = (
-      this.db.prepare('SELECT * FROM edges WHERE caller_file = ?').all(file) as RawEdge[]
-    ).map(rawToCallEdge);
+      this.db.prepare('SELECT * FROM edges WHERE caller_file = ?').all(file) as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
     const incoming = (
-      this.db.prepare('SELECT * FROM edges WHERE callee_file = ?').all(file) as RawEdge[]
-    ).map(rawToCallEdge);
+      this.db.prepare('SELECT * FROM edges WHERE callee_file = ?').all(file) as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
     return { outgoing, incoming };
   }
 
   /** Outgoing edges from a node ID (its direct callees). */
   getCallees(nodeId: string): CallEdge[] {
     return (
-      this.db.prepare('SELECT * FROM edges WHERE caller_id = ?').all(nodeId) as RawEdge[]
-    ).map(rawToCallEdge);
+      this.db.prepare('SELECT * FROM edges WHERE caller_id = ?').all(nodeId) as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
   }
 
   /** Incoming edges to a node ID (its direct callers). */
   getCallers(nodeId: string): CallEdge[] {
     return (
-      this.db.prepare('SELECT * FROM edges WHERE callee_id = ?').all(nodeId) as RawEdge[]
-    ).map(rawToCallEdge);
+      this.db.prepare('SELECT * FROM edges WHERE callee_id = ?').all(nodeId) as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
   }
 
-  /** Batch: outgoing edges for a set of caller IDs — one query instead of N. */
+  /**
+   * Cross-package consumer edges for a symbol name: edges whose callee is an
+   * unresolved external reference (`confidence === 'external'`) with this exact
+   * name. These are the call sites in *this* repo that reach a symbol published
+   * by another repo — the consumer side of federated cross-repo resolution.
+   * Matched on the exact name; arity/signature is unavailable at an external call
+   * site, so callers must disclose name-collision risk.
+   */
+  getExternalConsumers(symbolName: string): CallEdge[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM edges WHERE callee_name = ? AND confidence = 'external'")
+        .all(symbolName) as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
+  }
+
+  /**
+   * Distinct caller FILES that make an unresolved external reference to this
+   * exact name (`confidence === 'external'`). When an incremental edit ADDS a
+   * symbol, these are the prior non-callers whose `external::<name>` call sites
+   * should now bind to the new internal symbol — the files `getCallerFiles`
+   * misses (they hold an external edge, not an edge into the changed file). The
+   * change-driven closure re-resolves them so the graph converges with
+   * `analyze --force` (change: fix-transitive-incremental-staleness).
+   */
+  getExternalConsumerFiles(symbolName: string): string[] {
+    return (
+      this.db
+        .prepare("SELECT DISTINCT caller_file FROM edges WHERE callee_name = ? AND confidence = 'external'")
+        .all(symbolName) as unknown as Array<{ caller_file: string }>
+    ).map((r) => r.caller_file);
+  }
+
+  /**
+   * Caller FILE + current resolved callee id for every `name_only` edge to this
+   * exact name (the lowest, ambiguity-tolerant tier — no import, no receiver
+   * type). When an incremental edit ADDS a symbol, the winning candidate for a
+   * `name_only` call is the lowest candidate id, so the new symbol only flips a
+   * consumer whose current target id sorts AFTER the new id. The caller compares
+   * `calleeId` to prune the no-op majority (a common-name add would otherwise
+   * needlessly re-resolve and stale-flag every consumer)
+   * (fix-transitive-incremental-staleness). One row per (file, target) pair.
+   */
+  getNameOnlyConsumers(symbolName: string): Array<{ file: string; calleeId: string }> {
+    return (
+      this.db
+        .prepare("SELECT DISTINCT caller_file, callee_id FROM edges WHERE callee_name = ? AND confidence = 'name_only'")
+        .all(symbolName) as unknown as Array<{ caller_file: string; callee_id: string }>
+    ).map((r) => ({ file: r.caller_file, calleeId: r.callee_id }));
+  }
+
+  /**
+   * The distinct names of every unresolved external reference this repo makes
+   * (`confidence === 'external'`) — the upstream interfaces this repo consumes from
+   * the rest of the fleet. The producer side of federation resolves each of these to
+   * the repo that publishes it. Non-fleet externals (npm/stdlib) appear here too and
+   * are filtered downstream when no registered repo produces them.
+   */
+  getExternalReferenceNames(): string[] {
+    return (
+      this.db
+        .prepare("SELECT DISTINCT callee_name FROM edges WHERE confidence = 'external' AND callee_name IS NOT NULL")
+        .all() as unknown as Array<{ callee_name: string }>
+    ).map((r) => r.callee_name);
+  }
+
+  /**
+   * Batch: outgoing edges for a set of caller IDs — one query instead of N.
+   *
+   * `callerIds` is a BFS frontier, so it is graph-sized: chunked at
+   * {@link SQL_MAX_BOUND_PARAMS} rather than bound as one unbounded `IN (…)` list,
+   * which raises "too many SQL variables" on a large frontier.
+   */
   getCalleesForIds(callerIds: string[]): CallEdge[] {
     if (callerIds.length === 0) return [];
-    const placeholders = callerIds.map(() => '?').join(',');
-    return (
-      this.db.prepare(`SELECT * FROM edges WHERE caller_id IN (${placeholders})`).all(...callerIds) as RawEdge[]
-    ).map(rawToCallEdge);
+    const out: CallEdge[] = [];
+    for (const chunk of chunkForSqlIn(callerIds)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`SELECT * FROM edges WHERE caller_id IN (${placeholders})`).all(...chunk) as unknown as RawEdge[];
+      for (const r of rows) out.push(...rawToCallEdge(r));
+    }
+    return out;
   }
 
-  /** Batch: incoming edges for a set of callee IDs — one query instead of N. */
+  /** Batch: incoming edges for a set of callee IDs — one query instead of N. Chunked, see {@link EdgeStore.getCalleesForIds}. */
   getCallersForIds(calleeIds: string[]): CallEdge[] {
     if (calleeIds.length === 0) return [];
-    const placeholders = calleeIds.map(() => '?').join(',');
+    const out: CallEdge[] = [];
+    for (const chunk of chunkForSqlIn(calleeIds)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`SELECT * FROM edges WHERE callee_id IN (${placeholders})`).all(...chunk) as unknown as RawEdge[];
+      for (const r of rows) out.push(...rawToCallEdge(r));
+    }
+    return out;
+  }
+
+  /**
+   * Every production call edge. Used to recompute the production-graph content digest
+   * when validating an imported portable artifact against its bundled attestation
+   * (change: add-shareable-graph-artifact) — read-only, mirrors getAllInternalNodes().
+   */
+  getAllEdges(): CallEdge[] {
     return (
-      this.db.prepare(`SELECT * FROM edges WHERE callee_id IN (${placeholders})`).all(...calleeIds) as RawEdge[]
-    ).map(rawToCallEdge);
+      this.db.prepare('SELECT * FROM edges').all() as unknown as RawEdge[]
+    ).flatMap(rawToCallEdge);
   }
 
   // ── Edge mutations ────────────────────────────────────────────────────────────
@@ -180,41 +675,63 @@ export class EdgeStore {
 
   /** Bulk-insert edges in a single transaction. */
   insertEdges(edges: CallEdge[]): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO edges (caller_id, caller_file, callee_id, callee_file, callee_name, line, confidence, kind, call_type)
-      VALUES (@callerId, @callerFile, @calleeId, @calleeFile, @calleeName, @line, @confidence, @kind, @callType)
+    const stmt: StatementSync = this.db.prepare(`
+      INSERT OR IGNORE INTO edges (caller_id, caller_file, callee_id, callee_file, callee_name, line, confidence, kind, call_type, synthesized_by, arg_count, arg_count_lower_bound)
+      VALUES (@callerId, @callerFile, @calleeId, @calleeFile, @calleeName, @line, @confidence, @kind, @callType, @synthesizedBy, @argCount, @argCountLowerBound)
     `);
-    const insert = this.db.transaction((batch: CallEdge[]) => {
-      for (const e of batch) {
+    runTransaction(this.db, () => {
+      for (const e of edges) {
         const callerFile = e.callerId.includes('::') ? e.callerId.split('::')[0] : e.callerId;
         const calleeFile = e.calleeId.includes('::') ? e.calleeId.split('::')[0] : null;
         stmt.run({
-          callerId:   e.callerId,
-          callerFile,
-          calleeId:   e.calleeId,
-          calleeFile,
-          calleeName: e.calleeName,
-          line:       e.line ?? null,
-          confidence: e.confidence,
-          kind:       e.kind ?? null,
-          callType:   e.callType ?? null,
+          '@callerId':   e.callerId,
+          '@callerFile': callerFile,
+          '@calleeId':   e.calleeId,
+          '@calleeFile': calleeFile,
+          '@calleeName': e.calleeName,
+          '@line':       e.line ?? null,
+          '@confidence': e.confidence,
+          '@kind':       e.kind ?? null,
+          '@callType':   e.callType ?? null,
+          '@synthesizedBy': e.synthesizedBy ?? null,
+          '@argCount': e.argCount ?? null,
+          '@argCountLowerBound': e.argCountLowerBound ? 1 : null,
         });
       }
     });
-    insert(edges);
   }
 
   /** Bulk-insert inheritance edges in a single transaction. */
   insertInheritanceEdges(edges: InheritanceEdge[]): void {
-    const stmt = this.db.prepare(
+    const stmt: StatementSync = this.db.prepare(
       'INSERT INTO inheritance_edges (parent_id, child_id, kind) VALUES (@parentId, @childId, @kind)'
     );
-    const insert = this.db.transaction((batch: InheritanceEdge[]) => {
-      for (const e of batch) {
-        stmt.run({ parentId: e.parentId, childId: e.childId, kind: e.kind ?? null });
+    runTransaction(this.db, () => {
+      for (const e of edges) {
+        stmt.run({ '@parentId': e.parentId, '@childId': e.childId, '@kind': e.kind ?? null });
       }
     });
-    insert(edges);
+  }
+
+  replaceInheritanceEdges(edges: InheritanceEdge[]): void {
+    this.db.exec('DELETE FROM inheritance_edges');
+    this.insertInheritanceEdges(edges);
+  }
+
+  getAllInheritanceEdges(): InheritanceEdge[] {
+    return this.db.prepare(`
+      SELECT parent_id AS parentId, child_id AS childId, kind
+      FROM inheritance_edges
+      ORDER BY parent_id, child_id, kind
+    `).all().map(row => {
+      const edge = row as { parentId: string; childId: string; kind: string | null };
+      return {
+        id: `${edge.parentId}->${edge.childId}`,
+        parentId: edge.parentId,
+        childId: edge.childId,
+        kind: (edge.kind ?? 'extends') as InheritanceEdge['kind'],
+      };
+    });
   }
 
   // ── Node queries ──────────────────────────────────────────────────────────────
@@ -226,13 +743,55 @@ export class EdgeStore {
 
   getNodesForFile(file: string): FunctionNode[] {
     return (
-      this.db.prepare('SELECT * FROM nodes WHERE file_path = ?').all(file) as RawNode[]
+      this.db.prepare('SELECT * FROM nodes WHERE file_path = ?').all(file) as unknown as RawNode[]
+    ).map(rawToFunctionNode);
+  }
+
+  /**
+   * Resolve a node by its content-addressed `stableId`
+   * (add-content-addressed-stable-symbol-ids). Returns the match only when it is
+   * unambiguous — a single internal node. Ambiguous (a collision the ordinal pass
+   * still left, or two files momentarily sharing one) or absent → null, so a
+   * rename-resolution caller never guesses between candidates.
+   */
+  getNodeByStableId(stableId: string): FunctionNode | null {
+    const rows = this.db
+      .prepare('SELECT * FROM nodes WHERE stable_id = ? AND is_external = 0')
+      .all(stableId) as unknown as RawNode[];
+    return rows.length === 1 ? rawToFunctionNode(rows[0]) : null;
+  }
+
+  /**
+   * All internal (non-external) nodes. Used to seed cross-file call resolution
+   * during an incremental subset rebuild, so calls into files outside the
+   * re-parsed subset still resolve to their real node instead of `external::`.
+   */
+  getAllInternalNodes(): FunctionNode[] {
+    const rows = this.db.prepare('SELECT * FROM nodes WHERE is_external = 0').all() as unknown as RawNode[];
+    recordPerfWork('fullNodeTableLoads');
+    return rows.map(rawToFunctionNode);
+  }
+
+  /**
+   * Internal nodes with this exact name, through `idx_node_name`.
+   *
+   * The complete set for the name, so a caller can still tell "one match" from
+   * "ambiguous" — it is {@link EdgeStore.getAllInternalNodes} filtered by name, not a
+   * sample. (change: optimize-serving-hot-path-caches)
+   */
+  getInternalNodesByName(name: string): FunctionNode[] {
+    return (
+      this.db.prepare('SELECT * FROM nodes WHERE is_external = 0 AND name = ?').all(name) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
   /** Case-insensitive substring search on node name. FTS5 trigram for ≥3 chars, LIKE fallback otherwise. */
   searchNodes(pattern: string, limit = 50): FunctionNode[] {
     if (pattern.length >= 3) {
+      // Wrap as an FTS5 phrase so special characters in the symbol are literal —
+      // IaC resource names contain ':' (e.g. "Bucket:logs") and '.' which FTS5
+      // would otherwise read as column filters / operators (spec-17).
+      const phrase = `"${pattern.replace(/"/g, '""')}"`;
       return (
         this.db
           .prepare(`
@@ -241,13 +800,13 @@ export class EdgeStore {
             WHERE nodes_fts MATCH ? AND n.is_external = 0
             LIMIT ?
           `)
-          .all(pattern, limit) as RawNode[]
+          .all(phrase, limit) as unknown as RawNode[]
       ).map(rawToFunctionNode);
     }
     return (
       this.db
         .prepare('SELECT * FROM nodes WHERE name LIKE ? AND is_external = 0 LIMIT ?')
-        .all(`%${pattern}%`, limit) as RawNode[]
+        .all(`%${pattern}%`, limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
@@ -255,7 +814,7 @@ export class EdgeStore {
     return (
       this.db
         .prepare('SELECT * FROM nodes WHERE is_hub = 1 AND is_external = 0 ORDER BY fan_in DESC LIMIT ?')
-        .all(limit) as RawNode[]
+        .all(limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
@@ -263,7 +822,7 @@ export class EdgeStore {
     return (
       this.db
         .prepare('SELECT * FROM nodes WHERE is_entry_point = 1 AND is_external = 0 ORDER BY fan_out DESC LIMIT ?')
-        .all(limit) as RawNode[]
+        .all(limit) as unknown as RawNode[]
     ).map(rawToFunctionNode);
   }
 
@@ -272,17 +831,119 @@ export class EdgeStore {
     return row.n;
   }
 
+  /** Internal node count at or above a direct-caller threshold. */
+  countNodesWithMinFanIn(minFanIn: number): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) as n FROM nodes WHERE is_external = 0 AND fan_in >= ?')
+      .get(minFanIn) as { n: number };
+    return row.n;
+  }
+
+  /** Distinct source files contributing production nodes. Reconciliation input for the attestation. */
+  countFiles(): number {
+    const row = this.db.prepare('SELECT COUNT(DISTINCT file_path) as n FROM nodes WHERE is_external = 0').get() as { n: number };
+    return row.n;
+  }
+
+  /** Production (non-tested_by) call-edge count. Reconciliation input for the index attestation. */
+  countEdges(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM edges').get() as { n: number };
+    return row.n;
+  }
+
+  /** Class/module node count. Reconciliation input for the index attestation. */
+  countClasses(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM classes').get() as { n: number };
+    return row.n;
+  }
+
+  /**
+   * The SCHEMA_VERSION recorded in this store. After an open() that found a stale
+   * version, this is the CURRENT SCHEMA_VERSION (the store was wiped + re-stamped),
+   * so an attestation written at an older version reconciles as `mismatched`.
+   */
+  getSchemaVersion(): number {
+    const row = this.db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number } | undefined;
+    return row?.version ?? SCHEMA_VERSION;
+  }
+
+  /**
+   * Fold a lagging write-ahead log into the main database so a recount sees the latest
+   * committed rows. Used by the integrity check to rule out a WAL-lag false positive
+   * before declaring an index `degraded` (change: add-index-integrity-attestation).
+   *
+   * PASSIVE, not TRUNCATE: this runs on the hot read path (readCachedContext), and the
+   * goal is only "recount against the folded-in WAL", not "shrink the file". PASSIVE
+   * checkpoints what it can without waiting on a writer, so it never blocks the read path
+   * up to busy_timeout when the watcher or a concurrent `analyze` holds the write lock.
+   */
+  checkpoint(): void {
+    try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* best-effort */ }
+  }
+
   // ── Node mutations ────────────────────────────────────────────────────────────
 
   deleteNodesForFile(file: string): void {
-    const ids = (
-      this.db.prepare('SELECT id FROM nodes WHERE file_path = ?').all(file) as Array<{ id: string }>
-    ).map(r => r.id);
-    this.db.prepare('DELETE FROM nodes WHERE file_path = ?').run(file);
-    if (ids.length > 0) {
-      const placeholders = ids.map(() => '?').join(',');
-      this.db.prepare(`DELETE FROM nodes_fts WHERE node_id IN (${placeholders})`).run(...ids);
-    }
+    // FTS rows first, selected by subquery against the still-present node rows: a
+    // generated or vendored file can hold more symbols than SQLite's bound-variable
+    // ceiling, so the id list never becomes a parameter list.
+    //
+    // In one transaction: this order means a failure between the two statements would
+    // otherwise leave nodes present with their FTS rows gone — a silent search hole,
+    // where the previous order left only orphaned FTS rows that the join drops anyway.
+    // (change: optimize-serving-hot-path-caches)
+    runTransaction(this.db, () => {
+      this.db.prepare('DELETE FROM nodes_fts WHERE node_id IN (SELECT id FROM nodes WHERE file_path = ?)').run(file);
+      this.db.prepare('DELETE FROM nodes WHERE file_path = ?').run(file);
+    });
+  }
+
+  /** Remove synthetic external nodes no longer referenced by any persisted edge. */
+  deleteOrphanExternalNodes(): void {
+    const orphanPredicate = `
+      is_external = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM edges
+        WHERE edges.caller_id = nodes.id OR edges.callee_id = nodes.id
+      )
+    `;
+    this.db.exec(`
+      DELETE FROM nodes_fts WHERE node_id IN (SELECT id FROM nodes WHERE ${orphanPredicate});
+      DELETE FROM nodes WHERE ${orphanPredicate};
+    `);
+  }
+
+  /** Recompute graph-derived node/class degrees and classifications after a partial edge swap. */
+  recomputeStructuralMetrics(): void {
+    this.db.exec(`
+      UPDATE nodes SET
+        fan_in = (
+          SELECT COUNT(*) FROM (
+            SELECT DISTINCT caller_id FROM edges
+            WHERE callee_id = nodes.id AND confidence <> 'synthesized'
+          )
+        ),
+        fan_out = (
+          SELECT COUNT(*) FROM (
+            SELECT DISTINCT callee_id FROM edges
+            WHERE caller_id = nodes.id AND confidence <> 'synthesized'
+          )
+        );
+      UPDATE nodes SET
+        is_hub = CASE WHEN is_external = 0 AND fan_in >= ${HUB_THRESHOLD} THEN 1 ELSE 0 END,
+        is_entry_point = CASE WHEN is_external = 0 AND NOT EXISTS (
+          SELECT 1 FROM edges WHERE callee_id = nodes.id
+        ) THEN 1 ELSE 0 END;
+      UPDATE classes SET
+        fan_in = COALESCE((
+          SELECT SUM(nodes.fan_in) FROM json_each(classes.method_ids)
+          JOIN nodes ON nodes.id = json_each.value
+        ), 0),
+        fan_out = COALESCE((
+          SELECT SUM(nodes.fan_out) FROM json_each(classes.method_ids)
+          JOIN nodes ON nodes.id = json_each.value
+        ), 0);
+    `);
   }
 
   /**
@@ -290,39 +951,115 @@ export class EdgeStore {
    * omit them during incremental watcher updates (flags preserved from last analyze).
    */
   insertNodes(nodes: FunctionNode[], hubIds?: Set<string>, entryIds?: Set<string>): void {
-    const stmt = this.db.prepare(`
+    const stmt: StatementSync = this.db.prepare(`
       INSERT OR REPLACE INTO nodes
         (id, name, file_path, class_name, is_async, language, start_index, end_index,
-         fan_in, fan_out, docstring, signature, is_external, external_kind, is_hub, is_entry_point)
+         fan_in, fan_out, docstring, signature, is_external, external_kind, is_hub, is_entry_point, stable_id, call_arity)
       VALUES
         (@id, @name, @filePath, @className, @isAsync, @language, @startIndex, @endIndex,
-         @fanIn, @fanOut, @docstring, @signature, @isExternal, @externalKind, @isHub, @isEntryPoint)
+         @fanIn, @fanOut, @docstring, @signature, @isExternal, @externalKind, @isHub, @isEntryPoint, @stableId, @callArity)
     `);
-    const ftsStmt = this.db.prepare('INSERT OR REPLACE INTO nodes_fts (node_id, name) VALUES (?, ?)');
-    const insert = this.db.transaction((batch: FunctionNode[]) => {
-      for (const n of batch) {
+    const ftsStmt: StatementSync = this.db.prepare('INSERT OR REPLACE INTO nodes_fts (node_id, name) VALUES (?, ?)');
+    runTransaction(this.db, () => {
+      for (const n of nodes) {
         stmt.run({
-          id:           n.id,
-          name:         n.name,
-          filePath:     n.filePath,
-          className:    n.className ?? null,
-          isAsync:      n.isAsync ? 1 : 0,
-          language:     n.language,
-          startIndex:   n.startIndex,
-          endIndex:     n.endIndex,
-          fanIn:        n.fanIn,
-          fanOut:       n.fanOut,
-          docstring:    n.docstring ?? null,
-          signature:    n.signature ?? null,
-          isExternal:   n.isExternal ? 1 : 0,
-          externalKind: n.externalKind ?? null,
-          isHub:        hubIds ? (hubIds.has(n.id) ? 1 : 0) : 0,
-          isEntryPoint: entryIds ? (entryIds.has(n.id) ? 1 : 0) : 0,
+          '@id':           n.id,
+          '@name':         n.name,
+          '@filePath':     n.filePath,
+          '@className':    n.className ?? null,
+          '@isAsync':      n.isAsync ? 1 : 0,
+          '@language':     n.language,
+          '@startIndex':   n.startIndex,
+          '@endIndex':     n.endIndex,
+          '@fanIn':        n.fanIn,
+          '@fanOut':       n.fanOut,
+          '@docstring':    n.docstring ?? null,
+          '@signature':    n.signature ?? null,
+          '@isExternal':   n.isExternal ? 1 : 0,
+          '@externalKind': n.externalKind ?? null,
+          '@isHub':        hubIds ? (hubIds.has(n.id) ? 1 : 0) : 0,
+          '@isEntryPoint': entryIds ? (entryIds.has(n.id) ? 1 : 0) : 0,
+          '@stableId':     n.stableId ?? null,
+          '@callArity':    n.callArity ? JSON.stringify(n.callArity) : null,
         });
         if (!n.isExternal) ftsStmt.run(n.id, n.name);
       }
     });
-    insert(nodes);
+  }
+
+  // ── CFG / data-flow overlay (spec: add-intraprocedural-cfg-dataflow-overlay) ──
+
+  /**
+   * Lazily load one function's control-flow + reaching-definitions overlay.
+   * Returns null when the function has no overlay (unsupported language, a parse
+   * that produced no CFG, or a pre-overlay store). DB-only — never resident.
+   */
+  getCfg(functionId: string): FunctionCfg | null {
+    const row = this.db.prepare('SELECT cfg FROM cfg_overlay WHERE function_id = ?').get(functionId) as { cfg: string } | undefined;
+    if (!row) return null;
+    try { return JSON.parse(row.cfg) as FunctionCfg; } catch { return null; }
+  }
+
+  /** True when any overlay rows exist (used to tell "no overlay" from "absent feature"). */
+  hasCfgOverlay(): boolean {
+    const row = this.db.prepare('SELECT 1 FROM cfg_overlay LIMIT 1').get() as { 1: number } | undefined;
+    return row !== undefined;
+  }
+
+  /** Delete every overlay row for a file (per-file incremental recompute). */
+  deleteCfgForFile(file: string): void {
+    this.db.prepare('DELETE FROM cfg_overlay WHERE file_path = ?').run(file);
+  }
+
+  /** Bulk-insert per-function overlays in a single transaction. */
+  /**
+   * Insert overlay rows whose CFG is ALREADY serialized, streamed from an async source (issue
+   * #304). Batched so neither the source nor a transaction has to hold the whole corpus.
+   *
+   * Batches are separate transactions on purpose: this runs after `clearAll()`, so a failure
+   * part-way leaves a PARTIAL overlay. That is the same state every consumer already handles —
+   * `getCfg` returns `null` for a missing row and both call sites degrade to a disclosed
+   * function-granularity answer — whereas holding one transaction over millions of rows would
+   * reintroduce the unbounded memory this change exists to remove.
+   */
+  async insertCfgRowsStreaming(
+    rows: AsyncIterable<{ functionId: string; filePath: string; cfgJson: string }>,
+    batchSize = 20_000,
+  ): Promise<number> {
+    const stmt: StatementSync = this.db.prepare(
+      'INSERT OR REPLACE INTO cfg_overlay (function_id, file_path, cfg) VALUES (@functionId, @filePath, @cfg)'
+    );
+    let batch: Array<{ functionId: string; filePath: string; cfgJson: string }> = [];
+    let written = 0;
+    const flush = (): void => {
+      if (batch.length === 0) return;
+      const pending = batch;
+      batch = [];
+      runTransaction(this.db, () => {
+        for (const r of pending) {
+          stmt.run({ '@functionId': r.functionId, '@filePath': r.filePath, '@cfg': r.cfgJson });
+        }
+      });
+      written += pending.length;
+    };
+    for await (const row of rows) {
+      batch.push(row);
+      if (batch.length >= batchSize) flush();
+    }
+    flush();
+    return written;
+  }
+
+  insertCfgs(cfgs: Array<{ functionId: string; filePath: string; cfg: FunctionCfg }>): void {
+    if (cfgs.length === 0) return;
+    const stmt: StatementSync = this.db.prepare(
+      'INSERT OR REPLACE INTO cfg_overlay (function_id, file_path, cfg) VALUES (@functionId, @filePath, @cfg)'
+    );
+    runTransaction(this.db, () => {
+      for (const c of cfgs) {
+        stmt.run({ '@functionId': c.functionId, '@filePath': c.filePath, '@cfg': JSON.stringify(c.cfg) });
+      }
+    });
   }
 
   // ── Class queries ─────────────────────────────────────────────────────────────
@@ -332,9 +1069,20 @@ export class EdgeStore {
     return row ? rawToClassNode(row) : null;
   }
 
+  /**
+   * Every class/module node. Used to recompute the production-graph content digest
+   * when validating an imported portable artifact against its bundled attestation
+   * (change: add-shareable-graph-artifact) — read-only, mirrors getAllInternalNodes().
+   */
+  getAllClasses(): ClassNode[] {
+    return (
+      this.db.prepare('SELECT * FROM classes').all() as unknown as RawClass[]
+    ).map(rawToClassNode);
+  }
+
   getClassesForFile(file: string): ClassNode[] {
     return (
-      this.db.prepare('SELECT * FROM classes WHERE file_path = ?').all(file) as RawClass[]
+      this.db.prepare('SELECT * FROM classes WHERE file_path = ?').all(file) as unknown as RawClass[]
     ).map(rawToClassNode);
   }
 
@@ -344,30 +1092,215 @@ export class EdgeStore {
     this.db.prepare('DELETE FROM classes WHERE file_path = ?').run(file);
   }
 
+  /** Rebuild synthetic external class/module rows after incremental edge repair. */
+  refreshExternalClasses(): void {
+    const nodes = (
+      this.db.prepare('SELECT * FROM nodes WHERE is_external = 1 ORDER BY id').all() as unknown as RawNode[]
+    ).map(rawToFunctionNode);
+    this.deleteClassesForFile('external');
+    const groups = new Map<string, ClassNode>();
+    for (const node of nodes) {
+      const id = node.className ? `external::${node.className}` : 'external';
+      const current = groups.get(id);
+      if (current) {
+        current.methodIds.push(node.id);
+        continue;
+      }
+      groups.set(id, {
+        id,
+        name: node.className ?? '[external]',
+        filePath: 'external',
+        language: node.language,
+        parentClasses: [],
+        interfaces: [],
+        methodIds: [node.id],
+        fanIn: 0,
+        fanOut: 0,
+        isModule: !node.className,
+      });
+    }
+    this.insertClasses([...groups.values()]);
+  }
+
   insertClasses(classes: ClassNode[]): void {
-    const stmt = this.db.prepare(`
+    const stmt: StatementSync = this.db.prepare(`
       INSERT OR REPLACE INTO classes
-        (id, name, file_path, language, parent_classes, interfaces, method_ids, fan_in, fan_out, is_module)
+        (id, name, file_path, language, parent_classes, interfaces, method_ids, fan_in, fan_out, is_module, stable_id)
       VALUES
-        (@id, @name, @filePath, @language, @parentClasses, @interfaces, @methodIds, @fanIn, @fanOut, @isModule)
+        (@id, @name, @filePath, @language, @parentClasses, @interfaces, @methodIds, @fanIn, @fanOut, @isModule, @stableId)
     `);
-    const insert = this.db.transaction((batch: ClassNode[]) => {
-      for (const c of batch) {
+    runTransaction(this.db, () => {
+      for (const c of classes) {
         stmt.run({
-          id:            c.id,
-          name:          c.name,
-          filePath:      c.filePath,
-          language:      c.language,
-          parentClasses: JSON.stringify(c.parentClasses),
-          interfaces:    JSON.stringify(c.interfaces),
-          methodIds:     JSON.stringify(c.methodIds),
-          fanIn:         c.fanIn,
-          fanOut:        c.fanOut,
-          isModule:      c.isModule ? 1 : 0,
+          '@id':            c.id,
+          '@name':          c.name,
+          '@filePath':      c.filePath,
+          '@language':      c.language,
+          '@parentClasses': JSON.stringify(c.parentClasses),
+          '@interfaces':    JSON.stringify(c.interfaces),
+          '@methodIds':     JSON.stringify(c.methodIds),
+          '@fanIn':         c.fanIn,
+          '@fanOut':        c.fanOut,
+          '@isModule':      c.isModule ? 1 : 0,
+          '@stableId':      c.stableId ?? null,
         });
       }
     });
-    insert(classes);
+  }
+
+  // ── Decision queries / mutations (spec-16) ─────────────────────────────────────
+
+  /** Replace the projected decision graph wholesale (idempotent re-projection). */
+  insertDecisions(nodes: DecisionNode[], edges: DecisionAffectsEdge[]): void {
+    const nodeStmt: StatementSync = this.db.prepare(`
+      INSERT OR REPLACE INTO decisions
+        (id, decision_id, title, status, rationale, consequences, affected_domains, affected_files, confidence, supersedes)
+      VALUES
+        (@id, @decisionId, @title, @status, @rationale, @consequences, @affectedDomains, @affectedFiles, @confidence, @supersedes)
+    `);
+    const edgeStmt: StatementSync = this.db.prepare(
+      'INSERT INTO decision_edges (decision_id, file_path) VALUES (?, ?)'
+    );
+    runTransaction(this.db, () => {
+      this.db.exec('DELETE FROM decisions; DELETE FROM decision_edges;');
+      for (const n of nodes) {
+        nodeStmt.run({
+          '@id':              n.id,
+          '@decisionId':      n.decisionId,
+          '@title':           n.title,
+          '@status':          n.status,
+          '@rationale':       n.rationale,
+          '@consequences':    n.consequences,
+          '@affectedDomains': JSON.stringify(n.affectedDomains),
+          '@affectedFiles':   JSON.stringify(n.affectedFiles),
+          '@confidence':      n.confidence ?? null,
+          '@supersedes':      n.supersedes ?? null,
+        });
+      }
+      for (const e of edges) edgeStmt.run(e.decisionNodeId, e.filePath);
+    });
+  }
+
+  /** Every projected decision node (deterministic order). */
+  getAllDecisions(): DecisionNode[] {
+    return (
+      this.db.prepare('SELECT * FROM decisions ORDER BY id').all() as unknown as RawDecision[]
+    ).map(rawToDecisionNode);
+  }
+
+  countDecisions(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM decisions').get() as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Governing decisions for a set of files — the deterministic graph join that
+   * replaces orient's runtime affectedFiles set-membership filter (spec-16).
+   *
+   * Path forms differ across callers (edge-store nodes are repo-relative; some
+   * callers pass absolute paths), and decisions are few, so we match in JS with a
+   * tolerant suffix comparator rather than relying on exact SQL equality.
+   */
+  getDecisionsForFiles(files: string[]): DecisionNode[] {
+    if (files.length === 0) return [];
+    const edgeRows = this.db
+      .prepare('SELECT decision_id, file_path FROM decision_edges')
+      .all() as unknown as Array<{ decision_id: string; file_path: string }>;
+    if (edgeRows.length === 0) return [];
+
+    const wanted = files.filter(Boolean);
+    const matchedIds = new Set<string>();
+    for (const row of edgeRows) {
+      if (wanted.some(f => pathsMatch(f, row.file_path))) matchedIds.add(row.decision_id);
+    }
+    if (matchedIds.size === 0) return [];
+
+    return this.getAllDecisions().filter(d => matchedIds.has(d.id));
+  }
+
+  // ── Provenance queries / mutations (spec-18) ───────────────────────────────────
+
+  /** Replace the per-file provenance wholesale (idempotent re-extraction). */
+  insertProvenance(records: FileProvenance[]): void {
+    const stmt: StatementSync = this.db.prepare(`
+      INSERT OR REPLACE INTO provenance
+        (file_path, last_author, last_date, last_commit, last_subject, recent_authors, prs)
+      VALUES
+        (@filePath, @lastAuthor, @lastDate, @lastCommit, @lastSubject, @recentAuthors, @prs)
+    `);
+    runTransaction(this.db, () => {
+      this.db.exec('DELETE FROM provenance;');
+      for (const r of records) {
+        stmt.run({
+          '@filePath':      r.filePath,
+          '@lastAuthor':    JSON.stringify(r.lastAuthor),
+          '@lastDate':      r.lastDate ?? null,
+          '@lastCommit':    r.lastCommit ?? null,
+          '@lastSubject':   r.lastSubject ?? null,
+          '@recentAuthors': JSON.stringify(r.recentAuthors),
+          '@prs':           JSON.stringify(r.prs),
+        });
+      }
+    });
+  }
+
+  countProvenance(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM provenance').get() as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Provenance for a set of files. Path forms differ across callers (edge-store
+   * nodes are repo-relative; some callers pass absolute paths), so match with the
+   * same tolerant comparator used for decisions (spec-18).
+   *
+   * Answered through the `file_path` primary-key index — a briefing for a handful of
+   * touched files must not materialize every mined file in the repository.
+   * (change: optimize-serving-hot-path-caches)
+   */
+  getProvenanceForFiles(files: string[]): FileProvenance[] {
+    return selectRowsForFiles<RawProvenance>(this.db, 'provenance', files).map(rawToProvenance);
+  }
+
+  // ── Change coupling & volatility (spec-22) ─────────────────────────────────────
+
+  /** Replace the per-file change-coupling snapshot wholesale (idempotent re-mine). */
+  insertChangeCoupling(result: ChangeCouplingResult): void {
+    const stmt: StatementSync = this.db.prepare(
+      'INSERT OR REPLACE INTO change_coupling (file_path, churn, coupled_with) VALUES (@filePath, @churn, @coupledWith)'
+    );
+    runTransaction(this.db, () => {
+      this.db.exec('DELETE FROM change_coupling;');
+      // Persist every file that has churn (coupling may be empty for some).
+      for (const [filePath, churn] of result.churn) {
+        stmt.run({
+          '@filePath':    filePath,
+          '@churn':       churn,
+          '@coupledWith': JSON.stringify(result.coupling.get(filePath) ?? []),
+        });
+      }
+    });
+  }
+
+  countChangeCoupling(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM change_coupling').get() as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Change-coupling records for a set of files (tolerant path match, spec-22).
+   * Index-answered, see {@link EdgeStore.getProvenanceForFiles}.
+   */
+  getChangeCouplingForFiles(files: string[]): FileChangeCoupling[] {
+    return selectRowsForFiles<RawCoupling>(this.db, 'change_coupling', files).map(rawToCoupling);
+  }
+
+  /** Top-churn (most volatile) files, descending. */
+  getTopVolatile(limit = 20): FileChangeCoupling[] {
+    return (
+      this.db.prepare('SELECT * FROM change_coupling ORDER BY churn DESC, file_path ASC LIMIT ?')
+        .all(limit) as unknown as RawCoupling[]
+    ).map(rawToCoupling);
   }
 
   // ── Content-hash cache ────────────────────────────────────────────────────────
@@ -387,14 +1320,245 @@ export class EdgeStore {
       .run(filePath, hash, Date.now());
   }
 
-  /** Drop all graph data — used by full analyze rebuild. */
-  clearAll(): void {
-    this.db.exec('DELETE FROM edges; DELETE FROM inheritance_edges; DELETE FROM nodes; DELETE FROM classes; DELETE FROM nodes_fts; DELETE FROM file_hashes;');
+
+  deleteFileHash(filePath: string): void {
+    this.db.prepare('DELETE FROM file_hashes WHERE file_path = ?').run(filePath);
   }
 
-  /** Run fn inside a single SQLite transaction. Nested calls use savepoints. */
+  deletePass1FactsForFile(filePath: string): void {
+    if (!this.hasPass1Facts()) return;
+    this.db.prepare('DELETE FROM pass1_facts WHERE file_path = ?').run(filePath);
+  }
+
+  // ── Pass-1 fact memo (optimize-hash-keyed-analyze) ────────────────────────────
+
+  /**
+   * The memoized Pass-1 facts for this file, but ONLY on an exact three-way key match:
+   * same path, same content, same extractor stamp. Anything else — including a row written
+   * by a different OpenLore or a different grammar set — reads as absent, which costs a
+   * re-extraction and never a wrong answer.
+   */
+  getPass1Facts(filePath: string, contentHash: string, stamp: string): string | undefined {
+    const row = this.db
+      .prepare('SELECT facts FROM pass1_facts WHERE file_path = ? AND content_hash = ? AND extractor_stamp = ?')
+      .get(filePath, contentHash, stamp) as { facts: string } | undefined;
+    return row?.facts;
+  }
+
+  /**
+   * Persist freshly extracted facts. One row per file (the path is the primary key), so a
+   * re-extraction REPLACES the previous content's row rather than accumulating a row per
+   * historical revision — the memo tracks the working tree, not its history.
+   */
+  putPass1Facts(rows: ReadonlyArray<{ filePath: string; contentHash: string; facts: string }>, stamp: string): void {
+    if (rows.length === 0) return;
+    const stmt = this.db.prepare(
+      'INSERT OR REPLACE INTO pass1_facts (file_path, content_hash, extractor_stamp, facts) VALUES (?, ?, ?, ?)'
+    );
+    runTransaction(this.db, () => {
+      for (const r of rows) stmt.run(r.filePath, r.contentHash, stamp, r.facts);
+    });
+  }
+
+  /**
+   * Does this store carry the Pass-1 memo at all? False for an index built before the memo
+   * existed, or materialized from a bundle (which strips it) — a whole-store condition worth
+   * naming once rather than rediscovering as a swallowed error on every file.
+   */
+  hasPass1Facts(): boolean {
+    return this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pass1_facts' LIMIT 1")
+      .get() !== undefined;
+  }
+
+  /**
+   * The KEYS of every memoized file — path, content hash, stamp — never the payloads, so
+   * this stays cheap enough to call for an inventory. Deterministically ordered.
+   */
+  listPass1FactKeys(): Array<{ filePath: string; contentHash: string; stamp: string }> {
+    return (
+      this.db
+        .prepare('SELECT file_path, content_hash, extractor_stamp FROM pass1_facts ORDER BY file_path')
+        .all() as unknown as Array<{ file_path: string; content_hash: string; extractor_stamp: string }>
+    ).map((r) => ({ filePath: r.file_path, contentHash: r.content_hash, stamp: r.extractor_stamp }));
+  }
+
+  /**
+   * Drop memo rows for files that are no longer in the analyzed set — a deleted file must
+   * leave no facts behind that a later run could serve. Diffed in JS rather than with a
+   * `NOT IN (…)` of every live path, which would be a parameter list the size of the repo.
+   * Returns the number of rows removed.
+   */
+  prunePass1Facts(keepPaths: Iterable<string>): number {
+    const keep = keepPaths instanceof Set ? keepPaths : new Set(keepPaths);
+    const drop = this.listPass1FactKeys().map((r) => r.filePath).filter((p) => !keep.has(p));
+    if (drop.length === 0) return 0;
+    const stmt = this.db.prepare('DELETE FROM pass1_facts WHERE file_path = ?');
+    runTransaction(this.db, () => {
+      for (const p of drop) stmt.run(p);
+    });
+    return drop.length;
+  }
+
+  /** How many files currently hold memoized Pass-1 facts. */
+  countPass1Facts(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM pass1_facts').get() as { n: number };
+    return row.n;
+  }
+
+  // ── Explicit stale region (fix-transitive-incremental-staleness) ───────────────
+
+  /**
+   * Mark files as explicitly stale — their topology was NOT recomputed by a
+   * budget-exceeded incremental update. Idempotent (re-marking refreshes the
+   * timestamp). Sound over-approximation: it is always safe to mark more.
+   */
+  markFilesStale(
+    files: readonly string[],
+    at: number = Date.now(),
+    composition?: ReadonlyMap<string, StaleFileComposition>,
+  ): void {
+    if (files.length === 0) return;
+    const stmt = this.db.prepare('INSERT OR REPLACE INTO stale_files (file_path, marked_at) VALUES (?, ?)');
+    const compositionStmt = this.db.prepare(`
+      INSERT OR REPLACE INTO stale_file_composition
+        (file_path, symbol_count, hub_count, chokepoint_count, top_symbol)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const clearCompositionStmt = this.db.prepare('DELETE FROM stale_file_composition WHERE file_path = ?');
+    runTransaction(this.db, () => {
+      for (const f of files) {
+        stmt.run(f, at);
+        const receipt = composition?.get(f);
+        if (receipt) {
+          compositionStmt.run(
+            f,
+            receipt.symbolCount,
+            receipt.hubCount,
+            receipt.chokepointCount,
+            receipt.topSymbol ? JSON.stringify(receipt.topSymbol) : null,
+          );
+        } else {
+          clearCompositionStmt.run(f);
+        }
+      }
+    });
+  }
+
+  /**
+   * Clear the stale mark for files that have just been recomputed (self-heal).
+   * No-op for files that were never stale.
+   */
+  clearFilesStale(files: readonly string[]): void {
+    if (files.length === 0) return;
+    const stmt = this.db.prepare('DELETE FROM stale_files WHERE file_path = ?');
+    const compositionStmt = this.db.prepare('DELETE FROM stale_file_composition WHERE file_path = ?');
+    runTransaction(this.db, () => {
+      for (const f of files) {
+        stmt.run(f);
+        compositionStmt.run(f);
+      }
+    });
+  }
+
+  /** True when a file is in the explicitly-stale region. */
+  isFileStale(file: string): boolean {
+    return this.db.prepare('SELECT 1 FROM stale_files WHERE file_path = ? LIMIT 1').get(file) !== undefined;
+  }
+
+  /** Every file currently in the explicitly-stale region (deterministic order). */
+  getStaleFiles(): string[] {
+    return (
+      this.db.prepare('SELECT file_path FROM stale_files ORDER BY file_path').all() as unknown as Array<{ file_path: string }>
+    ).map((r) => r.file_path);
+  }
+
+  /** Count of files in the explicitly-stale region. */
+  countStaleFiles(): number {
+    const row = this.db.prepare('SELECT COUNT(*) as n FROM stale_files').get() as { n: number };
+    return row.n;
+  }
+
+  /** One-statement snapshot of stale membership and its persisted composition. */
+  getStaleRegionSnapshot(): { files: string[]; composition: StaleRegionComposition } {
+    try {
+      const rows = this.db.prepare(`
+        SELECT sf.file_path, sfc.symbol_count, sfc.hub_count,
+               sfc.chokepoint_count, sfc.top_symbol
+        FROM stale_files sf
+        LEFT JOIN stale_file_composition sfc ON sfc.file_path = sf.file_path
+        ORDER BY sf.file_path
+      `).all() as unknown as Array<{
+        file_path: string;
+        symbol_count: number | null;
+        hub_count: number | null;
+        chokepoint_count: number | null;
+        top_symbol: string | null;
+      }>;
+      const receipts: StaleFileComposition[] = rows.flatMap(row => {
+        if (!isNonNegativeSafeInteger(row.symbol_count) ||
+            !isNonNegativeSafeInteger(row.hub_count) ||
+            !isNonNegativeSafeInteger(row.chokepoint_count) ||
+            row.hub_count > row.symbol_count || row.chokepoint_count > row.hub_count) return [];
+        const hasTopSymbol = typeof row.top_symbol === 'string' && row.top_symbol.length > 0;
+        if ((row.symbol_count > 0) !== hasTopSymbol) return [];
+        let topSymbol: StaleRegionSymbol | undefined;
+        if (hasTopSymbol) {
+          try {
+            const encodedTopSymbol = row.top_symbol;
+            if (typeof encodedTopSymbol !== 'string') return [];
+            const parsed: unknown = JSON.parse(encodedTopSymbol);
+            if (!isStaleRegionSymbol(parsed) || parsed.filePath !== row.file_path) return [];
+            topSymbol = parsed;
+          } catch { return []; }
+        }
+        return {
+          symbolCount: row.symbol_count,
+          hubCount: row.hub_count,
+          chokepointCount: row.chokepoint_count,
+          ...(topSymbol ? { topSymbol } : {}),
+        };
+      });
+      return {
+        files: rows.map(row => row.file_path),
+        composition: combineStaleFileCompositions(receipts, rows.length),
+      };
+    } catch {
+      // Preserve the stale verdict with neutral context if an independently
+      // damaged store lost only this optional reporting table.
+      const files = this.getStaleFiles();
+      return { files, composition: combineStaleFileCompositions([], files.length) };
+    }
+  }
+
+  /** Structural composition persisted with the current stale-file receipt. */
+  getStaleRegionComposition(): StaleRegionComposition {
+    return this.getStaleRegionSnapshot().composition;
+  }
+
+  /**
+   * Drop all graph data — used by the full analyze rebuild.
+   *
+   * `pass1_facts` is deliberately NOT cleared (change: optimize-hash-keyed-analyze). It holds
+   * no graph data: it is the per-file extraction memo that makes the very rebuild running
+   * here cost only the diff, and wiping it would make every rebuild a full re-parse again.
+   * The rebuild REPLACES the rows for files it re-extracted and prunes the rows for files
+   * that are gone, so the memo never outlives the tree it describes. There is no separate
+   * eviction call: `analyze --force` rewrites every row, deleting the analysis directory
+   * removes it with the index, and a SCHEMA_VERSION bump drops it with everything else.
+   */
+  clearAll(): void {
+    this.db.exec('DELETE FROM edges; DELETE FROM inheritance_edges; DELETE FROM nodes; DELETE FROM classes; DELETE FROM nodes_fts; DELETE FROM file_hashes; DELETE FROM decisions; DELETE FROM decision_edges; DELETE FROM provenance; DELETE FROM change_coupling; DELETE FROM cfg_overlay; DELETE FROM stale_file_composition; DELETE FROM stale_files;');
+  }
+
+  /** Run fn inside a single SQLite transaction. */
   transaction(fn: () => void): void {
-    this.db.transaction(fn)();
+    runTransaction(this.db, fn);
+  }
+
+  /** Run an async fn inside one SQLite transaction, preserving nested savepoints. */
+  async transactionAsync<T>(fn: () => Promise<T>): Promise<T> {
+    return runTransactionAsync(this.db, fn);
   }
 
   close(): void {
@@ -403,8 +1567,94 @@ export class EdgeStore {
 
   // ── Factory ───────────────────────────────────────────────────────────────────
 
+  /**
+   * Open the graph store on a READ path. NEVER mutates the store: a schema-version
+   * mismatch or a corrupt DB yields a handle whose {@link notReady} is set (the on-disk
+   * store is preserved — untouched on mismatch, quarantined to `*.corrupt-<n>` on
+   * corruption), which read consumers surface as a not-ready conclusion instead of
+   * serving an empty graph or crashing (change: harden-index-store-lifecycle).
+   */
   static open(dbPath: string): EdgeStore {
-    return new EdgeStore(openDatabase(dbPath));
+    return EdgeStore.openInternal(dbPath, 'read');
+  }
+
+  /**
+   * Open the graph store on an ANALYZE/WRITE path. A SCHEMA_VERSION bump drops and
+   * rebuilds the tables (rebuild-on-bump) and a corrupt DB is quarantined then reopened
+   * fresh — both legitimate here because the caller repopulates the store in the same
+   * operation. Only this path may destroy data.
+   */
+  static openForAnalyze(dbPath: string): EdgeStore {
+    return EdgeStore.openInternal(dbPath, 'analyze');
+  }
+
+  private static openInternal(dbPath: string, mode: 'read' | 'analyze'): EdgeStore {
+    const existed = existsSync(dbPath);
+    // Held so the catch can release it. `openDatabase` SUCCEEDS on a corrupt file — the
+    // corruption surfaces from the schema probe in the EdgeStore constructor below — so the
+    // handle is already open when that throws, and nothing owns it: the EdgeStore was never
+    // constructed. POSIX renames a file with an open handle regardless, so the quarantine
+    // still worked there and the leak stayed invisible. On Windows the move failed EBUSY and
+    // the store fell back to "starting from an empty store" — the silent-empty substitute the
+    // quarantine invariant exists to prevent, on the one platform that could not do it.
+    let rawDb: ReturnType<typeof openDatabase> | undefined;
+    try {
+      rawDb = openDatabase(dbPath, mode === 'read' && existed);
+      const store = new EdgeStore(rawDb, mode, mode === 'read' && !existed);
+      rawDb = undefined; // ownership passed to the store; it closes on its own path now
+      // Existing read targets are probed through a read-only handle so an invalid
+      // schema cannot be altered merely by opening it. A healthy current store is
+      // then reopened with the historical writable handle expected by incremental
+      // callers; schema inspection on that second handle still executes no DDL.
+      if (mode === 'read' && existed && store.notReady === null) {
+        store.close();
+        // Through `rawDb` as well. This handle is WRITABLE and enables WAL, and the
+        // constructor then runs two `prepare()` statements — a corruption that first surfaces
+        // on that second read lands in the same catch, where a handle held only in a temporary
+        // would be invisible to the release and Windows would refuse the quarantine rename.
+        // That is the identical silent-empty-store failure this method exists to prevent, one
+        // branch over.
+        rawDb = openDatabase(dbPath);
+        const reopened = new EdgeStore(rawDb, 'read');
+        rawDb = undefined;
+        return reopened;
+      }
+      return store;
+    } catch (err) {
+      // Release the handle before touching the file. Windows will not rename or unlink a
+      // file that anything still has open, and the quarantine below does exactly that.
+      if (rawDb) { try { rawDb.close(); } catch { /* already gone */ } }
+      // A locked/busy open is transient, not corruption — surface it for the caller
+      // to retry rather than quarantining a healthy store.
+      if (!isCorruptionError(err)) throw err;
+      // CorruptGraphStoreQuarantineParity: move the unreadable file (+ WAL/SHM) aside.
+      const quarantinePath = quarantineCorruptSync(dbPath, (err as Error).message);
+      if (mode === 'analyze') {
+        // The corrupt file is aside; analyze repopulates, so open a fresh store here. Held in
+        // `fresh` rather than a temporary so a throw between the open and the constructor
+        // cannot leak it — the quarantine has already run, but a leaked handle on the new file
+        // would block the NEXT one.
+        const fresh = openDatabase(dbPath);
+        try {
+          return new EdgeStore(fresh, 'analyze');
+        } catch (freshErr) {
+          try { fresh.close(); } catch { /* already gone */ }
+          throw freshErr;
+        }
+      }
+      // Read path: never recreate an empty on-disk store (that would be the silent
+      // empty substitute the invariant forbids). Hand back a disclosed not-ready handle
+      // over an ephemeral in-memory DB the caller will not query.
+      const es = new EdgeStore(new EdgeStoreDatabase(':memory:'), 'read');
+      es._fault = {
+        reason: 'quarantined',
+        quarantinePath,
+        message:
+          `graph index was corrupt and quarantined${quarantinePath ? ` to ${quarantinePath}` : ''} — ` +
+          `run \`openlore analyze\` to rebuild it`,
+      };
+      return es;
+    }
   }
 
   static exists(outputDir: string): boolean {
@@ -424,10 +1674,13 @@ interface RawEdge {
   callee_id:   string;
   callee_file: string | null;
   callee_name: string;
-  line:        number | null;
-  confidence:  string;
-  kind:        string | null;
-  call_type:   string | null;
+  line:        unknown;
+  confidence:  unknown;
+  kind:        unknown;
+  call_type:   unknown;
+  synthesized_by: unknown;
+  arg_count: unknown;
+  arg_count_lower_bound: unknown;
 }
 
 interface RawNode {
@@ -447,6 +1700,8 @@ interface RawNode {
   external_kind:  string | null;
   is_hub:         number;
   is_entry_point: number;
+  stable_id:      string | null;
+  call_arity:     unknown;
 }
 
 interface RawClass {
@@ -460,21 +1715,233 @@ interface RawClass {
   fan_in:         number;
   fan_out:        number;
   is_module:      number;
+  stable_id:      string | null;
 }
 
-function rawToCallEdge(r: RawEdge): CallEdge {
+interface RawDecision {
+  id:               string;
+  decision_id:      string;
+  title:            string;
+  status:           string;
+  rationale:        string;
+  consequences:     string;
+  affected_domains: string;
+  affected_files:   string;
+  confidence:       string | null;
+  supersedes:       string | null;
+}
+
+interface RawProvenance {
+  file_path:      string;
+  last_author:    string;
+  last_date:      string | null;
+  last_commit:    string | null;
+  last_subject:   string | null;
+  recent_authors: string;
+  prs:            string;
+}
+
+interface RawCoupling {
+  file_path:    string;
+  churn:        number;
+  coupled_with: string;
+}
+
+function rawToCoupling(r: RawCoupling): FileChangeCoupling {
   return {
-    callerId:   r.caller_id,
-    calleeId:   r.callee_id,
-    calleeName: r.callee_name,
-    ...(r.line !== null && { line: r.line }),
-    confidence: r.confidence as CallEdge['confidence'],
-    ...(r.kind      && { kind:     r.kind     as CallEdge['kind'] }),
-    ...(r.call_type && { callType: r.call_type as CallEdge['callType'] }),
+    filePath:    r.file_path,
+    churn:       r.churn,
+    coupledWith: JSON.parse(r.coupled_with) as CoupledFile[],
   };
 }
 
+function rawToProvenance(r: RawProvenance): FileProvenance {
+  return {
+    filePath:      r.file_path,
+    lastAuthor:    JSON.parse(r.last_author) as FileProvenance['lastAuthor'],
+    lastDate:      r.last_date ?? '',
+    lastCommit:    r.last_commit ?? '',
+    lastSubject:   r.last_subject ?? '',
+    recentAuthors: JSON.parse(r.recent_authors) as FileProvenance['recentAuthors'],
+    prs:           JSON.parse(r.prs) as FileProvenance['prs'],
+  };
+}
+
+/**
+ * Every `/`-delimited proper suffix of `path`, plus `path` itself and its
+ * leading-slash-stripped form.
+ *
+ * `pathsMatch(a, b)` holds when the two are equal ignoring leading slashes, or when
+ * either is a `/`-delimited suffix of the other. Both directions of that relation are
+ * "one side appears in the other's suffix set", so this one function answers both:
+ * applied to the WANTED path it enumerates the stored values an indexed lookup can
+ * find directly; applied to a STORED path it says whether a wanted path matches it
+ * with a Set probe, independent of how many paths were requested.
+ * (change: optimize-serving-hot-path-caches)
+ */
+function pathSuffixSet(path: string): string[] {
+  const stripped = path.replace(/^\/+/, '');
+  const out = new Set<string>([path, stripped]);
+  let rest = stripped;
+  for (let cut = rest.indexOf('/'); cut !== -1; cut = rest.indexOf('/')) {
+    rest = rest.slice(cut + 1);
+    if (rest) out.add(rest);
+  }
+  return [...out];
+}
+
+/**
+ * Rows of `table` whose `file_path` {@link pathsMatch} any of `files`.
+ *
+ * Two passes, together exactly `pathsMatch` and never a full row materialization:
+ *
+ *  1. An indexed `file_path IN (…)` over each wanted path's suffix set. This answers
+ *     every case except "the stored path is strictly longer than the wanted one".
+ *  2. That remaining case cannot be enumerated from the wanted paths, so it needs a
+ *     scan — but only of the `file_path` column, which SQLite answers from the primary
+ *     key as a COVERING INDEX scan. Each stored path is then probed against a Set of
+ *     the wanted paths, so this pass costs O(rows x path depth) regardless of how many
+ *     files were requested, and the rows themselves are fetched by key afterwards.
+ *
+ * Both the probe and the `IN` compare with BINARY semantics, matching `pathsMatch`. A
+ * SQL `LIKE '%/x'` form would NOT: `LIKE` is ASCII-case-insensitive by default, so it
+ * would accept `src/Utils.ts` for a request for `utils.ts`.
+ *
+ * Rows come back in the table's own `rowid` order — the order the previous full-scan
+ * implementation returned them in. Callers take `records[0]` and `slice(0, 10)` from
+ * these lists, so the order is observable and is preserved deliberately.
+ */
+function selectRowsForFiles<T>(db: DatabaseSync, table: 'provenance' | 'change_coupling', files: string[]): T[] {
+  const wanted = files.filter(Boolean);
+  if (wanted.length === 0) return [];
+
+  const byPath = new Map<string, { rowid: number; row: T }>();
+  const collect = (rows: unknown[]): void => {
+    for (const raw of rows as Array<T & { file_path: string; __rowid: number }>) {
+      const { __rowid, ...row } = raw;
+      byPath.set(raw.file_path, { rowid: __rowid, row: row as unknown as T });
+    }
+  };
+  const fetchByPath = (paths: string[]): void => {
+    for (const chunk of chunkForSqlIn(paths)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      collect(db.prepare(`SELECT rowid AS __rowid, * FROM ${table} WHERE file_path IN (${placeholders})`).all(...chunk));
+    }
+  };
+
+  // Both the bare and leading-slash forms: a stored path may carry a leading slash and
+  // still be a suffix of the wanted one, which `pathsMatch` accepts.
+  const exact = new Set<string>();
+  for (const suffix of wanted.flatMap(pathSuffixSet)) {
+    exact.add(suffix);
+    if (!suffix.startsWith('/')) exact.add(`/${suffix}`);
+  }
+  fetchByPath([...exact]);
+
+  const wantedStripped = new Set(wanted.map((f) => f.replace(/^\/+/, '')));
+  const storedPaths = db.prepare(`SELECT file_path FROM ${table}`).all() as unknown as Array<{ file_path: string }>;
+  const longerMatches: string[] = [];
+  for (const { file_path } of storedPaths) {
+    if (byPath.has(file_path)) continue;
+    if (pathSuffixSet(file_path).some((suffix) => wantedStripped.has(suffix))) longerMatches.push(file_path);
+  }
+  if (longerMatches.length > 0) fetchByPath(longerMatches);
+
+  return [...byPath.values()].sort((a, b) => a.rowid - b.rowid).map(({ row }) => row);
+}
+
+/** Tolerant path equality: exact, or one path is a suffix of the other. */
+function pathsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const na = a.replace(/^\/+/, '');
+  const nb = b.replace(/^\/+/, '');
+  if (na === nb) return true;
+  return na.endsWith('/' + nb) || nb.endsWith('/' + na);
+}
+
+function rawToDecisionNode(r: RawDecision): DecisionNode {
+  return {
+    id:              r.id,
+    decisionId:      r.decision_id,
+    kind:            'decision',
+    title:           r.title,
+    status:          r.status as DecisionStatus,
+    rationale:       r.rationale,
+    consequences:    r.consequences,
+    affectedDomains: JSON.parse(r.affected_domains) as string[],
+    affectedFiles:   JSON.parse(r.affected_files) as string[],
+    confidence:      (r.confidence ?? 'medium') as DecisionNode['confidence'],
+    ...(r.supersedes ? { supersedes: r.supersedes } : {}),
+  };
+}
+
+const EDGE_CONFIDENCES = EDGE_CONFIDENCE_VALUES;
+const EDGE_KINDS = new Set<NonNullable<CallEdge['kind']>>([
+  'calls', 'overrides', 'tested_by', 'references', 'depends_on',
+  'affects', 'authored_by', 'changed_in_pr',
+]);
+const CALL_TYPES = new Set<NonNullable<CallEdge['callType']>>([
+  'direct', 'method', 'awaited', 'constructor',
+]);
+const CALL_ARITY_KEYS = new Set([
+  'required', 'total', 'variadic', 'variadicParameterCount',
+  'hasOptionalOrDefault', 'implicitReceiverCount', 'overloaded',
+]);
+
+function isSafeNonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Invalid required edge facts drop the row; invalid optional facts are omitted. */
+function rawToCallEdge(r: RawEdge): CallEdge[] {
+  if (typeof r.confidence !== 'string' || !EDGE_CONFIDENCES.has(r.confidence as CallEdge['confidence'])) {
+    return [];
+  }
+  if (r.kind !== null
+    && (typeof r.kind !== 'string' || !EDGE_KINDS.has(r.kind as NonNullable<CallEdge['kind']>))) {
+    return [];
+  }
+  if (r.call_type !== null
+    && (typeof r.call_type !== 'string' || !CALL_TYPES.has(r.call_type as NonNullable<CallEdge['callType']>))) {
+    return [];
+  }
+  const confidence = r.confidence as CallEdge['confidence'];
+  const line = isSafeNonnegativeInteger(r.line) ? r.line : undefined;
+  const kind = typeof r.kind === 'string'
+    ? r.kind as NonNullable<CallEdge['kind']>
+    : undefined;
+  const callType = typeof r.call_type === 'string'
+    ? r.call_type as NonNullable<CallEdge['callType']>
+    : undefined;
+  if (callType && kind && kind !== 'calls') return [];
+  const lowerBoundMarkerValid = r.arg_count_lower_bound === null
+    || r.arg_count_lower_bound === 0
+    || r.arg_count_lower_bound === 1;
+  const argCount = lowerBoundMarkerValid && isSafeNonnegativeInteger(r.arg_count)
+    ? r.arg_count
+    : undefined;
+
+  return [{
+    callerId:   r.caller_id,
+    calleeId:   r.callee_id,
+    calleeName: r.callee_name,
+    ...(line !== undefined && { line }),
+    confidence,
+    ...(kind && { kind }),
+    ...(callType && { callType }),
+    ...(confidence === 'synthesized' && typeof r.synthesized_by === 'string' && r.synthesized_by.length > 0
+      && { synthesizedBy: r.synthesized_by }),
+    ...(argCount !== undefined && { argCount }),
+    ...(argCount !== undefined && r.arg_count_lower_bound === 1 && { argCountLowerBound: true }),
+  }];
+}
+
 function rawToFunctionNode(r: RawNode): FunctionNode {
+  let callArity: FunctionNode['callArity'];
+  if (typeof r.call_arity === 'string' && r.call_arity.length <= 1024) {
+    try { callArity = validateCallArity(JSON.parse(r.call_arity)); }
+    catch { callArity = undefined; }
+  }
   return {
     id:          r.id,
     name:        r.name,
@@ -490,7 +1957,35 @@ function rawToFunctionNode(r: RawNode): FunctionNode {
     ...(r.signature    && { signature:    r.signature }),
     ...(r.is_external  && { isExternal:   true }),
     ...(r.external_kind && { externalKind: r.external_kind as FunctionNode['externalKind'] }),
+    ...(r.stable_id    && { stableId:     r.stable_id }),
+    ...(callArity && { callArity }),
   };
+}
+
+function validateCallArity(value: unknown): FunctionNode['callArity'] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const arity = value as Record<string, unknown>;
+  if (Object.keys(arity).some((key) => !CALL_ARITY_KEYS.has(key))) return undefined;
+  if (!isSafeNonnegativeInteger(arity.required)
+    || !isSafeNonnegativeInteger(arity.total)
+    || arity.required > arity.total
+    || typeof arity.variadic !== 'boolean'
+    || typeof arity.hasOptionalOrDefault !== 'boolean'
+    || arity.hasOptionalOrDefault !== (arity.required < arity.total)
+    || !isSafeNonnegativeInteger(arity.implicitReceiverCount)
+    || arity.implicitReceiverCount > 1
+    || (arity.overloaded !== undefined && arity.overloaded !== true)) {
+    return undefined;
+  }
+  if (arity.variadicParameterCount !== undefined) {
+    if (!isSafeNonnegativeInteger(arity.variadicParameterCount)
+      || arity.variadicParameterCount > 2
+      || (arity.variadic && arity.variadicParameterCount === 0)
+      || (!arity.variadic && arity.variadicParameterCount !== 0)) {
+      return undefined;
+    }
+  }
+  return arity as unknown as NonNullable<FunctionNode['callArity']>;
 }
 
 function rawToClassNode(r: RawClass): ClassNode {
@@ -505,5 +2000,6 @@ function rawToClassNode(r: RawClass): ClassNode {
     fanIn:         r.fan_in,
     fanOut:        r.fan_out,
     ...(r.is_module && { isModule: true }),
+    ...(r.stable_id && { stableId: r.stable_id }),
   };
 }

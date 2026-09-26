@@ -1,7 +1,7 @@
 /**
- * spec-gen MCP Server
+ * openlore MCP Server
  *
- * Exposes spec-gen's static analysis capabilities as Model Context Protocol
+ * Exposes openlore's static analysis capabilities as Model Context Protocol
  * tools, usable from Cline, Claude Code, or any MCP-compatible AI agent.
  *
  * Transport: stdio (standard for editor-embedded MCP servers)
@@ -9,24 +9,53 @@
  * Configuration for Cline / Claude Code:
  *   {
  *     "mcpServers": {
- *       "spec-gen": {
+ *       "openlore": {
  *         "command": "node",
- *         "args": ["/path/to/spec-gen/dist/cli/index.js", "mcp"]
+ *         "args": ["/path/to/openlore/dist/cli/index.js", "mcp"]
  *       }
  *     }
  *   }
  */
 
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+const _require = createRequire(import.meta.url);
+const _pkgVersion = (_require('../../../package.json') as { version: string }).version;
+
 import { Command } from 'commander';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+// The stdio transport SDK is an OPTIONAL dependency, loaded inside the command action rather than
+// here: a module-scope import makes every `import openlore` — the CLI's own `--help`, the
+// programmatic API, the HTTP daemon — load an SDK only `openlore mcp` uses, and fail outright when
+// a host declined it (cli: OptionalFeatureDependenciesDegradeAtTheirOwnCommand).
+import { loadMcpSdk, OptionalFeatureError } from './optional-features.js';
 import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+  checkToolArguments,
+  withToolTimeout,
+  capStructuredResult,
+  classifyToolError,
+} from '../../core/services/mcp-handlers/tool-guard.js';
 
 import { sanitizeMcpError, validateDirectory } from '../../core/services/mcp-handlers/utils.js';
-import { DEFAULT_DRIFT_MAX_FILES } from '../../constants.js';
+import { createTracker, updateTracker, updatePanic, resetPanicOnOrient, getFreshnessSignal, trackerToPanicState } from '../../core/services/mcp-handlers/epistemic-lease.js';
+import type { EpistemicTracker } from '../../core/services/mcp-handlers/epistemic-lease.js';
+import {
+  registerRepairBuilder,
+  registerRepairHost,
+  buildIndexInChildProcess,
+  enableChildProcessBuilds,
+  stopChildProcessBuilds,
+  repairStatusFor,
+  takeFirstTouchNotice,
+  repairDisclosureText,
+  autoInitSuppression,
+} from '../../core/services/cold-start-bootstrap.js';
+import type { PanicResponseMode } from '../../types/index.js';
+import { readPanicState, mutatePanicStateLocked, getPanicSignalText } from '../../core/services/mcp-handlers/panic-response.js';
+import { emit, setTelemetryIdentity } from '../../core/services/telemetry.js';
+import { readOpenLoreConfig } from '../../core/services/config-manager.js';
+import { MCP_TOOL_MAX_BYTES, LEAN_DEFAULT_PRESET, FULL_PRESET, FULL_PRESET_ALIAS } from '../../constants.js';
+import { capabilityFamily, groupToolsByFamily, resolveCanonicalToolName } from '../../core/services/mcp-handlers/tool-contract.js';
+import { CAPABILITIES as LANGUAGE_CAPABILITIES } from '../../core/analyzer/language-support.js';
 import {
   handleGetCallGraph,
   handleGetSubgraph,
@@ -42,19 +71,11 @@ import {
   handleSearchCode,
   handleSuggestInsertionPoints,
   handleSearchSpecs,
-  handleListSpecDomains,
-  handleGetSpec,
-  handleUnifiedSearch,
 } from '../../core/services/mcp-handlers/semantic.js';
-import { handleOrient } from '../../core/services/mcp-handlers/orient.js';
-import { handleGenerateChangeProposal, handleAnnotateStory } from '../../core/services/mcp-handlers/change.js';
-import {
-  handleRecordDecision,
-  handleListDecisions,
-  handleApproveDecision,
-  handleRejectDecision,
-  handleSyncDecisions,
-} from '../../core/services/mcp-handlers/decisions.js';
+import { dispatchTool, UnknownToolError } from '../../core/services/tool-dispatch.js';
+import { ensureServeDaemon, callServeTool, isServePresetRejection, type ServeEndpoint } from '../../core/services/serve-client.js';
+import { createShutdownCoordinator } from '../../utils/shutdown.js';
+import { buildToolListPayload } from '../../core/services/mcp-standing-cost.js';
 import {
   handleAnalyzeCodebase,
   handleGetArchitectureOverview,
@@ -64,8 +85,6 @@ import {
   handleGetMapping,
   handleCheckSpecDrift,
   handleGetFunctionSkeleton,
-  handleGetFunctionBody,
-  handleGetDecisions,
   handleGetRouteInventory,
   handleGetMiddlewareInventory,
   handleGetSchemaInventory,
@@ -123,6 +142,40 @@ export {
 // TOOL DEFINITIONS
 // ============================================================================
 
+// Spec 28 + change: fix-mcp-argument-contract — `directory` is shared by every
+// tool and defaults to the server's captured launch cwd. Keep that contract in
+// one short description so tools/list does not pay for a long repeated prefix.
+const DIR_DESC = 'Absolute path; default cwd';
+
+/**
+ * Shared inputSchema property for the concise/detailed verbosity contract
+ * (ConciseByDefaultDetailedOnRequest). A verbose list tool returns a concise
+ * summary (total + a sample + a truncation receipt) by default and the full
+ * payload only when `responseFormat:"detailed"` is requested.
+ */
+const RESPONSE_FORMAT_PROP = {
+  type: 'string',
+  enum: ['concise', 'detailed'],
+  description: 'Output verbosity. "concise" (default): total + a sample + a truncation receipt. "detailed": the full inventory.',
+} as const;
+
+// Optional federation scope, shared by the four federation-aware conclusion tools
+// (analyze_impact, select_tests, find_dead_code, find_path). Inert unless an
+// `.openlore/federation.json` registry exists (built via `openlore federation add`),
+// so the default surface registers no active cross-repo behavior.
+// (change: add-multi-repo-federation)
+const FEDERATION_PROPS = {
+  federation: {
+    type: 'boolean',
+    description: 'Opt-in: compute across federated repos (.openlore/federation.json); no-op without a registry (default false).',
+  },
+  federationRepos: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Limit federation scope to these registry repo names (default: all).',
+  },
+} as const;
+
 export const TOOL_DEFINITIONS = [
   {
     name: 'orient',
@@ -131,13 +184,14 @@ export const TOOL_DEFINITIONS = [
       'Given a natural-language task description, returns in ONE call: relevant functions, source files, ' +
       'spec domains that cover them, depth-1 call neighbours, top insertion point candidates, ' +
       'and matching spec sections. Falls back to keyword search if the embedding server is down. ' +
-      'Requires "spec-gen analyze" to have been run at least once.',
+      'Requires "openlore analyze" to have been run at least once.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         task: {
           type: 'string',
@@ -147,8 +201,21 @@ export const TOOL_DEFINITIONS = [
           type: 'number',
           description: 'Number of relevant functions to return (default: 5)',
         },
+        tokenBudget: {
+          type: 'number',
+          description: 'Optional: fit the whole response to ~this many tokens: functions ranked past `limit` are added while they fit, or lowest-ranked entries are dropped (decisions never); counts in `budget`',
+        },
+        lean: {
+          type: 'boolean',
+          description: 'Return only the navigation core (relevantFunctions + callPaths + specDomains); drop provenance/change-coupling/insertion-points/specs/decisions enrichment (each reachable via expand handles or dedicated tools). Lower per-call cost for shallow "who/where" lookups.',
+        },
+        rankBy: {
+          type: 'string',
+          enum: ['distance', 'pagerank'],
+          description: 'Opt-in landmark ordering (default "distance"). "pagerank" orders task-scoped landmarks by personalized PageRank seeded on the matched functions — connectivity-weighted relevance, not just nearest distance. Default output unchanged.',
+        },
       },
-      required: ['directory', 'task'],
+      required: ['task'],
     },
   },
   {
@@ -160,34 +227,67 @@ export const TOOL_DEFINITIONS = [
       'Results are cached for 1 hour; skip this if the cache is recent.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory to analyze',
+          description: DIR_DESC,
         },
         force: {
           type: 'boolean',
           description: 'Force re-analysis even if a recent cache exists (default: false)',
         },
       },
-      required: ['directory'],
     },
   },
   {
     name: 'get_architecture_overview',
     description:
       'USE THIS WHEN: onboarding to an unknown codebase, or before planning a large feature. ' +
-      'Returns domain clusters, cross-cluster dependencies, global entry points, and critical hubs — ' +
-      'faster than reading package.json + directory tree yourself. Run analyze_codebase first.',
+      'Returns domain clusters, cross-cluster dependencies, global entry points, critical hubs, and deterministic per-domain evidence. ' +
+      'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory (must have been analyzed first)',
+          description: DIR_DESC,
         },
       },
-      required: ['directory'],
+    },
+  },
+  {
+    name: 'prepare_spec_generation',
+    description: 'Return paged evidence for a host to author an OpenSpec domain. Read-only; no LLM or writes.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        domain: { type: 'string', description: 'Analyzed domain to document.' },
+        cursor: { type: 'string', description: 'Continuation cursor.' },
+        maxItems: { type: 'number', minimum: 10, maximum: 200, description: 'Page size (default 80).' },
+        maxResponseBytes: { type: 'number', minimum: 8192, maximum: 225280, description: 'Byte budget (default 49,152).' },
+      },
+      required: ['domain'],
+    },
+  },
+  {
+    name: 'prepare_spec_repair',
+    description: 'Return paged evidence for a host to repair an OpenSpec domain. Read-only; no LLM or writes.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        domain: { type: 'string', description: 'Existing domain to repair.' },
+        baseRef: { type: 'string', description: 'Drift comparison ref.' },
+        cursor: { type: 'string', description: 'Continuation cursor.' },
+        maxItems: { type: 'number', minimum: 10, maximum: 200, description: 'Maximum evidence records per page (default 80).' },
+        maxResponseBytes: { type: 'number', minimum: 8192, maximum: 225280, description: 'Byte budget (default 49,152).' },
+      },
+      required: ['domain'],
     },
   },
   {
@@ -199,13 +299,13 @@ export const TOOL_DEFINITIONS = [
       'and cyclic dependencies. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory (must have been analyzed first)',
+          description: DIR_DESC,
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -213,17 +313,16 @@ export const TOOL_DEFINITIONS = [
     description:
       'Return the call graph for a project: hub functions (high fan-in), ' +
       'entry points (no internal callers), and architectural layer violations. ' +
-      'Supports TypeScript, JavaScript, Python, Go, Rust, Ruby, Java, C++. ' +
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -233,16 +332,25 @@ export const TOOL_DEFINITIONS = [
       'Detects Type 1 (exact clones — identical after whitespace/comment normalization), ' +
       'Type 2 (structural clones — same structure with renamed variables), and ' +
       'Type 3 (near-clones with Jaccard similarity ≥ 0.7 on token n-grams). ' +
-      'No LLM calls required. Run analyze_codebase first.',
+      'This is the WHOLE-REPO audit of every clone group; for the pre-write "does a near-duplicate ' +
+      'of THIS function already exist?" one-vs-all query, use find_clones instead. ' +
+      'Returns a concise summary (stats + top clone groups + a truncation receipt) by default; ' +
+      'pass responseFormat:"detailed" for the full report. ' +
+      'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory (must have been analyzed first)',
+          description: DIR_DESC,
+        },
+        responseFormat: {
+          type: 'string',
+          enum: ['concise', 'detailed'],
+          description: 'Output verbosity. "concise" (default): stats + the top clone groups + a truncation receipt. "detailed": the full report.',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -253,10 +361,11 @@ export const TOOL_DEFINITIONS = [
       'Optionally filter by file path pattern. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         filePattern: {
           type: 'string',
@@ -264,7 +373,6 @@ export const TOOL_DEFINITIONS = [
             'Optional substring to filter file paths (e.g. "services", "api", ".py")',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -278,10 +386,11 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         functionName: {
           type: 'string',
@@ -304,8 +413,12 @@ export const TOOL_DEFINITIONS = [
           enum: ['json', 'mermaid'],
           description: 'Output format: "json" (default) or "mermaid" flowchart diagram',
         },
+        directResolvedOnly: {
+          type: 'boolean',
+          description: 'Traverse only directly-resolved edges, ignoring synthesized dynamic-dispatch edges (default false).',
+        },
       },
-      required: ['directory', 'functionName'],
+      required: ['functionName'],
     },
   },
   {
@@ -315,13 +428,16 @@ export const TOOL_DEFINITIONS = [
       '"which call chain produced this error?", "is there a path from A to B?". ' +
       'Finds all execution paths between two functions in the call graph (BFS/DFS, ' +
       'shortest first). Complementary to get_subgraph — use get_subgraph for ' +
-      'neighbourhood exploration, trace_execution_path for point-to-point tracing.',
+      'neighbourhood exploration, trace_execution_path for point-to-point tracing. ' +
+      'Distinct from find_path: trace_execution_path enumerates the paths for debugging; ' +
+      'find_path returns just the single CHEAPEST route (and accepts role/landmark selectors) for quick reachability.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         entryFunction: {
           type: 'string',
@@ -339,23 +455,36 @@ export const TOOL_DEFINITIONS = [
           type: 'number',
           description: 'Maximum number of paths to return (default: 10, max: 50)',
         },
+        directResolvedOnly: {
+          type: 'boolean',
+          description: 'Traverse only directly-resolved edges, ignoring synthesized dynamic-dispatch edges (default false).',
+        },
+        valueLevel: {
+          type: 'boolean',
+          description: 'Opt-in: restrict the first hop to calls data-dependent on a value via the def-use overlay; falls back to function granularity (default false).',
+        },
+        valueParam: {
+          type: 'string',
+          description: 'Entry parameter/variable to trace (with valueLevel; omit = all params).',
+        },
       },
-      required: ['directory', 'entryFunction', 'targetFunction'],
+      required: ['entryFunction', 'targetFunction'],
     },
   },
   {
     name: 'get_mapping',
     description:
-      'Return the requirement → function mapping produced by spec-gen generate. ' +
+      'Return the requirement → function mapping produced by openlore generate. ' +
       'Shows which functions implement which spec requirements, confidence level ' +
       '(llm / heuristic), and orphan functions not covered by any requirement. ' +
-      'Requires spec-gen generate to have been run at least once.',
+      'Requires openlore generate to have been run at least once.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         domain: {
           type: 'string',
@@ -366,7 +495,6 @@ export const TOOL_DEFINITIONS = [
           description: 'Return only orphan functions (not covered by any requirement)',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -375,13 +503,16 @@ export const TOOL_DEFINITIONS = [
       'USE THIS WHEN: you\'ve modified code and want to know if the specs are still aligned, ' +
       'or when asked "is the code in sync with the spec?", "what changed since the last spec run?". ' +
       'Compares git-changed files against spec coverage — impossible to replicate by reading files. ' +
-      'Requires spec-gen generate to have been run at least once. No LLM required.',
+      'Distinct from its sibling audit_spec_coverage: check_spec_drift asks whether EXISTING specs still ' +
+      'match code you changed (drift), while audit_spec_coverage asks what requirements/code have NO spec at all (coverage gaps). ' +
+      'Requires openlore generate to have been run at least once. No LLM required.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory (must be a git repository)',
+          description: DIR_DESC,
         },
         base: {
           type: 'string',
@@ -403,11 +534,11 @@ export const TOOL_DEFINITIONS = [
           description: 'Minimum severity to report (default: "warning")',
         },
         maxFiles: {
-          type: 'number',
+          type: 'integer',
+          minimum: 1,
           description: 'Maximum number of changed files to analyze (default: 100)',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -419,10 +550,11 @@ export const TOOL_DEFINITIONS = [
       'Call this before touching any non-trivial function. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         symbol: {
           type: 'string',
@@ -432,8 +564,227 @@ export const TOOL_DEFINITIONS = [
           type: 'number',
           description: 'Traversal depth for upstream/downstream chains (default: 2)',
         },
+        directResolvedOnly: {
+          type: 'boolean',
+          description: 'Traverse only directly-resolved edges, ignoring synthesized dynamic-dispatch edges (default false).',
+        },
+        valueLevel: {
+          type: 'boolean',
+          description: 'Opt-in: narrow downstream to calls data-dependent on a value via the def-use overlay; falls back to function granularity (default false).',
+        },
+        valueParam: {
+          type: 'string',
+          description: 'Parameter/variable to trace (with valueLevel; omit = all params).',
+        },
+        ...FEDERATION_PROPS,
       },
-      required: ['directory', 'symbol'],
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'select_tests',
+    description:
+      'USE THIS WHEN: you changed code and want to know which tests to run — ' +
+      '"which tests cover parseConfig?", "what should I run for this diff?". ' +
+      'Walks the call graph BACKWARD from the change to every test that transitively reaches it, ' +
+      'with the reaching path per test, and always includes changed and new test files; each test says why it was selected. ' +
+      'Deterministic, offline, no test run. ' +
+      'It is an over-approximate PRIORITIZER (run these first), not a sound replacement for the full ' +
+      'suite — the response states its confidence and coverage. A diff resolves to the symbols that ' +
+      'actually changed (formatting and comments are not changes); a file kept whole says why in ' +
+      'changeGranularity. The exact inverse of report_coverage_gaps ' +
+      '(which finds important code NO test reaches); this finds the reaching tests FOR a change. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        changedSymbols: {
+          type: 'array',
+          maxItems: 100,
+          items: { type: 'string', minLength: 1 },
+          description: 'Changed function/method names. Optional — if neither this nor diffRef is given, defaults to your current working-tree changes vs HEAD.',
+        },
+        diffRef: {
+          type: 'string',
+          description: 'Git ref to diff the working tree against (e.g. "HEAD", "main"). Optional — defaults to HEAD when neither this nor changedSymbols is given.',
+        },
+        maxDepth: { type: 'number', description: 'Backward reachability depth (default 12)' },
+        directResolvedOnly: { type: 'boolean', description: 'Traverse only directly-resolved edges, ignoring synthesized dynamic-dispatch edges (default false).' },
+        ...FEDERATION_PROPS,
+      },
+    },
+  },
+  {
+    name: 'blast_radius',
+    description:
+      'USE THIS WHEN: before committing/editing, you want one briefing of what your diff actually ' +
+      'touches — "what is the blast radius of my changes?", "is this change safe to commit?". ' +
+      'Composes existing deterministic analyses over the staged/working diff into a single ' +
+      'conclusion-shaped briefing over the symbols the diff ACTUALLY changed (formatting and comments ' +
+      'are not changes; a file kept whole says why in changeGranularity): affected callers and ' +
+      'layers crossed (analyze_impact), the tests ' +
+      'to run (select_tests), the anchored memories/decisions the diff will turn drifted/orphaned and ' +
+      'the specs it will make stale (check_spec_drift). No LLM, no new analysis — pure orchestration. ' +
+      'Advisory: it informs, you act. Distinct from its change-family siblings: structural_diff is the raw ' +
+      'graph delta + newly-stale callers, change_impact_certificate certifies the paths a diff newly opens ' +
+      'into a sensitive surface; this is the all-in-one pre-commit briefing. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to diff the working tree against (e.g. "HEAD", "main"). Default HEAD (uncommitted changes).' },
+        depth: { type: 'number', description: 'Impact-analysis traversal depth (default 2).' },
+        maxSymbols: { type: 'number', description: 'Cap on the number of highest-fan-in changed symbols analyzed for impact (default 12). Truncation is reported.' },
+      },
+    },
+  },
+  {
+    name: 'find_dead_code',
+    description:
+      'USE THIS WHEN: "what code is unreachable / dead?", "is anything calling X?", or ' +
+      '"what becomes dead if I delete X?". Cross-language mark-and-sweep reachability from roots ' +
+      '(tests, imported symbols, route handlers, main, files a config invokes) over the call graph. ' +
+      'Pass ifDeleted to get the downstream-only-reachable set for a symbol. ' +
+      'Results are confidence-tagged CANDIDATES, never deletion authority — dynamic dispatch, DI, ' +
+      'and external consumers cause false positives, stated in the response. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        ifDeleted: { type: 'string', description: 'Symbol name — returns what becomes dead if it is deleted (delete-impact mode)' },
+        maxResults: { type: 'number', description: 'Max candidate-dead results (default 100)' },
+        filePattern: { type: 'string', description: 'Only report candidates whose file path contains this substring' },
+        directResolvedOnly: { type: 'boolean', description: 'Restrict reachability to directly-resolved edges, ignoring synthesized dynamic-dispatch edges — strict certainty over completeness (default false).' },
+        ...FEDERATION_PROPS,
+      },
+    },
+  },
+  {
+    name: 'verify_claim',
+    description:
+      'USE THIS BEFORE asserting a structural fact ("X is dead", "Y calls Z", "this is safe to change") ' +
+      'or citing a decision ("ADR abc12345 governs this"). ' +
+      'Returns a deterministic verdict (confirmed | refuted | unverifiable) + a citation receipt (spans, ' +
+      'content hashes, index commit) — a graph computation, never an LLM guess. kinds: calls, reaches, ' +
+      'impacts, dead, safe-to-change (structural); decision-current (is a recorded decision still ' +
+      'authoritative, or superseded/rejected?). "unverifiable" is first-class when the claim hits a ' +
+      'dynamic-dispatch blind spot or names an unknown decision — hedge or read the source. Run ' +
+      'analyze_codebase first for structural kinds.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        kind: {
+          type: 'string',
+          enum: ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change', 'decision-current'],
+          description: 'The kind of claim to verify (structural, or decision-current for decision authority).',
+        },
+        subject: { type: 'string', description: 'What the claim is about: a function/method name for structural kinds, or an 8-character decision id for decision-current.' },
+        object: { type: 'string', description: 'The second symbol — required for relational kinds (calls, reaches, impacts).' },
+      },
+      required: ['kind', 'subject'],
+    },
+  },
+  {
+    name: 'structural_diff',
+    description:
+      'USE THIS WHEN reviewing or refactoring a change: "what changed structurally?", ' +
+      '"whose callers are now stale?". A graph diff (complement to git diff) between two states ' +
+      '(working tree vs a ref, or two refs): functions/edges added & removed, signature changes, ' +
+      'and the existing callers now STALE because a callee signature moved under them. ' +
+      'Rename/move ambiguity is flagged, not guessed. Deterministic, offline. This is the raw graph delta; ' +
+      'for the all-in-one pre-commit briefing use blast_radius, and for paths a diff newly opens into a ' +
+      'sensitive surface use change_impact_certificate. Run analyze_codebase ' +
+      'first for stale-caller analysis. Opt-in escape check: pass declaredFootprint to also flag ' +
+      'symbols modified OUTSIDE the declared write-set and conflicts they open against peerFootprints.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Old state to diff against (default "HEAD")' },
+        headRef: { type: 'string', description: 'New state (a git ref). Omit to use the working tree.' },
+        maxResults: { type: 'number', description: 'Cap reported items per category (default 200)' },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional repository-relative files to analyze. Applied before category limits.',
+        },
+        declaredFootprint: {
+          type: 'object',
+          description:
+            'OPT-IN escape check: the task\'s declared write-footprint (a plan_parallel_work `Footprint`). ' +
+            'Shape { taskId?, writeSet: [{ id:"file::name", filePath?, writeMode?:append|modify }], readSet?:string[] }. ' +
+            'Adds an `escapeAnalysis` block; omit = unchanged behavior.',
+          properties: {
+            taskId: { type: 'string' },
+            writeSet: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  filePath: { type: 'string' },
+                  writeMode: { type: 'string', enum: ['append', 'modify'] },
+                },
+                required: ['id'],
+              },
+            },
+            readSet: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        peerFootprints: {
+          type: 'array',
+          description:
+            'Declared footprints of OTHER in-flight tasks (same shape as declaredFootprint). An escape ' +
+            'landing in a peer\'s write-set opens a newly-reported conflict naming that peer.',
+          items: { type: 'object' },
+        },
+      },
+    },
+  },
+  {
+    name: 'get_change_coupling',
+    description:
+      'USE THIS WHEN: "what changes together with this file?" or "what is the most volatile code?". ' +
+      'Mined from local git history (not the call graph): co-change coupling surfaces invisible ' +
+      'coupling with no import/call edge (the config + parser that move in lockstep), and ' +
+      'volatility/churn flags risky high-change code. Pass a file for its coupling, or omit for the ' +
+      'most-volatile overview. Advisory signal (correlation, not causation); bulk commits filtered. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        file: { type: 'string', description: 'A file to query its coupling/volatility. Omit for the most-volatile overview.' },
+        limit: { type: 'number', description: 'Cap results (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'check_architecture',
+    description:
+      'USE THIS BEFORE adding an import to check it against the repo\'s architecture rules, or to ' +
+      'list current architecture violations. Opt-in and inert unless the repo declares rules in ' +
+      '.openlore/architecture.json (layers / forbidden / allowedOnly / required / circular / reachable / orphan / moreUnstable) or via an "Invariant:" marker ' +
+      'in a synced ADR. Pre-edit mode: pass {from, to} ("may a file under <from> import <to>?") for a ' +
+      'deterministic allowed/denied + the governing rule + why, BEFORE you write the code. Scan mode: ' +
+      'pass only {directory} for the full current-violations report. Cross-language, offline, ' +
+      'deterministic; complements (does not replace) CI linters. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        from: { type: 'string', description: 'Pre-edit mode: the file that would gain the import (relative or absolute). Requires "to".' },
+        to: { type: 'string', description: 'Pre-edit mode: the target file path or exported symbol being imported. Requires "from".' },
+      },
     },
   },
   {
@@ -445,10 +796,11 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         limit: {
           type: 'number',
@@ -459,7 +811,6 @@ export const TOOL_DEFINITIONS = [
           description: 'Optional substring to restrict candidates to matching file paths',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -471,10 +822,11 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         limit: {
           type: 'number',
@@ -491,7 +843,6 @@ export const TOOL_DEFINITIONS = [
             'Sort order: "fanIn" (most-called leaves first, default), "name", or "file"',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -503,10 +854,11 @@ export const TOOL_DEFINITIONS = [
       'approach (extract, split, facade, delegate). Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         limit: {
           type: 'number',
@@ -517,7 +869,6 @@ export const TOOL_DEFINITIONS = [
           description: 'Minimum fan-in threshold to be considered a hub (default: 3)',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -530,17 +881,18 @@ export const TOOL_DEFINITIONS = [
       'without reading thousands of lines of raw source.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         filePath: {
           type: 'string',
           description: 'Path to the file, relative to the project directory',
         },
       },
-      required: ['directory', 'filePath'],
+      required: ['filePath'],
     },
   },
   {
@@ -552,10 +904,11 @@ export const TOOL_DEFINITIONS = [
       'logical blocks to extract. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         filePath: {
           type: 'string',
@@ -566,7 +919,6 @@ export const TOOL_DEFINITIONS = [
           description: 'Minimum fan-out to be considered a god function (default: 8)',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -576,13 +928,14 @@ export const TOOL_DEFINITIONS = [
       '"where should I add rate limiting?", "where\'s the best place to add email validation?". ' +
       'Combines semantic search + call graph to return ranked candidates with strategy. ' +
       'Call this before writing any code; then use get_subgraph on the top candidates. ' +
-      'Requires "spec-gen analyze --embed".',
+      'Requires "openlore analyze --embed".',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         description: {
           type: 'string',
@@ -599,7 +952,7 @@ export const TOOL_DEFINITIONS = [
           description: 'Filter by language: "TypeScript", "Python", "Go", "Rust", "Ruby", "Java"',
         },
       },
-      required: ['directory', 'description'],
+      required: ['description'],
     },
   },
   {
@@ -608,14 +961,17 @@ export const TOOL_DEFINITIONS = [
       'USE THIS WHEN: you don\'t know which file or function handles a concept — ' +
       '"where is rate limiting implemented?", "which function validates tokens?", ' +
       '"what handles authentication?". Beats grep when the function name is unknown. ' +
-      'Falls back to keyword search automatically if the embedding server is down. ' +
-      'Requires "spec-gen analyze --embed" to have been run at least once.',
+      'Falls back to keyword search if the embedding server is down, and to a ' +
+      'literal-text index on zero hits so strings in markup/text are still found ' +
+      '(mode:"text" forces it). Use search_specs for requirements. The full-only ' +
+      'explain_retrieval_miss tool diagnoses one named miss. Requires prior analysis.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         query: {
           type: 'string',
@@ -633,8 +989,22 @@ export const TOOL_DEFINITIONS = [
           type: 'number',
           description: 'Only return functions with at least this many callers (hub filter)',
         },
+        tokenBudget: {
+          type: 'number',
+          description: 'Optional: cap results to ~this many tokens (highest-scored kept, exact duplicates collapsed); each hit carries an `expand` handle for get_function_body',
+        },
+        mode: {
+          type: 'string',
+          enum: ['text'],
+          description: 'Set "text" to search literal strings in markup/text directly; returns file:line matches.',
+        },
+        questionKind: {
+          type: 'string',
+          enum: ['where-is', 'who-calls', 'what-gates', 'what-order', 'is-it-tested', 'why-decided'],
+          description: 'What you are asking (default "where-is"). When the index cannot cover it, the answer names this kind and the tool that does answer it — or says plainly that none does.',
+        },
       },
-      required: ['directory', 'query'],
+      required: ['query'],
     },
   },
   {
@@ -644,10 +1014,10 @@ export const TOOL_DEFINITIONS = [
       'Use this first when you need to discover what domains exist before doing a targeted search_specs call.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
       },
-      required: ['directory'],
     },
   },
   {
@@ -655,14 +1025,16 @@ export const TOOL_DEFINITIONS = [
     description:
       'USE THIS WHEN: asked "which spec covers X?", "what does the spec say about Y?", ' +
       '"which requirement describes Z?". Searches specs by meaning and returns linked source files. ' +
-      'Use spec-first: check what the spec says before reading or writing code. ' +
-      'Requires "spec-gen analyze --embed" or "spec-gen analyze --reindex-specs".',
+      'Use spec-first: check what the spec says before reading or writing code. Use search_code for ' +
+      'implementations; the full-only explain_retrieval_miss tool diagnoses one named miss. ' +
+      'Requires "openlore analyze --embed" or "openlore analyze --reindex-specs".',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         query: {
           type: 'string',
@@ -681,7 +1053,51 @@ export const TOOL_DEFINITIONS = [
           description: 'Filter by section type: "requirements", "purpose", "design", "architecture", "entities"',
         },
       },
-      required: ['directory', 'query'],
+      required: ['query'],
+    },
+  },
+  {
+    name: 'explain_retrieval_miss',
+    description:
+      'Explain why one named target missed search_code or search_specs; unlike either search, requires an exact target.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        query: { type: 'string', maxLength: 1000 },
+        surface: {
+          type: 'string',
+          enum: ['code', 'spec'],
+        },
+        target: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            kind: {
+              type: 'string',
+              enum: ['symbol', 'file', 'requirement'],
+            },
+            value: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 2048,
+            },
+            filePath: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 2048,
+            },
+          },
+          required: ['kind', 'value'],
+        },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+        language: { type: 'string', maxLength: 256 },
+        minFanIn: { type: 'integer', minimum: 0 },
+        domain: { type: 'string', maxLength: 256 },
+        section: { type: 'string', maxLength: 256 },
+      },
+      required: ['query', 'surface', 'target'],
     },
   },
   {
@@ -692,13 +1108,14 @@ export const TOOL_DEFINITIONS = [
       'cross-boosts results that are linked through mapping.json — so a function that implements a ' +
       'matching requirement ranks higher than one found by code search alone. ' +
       'Returns results with type "code", "spec", or "both" and a mappingBoost score. ' +
-      'Requires "spec-gen analyze --embed" and a prior "spec-gen generate" run.',
+      'Requires "openlore analyze --embed" and a prior "openlore generate" run.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         query: {
           type: 'string',
@@ -721,7 +1138,7 @@ export const TOOL_DEFINITIONS = [
           description: 'Filter spec results by section type: "requirements", "purpose", etc.',
         },
       },
-      required: ['directory', 'query'],
+      required: ['query'],
     },
   },
   {
@@ -733,27 +1150,29 @@ export const TOOL_DEFINITIONS = [
       'read access to a known domain.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         domain: {
           type: 'string',
           description: 'Domain name as returned by list_spec_domains (e.g. "auth", "analyzer")',
         },
       },
-      required: ['directory', 'domain'],
+      required: ['domain'],
     },
   },
   {
     name: 'get_function_body',
     description:
       'Return the exact source code of a named function in a file. ' +
-      'Use this after search_code or get_function_skeleton to read the full implementation. ' +
-      'Requires a prior "spec-gen analyze" run for precise byte-range extraction; ' +
-      'falls back to a brace-depth scan when the call graph is unavailable.',
+      'Use focus plus focusKind for stored variable/callee evidence; omit both for the full implementation. ' +
+      'Prior analysis enables exact byte ranges; otherwise it uses a brace-depth scan.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
+      dependentRequired: { focus: ['focusKind'], focusKind: ['focus'] },
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         filePath: {
           type: 'string',
           description: 'File path relative to the project directory, e.g. "src/auth/jwt.ts"',
@@ -762,8 +1181,18 @@ export const TOOL_DEFINITIONS = [
           type: 'string',
           description: 'Name of the function to extract, e.g. "verifyToken"',
         },
+        focus: {
+          type: 'string',
+          maxLength: 200,
+          description: 'Variable or callee name; requires focusKind.',
+        },
+        focusKind: {
+          type: 'string',
+          enum: ['variable', 'callee'],
+          description: 'Required with focus; selects its evidence kind.',
+        },
       },
-      required: ['directory', 'filePath', 'functionName'],
+      required: ['filePath', 'functionName'],
     },
   },
   {
@@ -772,11 +1201,12 @@ export const TOOL_DEFINITIONS = [
       'Return the file-level import dependencies for a given source file. ' +
       'Answers "what does this file import?" and "what files import this file?". ' +
       'Useful for planning refactors, understanding coupling, or scoping the blast radius ' +
-      'of a change. Reads the dependency-graph.json produced by "spec-gen analyze".',
+      'of a change. Reads the dependency-graph.json produced by "openlore analyze".',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         filePath: {
           type: 'string',
           description: 'File path relative to the project root, e.g. "src/core/analyzer/vector-index.ts"',
@@ -787,7 +1217,7 @@ export const TOOL_DEFINITIONS = [
           description: '"imports" = what this file depends on, "importedBy" = what depends on this file, "both" = both directions (default)',
         },
       },
-      required: ['directory', 'filePath'],
+      required: ['filePath'],
     },
   },
   {
@@ -801,10 +1231,11 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first; spec index optional (degrades gracefully).',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         description: {
           type: 'string',
@@ -825,7 +1256,7 @@ export const TOOL_DEFINITIONS = [
             'in the proposal for traceability.',
         },
       },
-      required: ['directory', 'description', 'slug'],
+      required: ['description', 'slug'],
     },
   },
   {
@@ -839,10 +1270,11 @@ export const TOOL_DEFINITIONS = [
       'generate_change_proposal output. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         storyFilePath: {
           type: 'string',
@@ -857,26 +1289,7 @@ export const TOOL_DEFINITIONS = [
             'e.g. "add payment retry — must retry up to 3 times on timeout"',
         },
       },
-      required: ['directory', 'storyFilePath', 'description'],
-    },
-  },
-  {
-    name: 'get_decisions',
-    description:
-      'List or search Architecture Decision Records (ADRs) stored in openspec/decisions/. ' +
-      'Use this when you need to understand why an architectural decision was made, ' +
-      'or to check whether a pattern is already documented. ' +
-      'ADRs are generated by "spec-gen generate --adrs".',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
-        query: {
-          type: 'string',
-          description: 'Optional text filter — returns only ADRs whose title or content contains this string',
-        },
-      },
-      required: ['directory'],
+      required: ['storyFilePath', 'description'],
     },
   },
   {
@@ -891,10 +1304,10 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
       },
-      required: ['directory'],
     },
   },
   {
@@ -906,13 +1319,15 @@ export const TOOL_DEFINITIONS = [
       'Reads the pre-computed middleware-inventory.json artifact when available, ' +
       'otherwise scans source files live. ' +
       'Supports Express, Hono, Fastify, NestJS, Next.js, and more. ' +
+      'Returns a concise summary by default; pass responseFormat:"detailed" for the full inventory. ' +
       'Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
+        responseFormat: RESPONSE_FORMAT_PROP,
       },
-      required: ['directory'],
     },
   },
   {
@@ -923,30 +1338,34 @@ export const TOOL_DEFINITIONS = [
       'Reads the pre-computed schema-inventory.json artifact when available, ' +
       'otherwise scans source files live. ' +
       'Supports Prisma, TypeORM, Drizzle ORM, and SQLAlchemy. ' +
+      'Returns a concise summary by default; pass responseFormat:"detailed" for the full inventory. ' +
       'Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
+        responseFormat: RESPONSE_FORMAT_PROP,
       },
-      required: ['directory'],
     },
   },
   {
-    name: 'get_ui_components',
+    name: 'get_ui_component_inventory',
     description:
       'Return the UI component inventory for the project: all detected components with ' +
       'their framework, props, source file, and line number. ' +
       'Reads the pre-computed ui-inventory.json artifact when available, ' +
       'otherwise scans source files live. ' +
       'Supports React, Vue, Svelte, and Angular. ' +
+      'Returns a concise summary by default; pass responseFormat:"detailed" for the full inventory. ' +
       'Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
+        responseFormat: RESPONSE_FORMAT_PROP,
       },
-      required: ['directory'],
     },
   },
   {
@@ -958,13 +1377,15 @@ export const TOOL_DEFINITIONS = [
       'Reads the pre-computed env-inventory.json artifact when available, ' +
       'otherwise scans source files live. ' +
       'Supports JS/TS (process.env), Python (os.environ/os.getenv), Go (os.Getenv), Ruby (ENV[]). ' +
+      'Returns a concise summary by default; pass responseFormat:"detailed" for the full inventory. ' +
       'Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
+        responseFormat: RESPONSE_FORMAT_PROP,
       },
-      required: ['directory'],
     },
   },
   {
@@ -977,10 +1398,10 @@ export const TOOL_DEFINITIONS = [
       'otherwise scans manifests live. Run analyze_codebase first for the fastest results.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
       },
-      required: ['directory'],
     },
   },
   {
@@ -992,11 +1413,15 @@ export const TOOL_DEFINITIONS = [
       'orphan requirements (spec requirements with no mapped implementation), ' +
       'and stale domains (source files changed after spec was last written). ' +
       'Use this before starting a new feature to understand what needs specs, ' +
-      'or to audit coverage health. Requires "spec-gen analyze" to have been run.',
+      'or to audit coverage health. Distinct from its sibling check_spec_drift: ' +
+      'audit_spec_coverage finds requirements/code with NO spec (coverage gaps); ' +
+      'check_spec_drift finds existing specs that no longer match changed code (drift). ' +
+      'Requires "openlore analyze" to have been run.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         maxUncovered: {
           type: 'number',
           description: 'Maximum uncovered functions to return (default: 50)',
@@ -1006,26 +1431,27 @@ export const TOOL_DEFINITIONS = [
           description: 'Minimum fanIn to flag a function as a hub gap (default: 5)',
         },
       },
-      required: ['directory'],
     },
   },
   {
     name: 'generate_tests',
     description:
       'Generate spec-driven test files from OpenSpec scenarios. ' +
-      'Supports vitest, playwright, pytest (Python), gtest and catch2 (C++). ' +
+      'Supports vitest, playwright (JS/TS), pytest (Python), gtest and catch2 (C++), ' +
+      'junit (Java/Kotlin) and gotest (Go). ' +
       'A THEN clause pattern engine emits real assertions for common patterns ' +
       '(HTTP status codes, property presence, error messages) without any LLM call. ' +
       'Pass useLlm:true to enrich unmatched clauses using mapped function source. ' +
-      'Each generated test is tagged with a parseable spec-gen: metadata comment ' +
+      'Each generated test is tagged with a parseable openlore: metadata comment ' +
       'that enables spec coverage tracking via get_test_coverage. ' +
       'Defaults to dryRun:true — set dryRun:false to write files to disk.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         domains: {
           type: 'array',
@@ -1034,7 +1460,7 @@ export const TOOL_DEFINITIONS = [
         },
         framework: {
           type: 'string',
-          enum: ['vitest', 'playwright', 'pytest', 'gtest', 'catch2', 'auto'],
+          enum: ['vitest', 'playwright', 'pytest', 'gtest', 'catch2', 'junit', 'gotest', 'auto'],
           description: 'Test framework (default: auto-detect from project files)',
         },
         useLlm: {
@@ -1046,24 +1472,24 @@ export const TOOL_DEFINITIONS = [
           description: 'Preview generated content without writing files (default: true)',
         },
       },
-      required: ['directory'],
     },
   },
   {
     name: 'get_test_coverage',
     description:
       'Report which OpenSpec scenarios have corresponding test coverage. ' +
-      'Scans test files for // spec-gen: {JSON} or # spec-gen: {JSON} metadata tags ' +
+      'Scans test files for // openlore: {JSON} or # openlore: {JSON} metadata tags ' +
       '(added automatically by generate_tests). ' +
       'Returns coverage percentage by domain, a list of uncovered scenarios, ' +
       'and flags domains where spec drift was detected. ' +
       'Use minCoverage to enforce a CI coverage gate.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         directory: {
           type: 'string',
-          description: 'Absolute path to the project directory',
+          description: DIR_DESC,
         },
         domains: {
           type: 'array',
@@ -1075,7 +1501,6 @@ export const TOOL_DEFINITIONS = [
           description: 'Report belowThreshold:true if effective coverage is below this percentage',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -1088,15 +1513,25 @@ export const TOOL_DEFINITIONS = [
       'Typically 200-600 tokens vs orient\'s 2000+. Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         functionName: { type: 'string', description: 'Exact function or method name' },
         filePath: {
           type: 'string',
           description: 'Optional relative file path to disambiguate when multiple functions share the name',
         },
+        rankBy: {
+          type: 'string',
+          enum: ['distance', 'pagerank'],
+          description: 'Opt-in caller/callee ordering (default "distance"). "pagerank" orders neighbours by personalized PageRank seeded on the target and attaches a per-neighbour `relevance`. Default output unchanged.',
+        },
+        tokenBudget: {
+          type: 'number',
+          description: 'Optional (pagerank mode): cap callers+callees to ~this many tokens, keeping highest-relevance neighbours and reporting `omittedForBudget` instead of truncating.',
+        },
       },
-      required: ['directory', 'functionName'],
+      required: ['functionName'],
     },
   },
   {
@@ -1109,11 +1544,456 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         functionName: { type: 'string', description: 'Function name to look up the community for' },
       },
-      required: ['directory', 'functionName'],
+      required: ['functionName'],
+    },
+  },
+  {
+    name: 'get_landmarks',
+    description:
+      'Whole-repo structural anchors as LABELED signals with evidence: the union of ' +
+      'hub/orchestrator/chokepoint/volatile/entrypoint/dead (each per-signal tool exposes only one). ' +
+      'Each function carries its earned labels + raw evidence (e.g. hub:{fanIn}); no blended score — ' +
+      'rank as your task needs. Optionally filter to one label. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        limit: { type: 'number', description: 'Max landmarks to return, ordered by fan-in (default: 20, max: 200)' },
+        label: { type: 'string', description: 'Optional: return only landmarks carrying this label (hub | orchestrator | chokepoint | volatile | entrypoint | dead)' },
+      },
+    },
+  },
+  {
+    name: 'get_map',
+    description:
+      'The lay of the land: a coarse-to-fine map of the call graph. With no communityId, returns the ' +
+      'REGION view — each code community as a super-node (label, size, top files, top landmark) plus ' +
+      'weighted inter-region connections, no function bodies — so you can see where regions connect ' +
+      'without reading any code. Pass a communityId to drill into one region at function granularity. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        communityId: { type: 'string', description: 'Optional: drill into this region (a communityId from the region view) at function granularity' },
+      },
+    },
+  },
+  {
+    name: 'find_path',
+    description:
+      'Find the route from A to B in the call graph. `from`/`to` may be exact/fuzzy function names ' +
+      'OR selectors: landmark:<id>, role:entrypoint|hub|sink, file:<path>. Returns the single ' +
+      'CHEAPEST path (by call-distance, or fewest hops if useCallDistance=false) plus a few bounded ' +
+      'alternates and a reason — not a raw multi-path dump. "No path within budget" is an explicit ' +
+      'answer. Distinct from trace_execution_path, which enumerates ALL paths for debugging: reach for ' +
+      'find_path to select the cheapest route (by name, role, or landmark), trace_execution_path to see every path. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        from: { type: 'string', description: 'Start endpoint: a function name, or landmark:<id> / role:entrypoint|hub|sink / file:<path>' },
+        to: { type: 'string', description: 'Goal endpoint: a function name, or landmark:<id> / role:entrypoint|hub|sink / file:<path>' },
+        useCallDistance: { type: 'boolean', description: 'Rank by confidence-weighted call-distance (default true); false ranks by fewest hops' },
+        directResolvedOnly: { type: 'boolean', description: 'Traverse only directly-resolved edges, ignoring synthesized dynamic-dispatch edges (default false).' },
+        ...FEDERATION_PROPS,
+      },
+      required: ['from', 'to'],
+    },
+  },
+  {
+    name: 'federation_status',
+    description:
+      'Report the multi-repo federation registry (.openlore/federation.json) and each registered ' +
+      'repo\'s live index state (indexed/stale/unindexed/missing). Index-of-indexes: no merged graph. Read-only.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+      },
+    },
+  },
+  {
+    name: 'spec_store_status',
+    description:
+      'Report the health of a spec-store binding: an external spec repository (.openlore/config.json ' +
+      '"specStore") whose declared target/reference repositories are resolved against the federation ' +
+      'registry. Returns conclusion-shaped findings with stable codes (target-unresolved, index-stale, ' +
+      'reference-missing, …) and pasteable remediations. Read-only; never blocks.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+      },
+    },
+  },
+  {
+    name: 'working_set_context',
+    description:
+      'Assemble the working-set structural briefing for an active change in a spec-store binding: ' +
+      'orient, generalized from one repo to the change\'s target repositories. Reads the change\'s ' +
+      'proposal under the bound store, orients each resolved+indexed target on that intent, and returns ' +
+      'ONE deterministic, token-budgeted briefing whose items are attributed per target (symbol, callers, ' +
+      'spec domains, insertion points) plus fresh in-scope anchored intent. Conclusion-shaped, read-only, ' +
+      'never blocks; orphaned intent is withheld and drifted intent is flagged. No LLM.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        change: { type: 'string', description: 'The active change id to brief (its proposal lives under the bound store).' },
+        tokenBudget: { type: 'number', description: 'Cap the merged briefing to ~this many tokens (default 8000).' },
+      },
+    },
+  },
+  {
+    name: 'change_impact_certificate',
+    description:
+      'Certify what the current diff touches before it lands. ONE conclusion-shaped certificate: blast ' +
+      'radius, the paths the change NEWLY OPENS into each declared covering surface (reachable after but ' +
+      'not before — computed differentially), drifted specs, and tests to run. Decays via the freshness ' +
+      'lease; advisory, never blocks. Declare surfaces under "impactCertificate.surfaces". Unlike its ' +
+      'change-family siblings — blast_radius (all-in-one pre-commit briefing) and structural_diff (raw graph ' +
+      'delta + stale callers) — this certifies the paths a diff NEWLY OPENS into a sensitive surface. No LLM.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to diff the working tree against (default HEAD).' },
+        change: { type: 'string', description: 'Change id to record on the certificate (spec-store context; default "working-tree").' },
+        persist: { type: 'boolean', description: 'Persist under .openlore/impact-certificates/ so the spec-store health check can re-fire it when it decays.' },
+      },
+    },
+  },
+  {
+    name: 'plan_parallel_work',
+    description:
+      'USE THIS WHEN: before fanning N tasks out across agents/worktrees — "which of these tasks are ' +
+      'safe to run concurrently, and in what order?". Given a caller-supplied task list (id + seed ' +
+      'symbols/files each), returns the plan: a hazard-typed conflict graph (WAW/shared-append/RAW/WAR/' +
+      'soft-coupling), a wave schedule (wave 1 = dispatch now), and the critical path (minimum rounds ' +
+      'with unlimited agents). Stateless, advisory; re-invoke with remaining tasks to re-plan. Mark ' +
+      'registration-site touches writeMode:"append" so they are not falsely serialized. Same hazard ' +
+      'classifier as map_in_flight_conflicts, different input: this plans a caller-supplied task list, ' +
+      'map_in_flight_conflicts harvests changes already in flight (branches/PRs). Run ' +
+      'analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        tasks: {
+          type: 'array',
+          description: 'Task descriptors; each needs an id and ≥1 seed (symbol or file). The list is never invented or decomposed.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Unique task id within this call.' },
+              seedSymbols: { type: 'array', items: { type: 'string' }, description: 'Symbol names/ids the task will edit.' },
+              seedFiles: { type: 'array', items: { type: 'string' }, description: 'File paths the task will edit (every symbol in the file enters the write-set).' },
+              intent: { type: 'string', description: 'Optional intent text (widens sparse seeds only; never guesses edits).' },
+              writeMode: { type: 'string', enum: ['append', 'modify'], description: '"append" for pure registration-site additions (default "modify").' },
+            },
+            required: ['id'],
+          },
+        },
+      },
+      required: ['tasks'],
+    },
+  },
+  {
+    name: 'map_in_flight_conflicts',
+    description:
+      'USE THIS WHEN: many humans/agents edit one codebase (or federation) and you want — before merge — ' +
+      'which in-flight changes collide. Builds ONE cross-actor conflict graph over every change in flight: ' +
+      'local branches, open PRs (via gh), and supplied agent task descriptors, as nodes of the same kind. ' +
+      'Each footprint is derived from the ACTUAL diff (per-symbol append vs modify read off the hunks, so ' +
+      'two PRs appending disjoint registry entries do NOT falsely conflict); the hazard classifier ' +
+      '(WAW/RAW/shared-append/WAR) then runs across all nodes. Returns per conflict: the two actors, ' +
+      'hazard, shared symbols, landing order, and git merge-tree textualMerge. ' +
+      'A change whose diff can\'t be fetched or whose ' +
+      'symbols don\'t resolve is "not assessed", never "no conflict". Read-only, stateless, advisory; ' +
+      'opt-in federation matches across repos by stable id. Same hazard classifier as plan_parallel_work, ' +
+      'different input: this harvests changes already in flight, plan_parallel_work plans a caller-supplied ' +
+      'task list. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref every change is diffed against (default: resolved default branch).' },
+        includeBranches: { type: 'boolean', description: 'Include local branches ahead of base (default true).' },
+        branches: { type: 'array', items: { type: 'string' }, description: 'Restrict to these branch names (default: all ahead of base).' },
+        includePullRequests: { type: 'boolean', description: 'Include open PRs via gh (default true; absent gh degrades).' },
+        tasks: {
+          type: 'array',
+          description: 'Optional agent task descriptors that join as first-class nodes (plan_parallel_work shape: id + seedSymbols/seedFiles + optional writeMode).',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              seedSymbols: { type: 'array', items: { type: 'string' } },
+              seedFiles: { type: 'array', items: { type: 'string' } },
+              intent: { type: 'string' },
+              writeMode: { type: 'string', enum: ['append', 'modify'] },
+            },
+            required: ['id'],
+          },
+        },
+        maxChanges: { type: 'number', description: 'Cap on assessed changes (default 40).' },
+        ...FEDERATION_PROPS,
+      },
+    },
+  },
+  {
+    name: 'get_language_support',
+    description:
+      'USE THIS WHEN: a structural result for some file looks empty/weak and you need to know whether ' +
+      'that means "nothing found" or "this language is only partly supported" — or when evaluating ' +
+      `coverage for a polyglot repo. Returns the deterministic capability matrix (${LANGUAGE_CAPABILITIES.join(', ')}) for the repo's DETECTED ` +
+      'languages, or — with a `language` name — that one language (a pure registry lookup; an unknown ' +
+      'language returns an honest all-unsupported record, never an error). Fail-soft: an unsupported ' +
+      'capability yields nothing, never a guess. Read-only, deterministic. Run analyze_codebase first ' +
+      'for repo mode (named-language mode needs no analysis).',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        language: { type: 'string', description: 'Optional: a specific language name (e.g. "Go", "Kotlin"). Omit to report the repo\'s detected languages.' },
+      },
+    },
+  },
+  {
+    name: 'report_coverage_gaps',
+    description:
+      'USE THIS WHEN: you need to know which important code has NO test reaching it — a reviewer ' +
+      'asking "is the risky part of this change tested?", an agent told to "improve coverage" and ' +
+      'needing where to start, or an audit wanting the untested HUBS ranked, not a flat list. ' +
+      'Computes the structural inverse of select_tests over the whole graph (functions in no test\'s ' +
+      'reachable set), ranked by hub/chokepoint significance so load-bearing untested code floats to ' +
+      'the top. SOUND DIRECTION ONLY: it reports "no reaching test" and NEVER claims a symbol is ' +
+      '"tested" — reachable-from-a-test is not behavior-verified. Distinct from find_dead_code (a gap ' +
+      'with no caller at all is labeled also-dead) and from get_test_coverage (spec-tag based). ' +
+      'No runtime, no coverage tool, deterministic. Scope to a diff (changedSymbols/diffRef) or a ' +
+      'region (filePattern). Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        maxResults: { type: 'number', description: 'Limit reported gaps (default 100, capped 500).' },
+        filePattern: { type: 'string', description: 'Only report gaps whose file path contains this substring (region scope).' },
+        changedSymbols: { type: 'array', items: { type: 'string' }, description: 'Restrict to gaps among these changed symbols (diff scope).' },
+        diffRef: { type: 'string', description: 'Git ref to diff the working tree against for diff scope (e.g. "HEAD", "main").' },
+        directResolvedOnly: { type: 'boolean', description: 'Count only directly-resolved edges as test-reach (ignore synthesized dynamic-dispatch); reports more gaps, more certainly. Default false.' },
+      },
+    },
+  },
+  {
+    name: 'certify_public_surface',
+    description:
+      'USE THIS WHEN: you are about to ship a change to a library/module and need to know "did I ' +
+      'break my consumers\' contract?" (removed/renamed export, new required param, narrowed types, ' +
+      'reduced visibility). No base ref: the PUBLIC SURFACE (exports + signatures). With a base ' +
+      'ref: a deterministic breaking-change VERDICT for the working-tree ' +
+      'diff: each changed export breaking | non-breaking | potentially-breaking; each breaking one is ' +
+      'breaking-consumed (with its consumers) or breaking-unconsumed-in-index (never "safe"); ' +
+      'federation also counts indexed sibling repos. Breakages accepted in ' +
+      '.openlore/public-surface-baseline.jsonl are listed as accepted, not findings. Unprovable ' +
+      '= potentially-breaking, NEVER silently safe. Renames are reported as renames. Distinct from ' +
+      'change_impact_certificate (paths into a surface). No LLM. Signatures: TS/JS/Python; others ' +
+      'fail-soft. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to diff the working tree\'s public surface against (e.g. "HEAD", "main"). Omit to return the surface itself.' },
+        maxResults: { type: 'number', description: 'Limit the surface listing in surface mode (default 200, capped 500).' },
+        ...FEDERATION_PROPS,
+      },
+    },
+  },
+  {
+    name: 'get_style_fingerprint',
+    description:
+      'USE THIS WHEN: you are about to write or edit code and want to match the codebase\'s house ' +
+      'style instead of your training-prior default. Returns a DESCRIPTIVE, deterministic idiom ' +
+      'profile measured from the AST: per language, the dominant choice for each of a fixed set of ' +
+      'idioms (arrow vs. declared function, const vs. let, ternary vs. if, await vs. .then, template ' +
+      'vs. concatenation, function-naming case) reported as { dominant, ratio, samples }. Repository ' +
+      'profile by default; pass communityId for a region (from get_map) or filePath for one file. ' +
+      'HONEST BY CONSTRUCTION: an idiom below the evidence floor, or one the language/formatter ' +
+      'enforces (e.g. Go ties identifier case to visibility), reports a null signal rather than a ' +
+      'misleading or tautological ratio — never a guess. Descriptive, not prescriptive: it measures ' +
+      'what the code IS, emits no lint judgment and no composite style score. Supported languages: ' +
+      'TypeScript, JavaScript, Python, Go (others contribute nothing, fail-soft). No LLM, offline. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        communityId: { type: 'string', description: 'Profile one community/region by id (list ids with get_map).' },
+        filePath: { type: 'string', description: 'Profile a single file (exact path or a unique path suffix). Most specific scope: if both filePath and communityId are given, filePath wins.' },
+        language: { type: 'string', description: 'Restrict the returned languages to this one (e.g. "TypeScript").' },
+      },
+    },
+  },
+  {
+    name: 'briefing_since',
+    description:
+      'USE THIS WHEN: a lot changed in this repo since you last looked (a large PR to review, ' +
+      'returning after time away, onboarding onto an active codebase) and you want to know which ' +
+      'changes STRUCTURALLY MATTER — not a flat wall of changed lines. Unlike blast_radius / ' +
+      'change_impact_certificate (which brief YOUR pending diff), this briefs everything that ' +
+      'changed SINCE a base ref. Returns the changed production symbols ranked into a fixed tier ' +
+      'order — surprising-change (a high-fan-in hub whose file rarely changed before) > hub-change ' +
+      '(a broad high-fan-in/high-fan-out hub) > chokepoint-change (a high-fan-in funnel) > ' +
+      'ordinary-change — using labels OpenLore already computes, NOT a weighted score. Each briefed ' +
+      'symbol carries its labels and raw evidence (fan-in, fan-out, prior churn), grouped by region, ' +
+      'with the tests to run for the whole change set. HONEST BY CONSTRUCTION: changed symbols are ' +
+      'exact where both revisions hash cleanly (renames are listed under carried), and a file kept ' +
+      'whole says why; the surprising-change label is withheld when git history is too ' +
+      'shallow to say "rarely changed before"; a bounded briefing always carries a truncation receipt ' +
+      '(omitted count + lowest tier reached) and never drops a higher tier for a lower one. The cursor ' +
+      'is the base ref, never wall-clock time. Deterministic, offline, no LLM. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        baseRef: { type: 'string', description: 'Git ref to brief changes SINCE (e.g. "main", a PR base, "HEAD~20"). Default "auto": resolves main → master → HEAD~1 → empty tree.' },
+        filePattern: { type: 'string', description: 'Region scope — only brief changes whose file path contains this substring.' },
+        maxResults: { type: 'number', description: 'Bound on briefed symbols, highest-tier-first (default 50, max 200). Overflow is reported in the truncation receipt.' },
+      },
+    },
+  },
+  {
+    name: 'find_clones',
+    description:
+      'USE THIS WHEN: you are about to write a function (or just wrote one) and want to know "does a ' +
+      'near-duplicate already exist that I should reuse or extend instead of reinventing?". Unlike ' +
+      'get_duplicate_report (the whole-repo audit of every clone group), this is SCOPED to one query: ' +
+      'a single symbol or a single snippet. Pass `symbol` (a function name, or name::path, already in ' +
+      'the index) to find clones of an existing function, OR `snippet` (raw code not necessarily in ' +
+      'the index) to check code BEFORE you write it — the pre-write question the whole-repo report ' +
+      'cannot answer. Returns the existing clones ranked: exact (identical after normalization) > ' +
+      'structural (same shape, renamed identifiers) > near (high token-overlap, Jaccard ≥ floor), each ' +
+      'naming the file, function, class, line range, type, similarity, and language (so a cross-language ' +
+      'match is visible) — the canonical implementation ' +
+      'to reuse. Reuses the same detector as get_duplicate_report (no new algorithm or constant), but ' +
+      'one-vs-all so it computes near-clones even on repos where the whole-repo O(n²) pass is skipped. ' +
+      'HONEST BY CONSTRUCTION: an unknown symbol is an explicit not-found (with candidates), never an ' +
+      'empty "unique"; a query below the evidence floor reports "too small to compare", not "no clones"; ' +
+      'the query never matches itself; HTML inline-script symbols are excluded (disclosed). ' +
+      'Deterministic, offline, no LLM. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        symbol: { type: 'string', description: 'A function in the index to find clones of: its name, or name::path to disambiguate. Provide exactly one of symbol or snippet.' },
+        snippet: { type: 'string', description: 'Raw code to find clones of (need not be in the index) — answers the pre-write "does this already exist?". Provide exactly one of symbol or snippet.' },
+        minSimilarity: { type: 'number', description: 'Near-clone Jaccard floor for this query (default 0.7, clamped to [0.1, 1]). Exact/structural matches are always included.' },
+        maxResults: { type: 'number', description: 'Cap on returned matches (default 25, max 200).' },
+      },
+    },
+  },
+  {
+    name: 'locate_symbol_span',
+    description:
+      'USE THIS WHEN: you know WHICH symbol to edit and need the byte-exact location to apply the edit at — ' +
+      'instead of re-finding it by string-matching a fresh read (wrong-overload hits, duplicated snippets, ' +
+      'whitespace drift). Resolves `symbol` (a function name, or name::path to disambiguate — the same ' +
+      'addressing as find_clones) and returns the span (startByte/endByte as UTF-16 code-unit offsets + ' +
+      '1-based startLine/endLine) plus a freshness VERDICT: `fresh` (the index still matches the file — the ' +
+      'offsets are safe to edit at, with a contentHash integrity token), `stale` (the file changed since ' +
+      'analysis — returns a re-analyze hint and NO offset, refusing to hand out a location the substrate can ' +
+      'no longer vouch for), `ambiguous` (a bare name matching several symbols → the name::path candidate ' +
+      'list), or `not-found` (unknown symbol → candidates). Unlike suggest_insertion_points (which RANKS where ' +
+      'to ADD new code) this pinpoints an EXISTING symbol\'s current bytes to modify. READ-ONLY: OpenLore ' +
+      'returns the location and the freshness guarantee; the host applies the write with its own edit tool — ' +
+      'no write face, no shell. Computed live from the cached graph + a re-read of the one file the symbol ' +
+      'spans (no new artifact). Deterministic, offline, no LLM. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        symbol: { type: 'string', description: 'The symbol to locate: its name, or name::path to disambiguate.' },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'analyze_error_propagation',
+    description:
+      'USE THIS WHEN: you are about to call a function and want to know "what exceptions can blow out ' +
+      'of here, and is any already handled?" — or you changed a function to throw and need "who is ' +
+      'exposed, and where (if anywhere) is it caught?". The error-handling analogue of analyze_impact: ' +
+      'given a `symbol` (a function name, or name::path, in the index), it returns `escapes` (the ' +
+      'exception types that can propagate OUT of the function to its callers — each with the origin ' +
+      'function/file/line, whether it is a direct throw or propagated from a callee, and the call ' +
+      'path) and `handledInternally` (exceptions thrown in the reachable subtree but caught within ' +
+      'this function, so callers are shielded). Computed live from the cached call graph + a re-read ' +
+      'of the source it spans (no new artifact). SCOPE: TypeScript / JavaScript / Python / Java / C# exceptions, ' +
+      'plus a separate Go returned-error and panic/recover value model (`errorModel: go-value`, with `value` ' +
+      'rather than exception `type` entries) — a symbol in ' +
+      'any other language returns an explicit `unsupported` result, never an empty escape set. HONEST: ' +
+      'a SOUND LOWER BOUND — an un-analyzable callee (external/bodyless/unsupported/over-bound) is ' +
+      'disclosed in `boundaries`, never assumed exception-free; a re-raise/throw whose static type is ' +
+      'unknowable is surfaced as `<dynamic>`, never dropped; Python typed `except` is matched by exact ' +
+      'name only (no subclass hierarchy), disclosed. Deterministic, offline, no LLM. Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        symbol: { type: 'string', description: 'The function to analyze: its name, or name::path to disambiguate.' },
+        maxDepth: { type: 'number', description: 'Callee-traversal depth bound (default 10, clamped to [1, 30]). Truncation is disclosed in boundaries.' },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'analyze_env_impact',
+    description:
+      'USE THIS WHEN: you are about to remove or rename an environment variable and want to know ' +
+      '"what breaks?" — the configuration analogue of analyze_impact. Given an env var `name` (e.g. ' +
+      'DATABASE_URL), it returns the line-precise `readSites` (file/line/enclosing function; a read ' +
+      'outside any function is reported module-level), the `affectedFunctions` (upstream callers that ' +
+      'transitively reach a read — the blast radius), the `reachingTests` to run, whether the var is ' +
+      'declared with a default, and per-site `required` (a read with no site-local fallback is a hard ' +
+      'break). Computed live from the cached call graph + a re-read of the files the env inventory ' +
+      'flags for the var (no new artifact). SCOPE: environment-variable reads in TypeScript / ' +
+      'JavaScript / Python / Go / Ruby — config-object key reads are a disclosed out-of-scope ' +
+      'boundary, never guessed. HONEST: an unknown var returns not-found + candidates (never an empty ' +
+      '"unused"); a module-level read and the call graph\'s resolution limits are disclosed in ' +
+      '`boundaries`, so the blast radius is a SOUND LOWER BOUND. Deterministic, offline, no LLM. Run ' +
+      'analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        name: { type: 'string', description: 'The environment variable to analyze, e.g. DATABASE_URL.' },
+        maxDepth: { type: 'number', description: 'Backward-reachability depth bound (default 12, clamped to [1, 30]). Truncation is disclosed in boundaries.' },
+      },
+      required: ['name'],
     },
   },
   {
@@ -1127,30 +2007,71 @@ export const TOOL_DEFINITIONS = [
       'Run analyze_codebase first.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         base: {
           type: 'string',
           description: 'Git ref to diff against (default: HEAD). Use "HEAD~1" for last commit, "main" for branch diff.',
         },
       },
-      required: ['directory'],
+    },
+  },
+  {
+    name: 'get_health_map',
+    description:
+      'Return a structural health dashboard: hubs (high fan-in), god functions (high fan-out), ' +
+      'layer violations, and volatile files — aggregated in one call and ranked by severity. ' +
+      'Use this as a starting point before a refactor or code review to identify the riskiest areas. ' +
+      'Drill in with get_critical_hubs, get_god_functions, get_change_coupling, or find_dead_code. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        limit: {
+          type: 'number',
+          description: 'Max items per hotspot list and max topRisks (default: 10, max: 50)',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_surprising_connections',
+    description:
+      'Find unexpected structural coupling via composite scoring: cross-community edges, ' +
+      'peripheral-to-hub calls, and cross-test-boundary dependencies. ' +
+      'Use before a refactor or code review to spot accidental dependencies. ' +
+      'Run analyze_codebase first.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        limit: {
+          type: 'number',
+          description: 'Max results to return (default: 15, max: 50)',
+        },
+      },
     },
   },
   {
     name: 'record_decision',
     description:
-      'Record an architectural decision made during the current development session. ' +
-      'Call this whenever you make a significant design choice: choosing a data structure, ' +
-      'picking a library, defining an API contract, selecting an auth strategy, etc. ' +
-      'Decisions are stored as drafts and consolidated before the next commit. ' +
-      'Use the supersedes field when a later decision replaces an earlier one.',
+      'Record a DRAFT architectural decision — a proposal, not a final record. ' +
+      'Call this on a significant design choice: data structure, library, API contract, auth strategy. ' +
+      'Diff-grounded consolidation then promotes it (possibly rewording it, keeping your text as ' +
+      'authorStatement), merges it, or rejects it — always with a stated reason. The response returns ' +
+      'the draft id and the command that reads the verdict; re-recording a decided draft returns that ' +
+      'verdict instead of a second draft. Use supersedes when a later decision replaces an earlier one.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
-        title: { type: 'string', description: 'Short imperative statement, e.g. "Use UUIDs for decision IDs"' },
-        rationale: { type: 'string', description: 'Why this decision was made' },
+        directory: { type: 'string', description: DIR_DESC },
+        title: { type: 'string', minLength: 1, maxLength: 4096, description: 'Short imperative statement, e.g. "Use UUIDs for decision IDs"' },
+        rationale: { type: 'string', minLength: 1, maxLength: 4096, description: 'Why this decision was made' },
         consequences: { type: 'string', description: 'What changes as a result (optional)' },
         affectedFiles: {
           type: 'array',
@@ -1161,8 +2082,87 @@ export const TOOL_DEFINITIONS = [
           type: 'string',
           description: 'ID of a prior decision this one replaces (optional)',
         },
+        scope: {
+          type: 'string',
+          enum: ['local', 'component', 'cross-domain', 'system'],
+          description: 'Decision scope. local: single file; component: single module/service; cross-domain: multiple spec domains or service contracts; system: global constraint. Only cross-domain and system generate ADR files. Defaults to component; auto-promoted to cross-domain when multiple domains inferred.',
+        },
+        constraints: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Optional versioned architecture constraints. Rules use the existing layers / forbidden / allowedOnly vocabulary and inherit this decision\'s lifecycle.',
+          properties: {
+            version: { type: 'integer', enum: [1] },
+            eligibility: {
+              oneOf: [
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    status: { type: 'string', enum: ['eligible'] },
+                    enforcedBoundary: { type: 'string', minLength: 1, maxLength: 4096 },
+                    humanReviewRemainder: { type: 'string', minLength: 1, maxLength: 4096 },
+                  },
+                  required: ['status', 'enforcedBoundary'],
+                },
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    status: { type: 'string', enum: ['ineligible'] },
+                    reason: { type: 'string', minLength: 1, maxLength: 4096 },
+                  },
+                  required: ['status', 'reason'],
+                },
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: { status: { type: 'string', enum: ['unclassified'] } },
+                  required: ['status'],
+                },
+              ],
+            },
+            rules: {
+              type: 'array',
+              maxItems: 10,
+              items: {
+                oneOf: [
+                  {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                      id: { type: 'string', minLength: 1, maxLength: 128 }, scope: { type: 'string', minLength: 1, maxLength: 256 },
+                      kind: { type: 'string', enum: ['layers'] }, reason: { type: 'string', maxLength: 2048 },
+                      layers: {
+                        type: 'object', maxProperties: 8,
+                        additionalProperties: { type: 'array', maxItems: 4, items: { type: 'string', minLength: 1, maxLength: 256 } },
+                      },
+                    },
+                    required: ['id', 'scope', 'kind', 'layers'],
+                  },
+                  {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                      id: { type: 'string', minLength: 1, maxLength: 128 }, scope: { type: 'string', minLength: 1, maxLength: 256 },
+                      kind: { type: 'string', enum: ['forbidden'] }, reason: { type: 'string', maxLength: 2048 },
+                      from: { type: 'string', minLength: 1, maxLength: 256 }, to: { type: 'string', minLength: 1, maxLength: 256 },
+                    },
+                    required: ['id', 'scope', 'kind', 'from', 'to'],
+                  },
+                  {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                      id: { type: 'string', minLength: 1, maxLength: 128 }, scope: { type: 'string', minLength: 1, maxLength: 256 },
+                      kind: { type: 'string', enum: ['allowedOnly'] }, reason: { type: 'string', maxLength: 2048 },
+                      module: { type: 'string', minLength: 1, maxLength: 256 },
+                      mayDependOn: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 256 } },
+                    },
+                    required: ['id', 'scope', 'kind', 'module', 'mayDependOn'],
+                  },
+                ],
+              },
+            },
+          },
+          required: ['version', 'rules'],
+        },
       },
-      required: ['directory', 'title', 'rationale'],
+      required: ['title', 'rationale'],
     },
   },
   {
@@ -1174,15 +2174,15 @@ export const TOOL_DEFINITIONS = [
       'then sync_decisions to write them to spec.md files.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         status: {
           type: 'string',
           enum: ['draft', 'consolidated', 'verified', 'phantom', 'approved', 'rejected', 'synced'],
           description: 'Filter by status (default: returns all)',
         },
       },
-      required: ['directory'],
     },
   },
   {
@@ -1195,12 +2195,13 @@ export const TOOL_DEFINITIONS = [
       'After approving, call sync_decisions to write the decision to the relevant spec.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         id: { type: 'string', description: '8-character decision ID from list_decisions' },
         note: { type: 'string', description: 'Optional review note' },
       },
-      required: ['directory', 'id'],
+      required: ['id'],
     },
   },
   {
@@ -1209,12 +2210,13 @@ export const TOOL_DEFINITIONS = [
       'Reject a pending decision. Rejected decisions are never synced to spec files.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         id: { type: 'string', description: '8-character decision ID from list_decisions' },
         note: { type: 'string', description: 'Optional reason for rejection' },
       },
-      required: ['directory', 'id'],
+      required: ['id'],
     },
   },
   {
@@ -1227,12 +2229,69 @@ export const TOOL_DEFINITIONS = [
       'Pass id to sync a single decision by ID.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
+        directory: { type: 'string', description: DIR_DESC },
         dryRun: { type: 'boolean', description: 'Preview without writing files (default: false)' },
         id: { type: 'string', description: 'Sync only this specific decision ID (default: all approved)' },
       },
-      required: ['directory'],
+    },
+  },
+  {
+    name: 'remember',
+    description:
+      'Persist a durable, code-anchored memory to recall later (invariant/gotcha/rationale). Pass ' +
+      'anchors (symbol and/or file) so it self-invalidates when that code changes. Optional: type ' +
+      '(default note) and supersedes=<id> to retire a prior memory; re-recording the same ' +
+      'content+anchor updates in place. For spec-synced decisions use record_decision.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        content: { type: 'string', description: 'The memory to persist (one self-contained fact).' },
+        anchors: {
+          type: 'array',
+          description: 'Code this memory is about; each anchor names a symbol and/or file.',
+          items: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string', description: 'Function/method name (optional)' },
+              file: { type: 'string', description: 'Repo-relative file path (optional)' },
+            },
+          },
+        },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Optional retrieval tags.' },
+        type: {
+          type: 'string',
+          enum: ['invariant', 'gotcha', 'rationale', 'convention', 'preference', 'todo', 'note'],
+          description: 'Classification (default note); never inferred.',
+        },
+        supersedes: { type: 'string', description: 'Id of a prior memory to retire (kept queryable via asOf).' },
+      },
+      required: ['content'],
+    },
+  },
+  {
+    name: 'recall',
+    description:
+      'Recall code-anchored memories (notes + decisions) for a task with a freshness verdict: fresh, ' +
+      'drifted (verify), or orphaned (in needsReanchoring, never authoritative). Two authoritative ' +
+      'memories on one symbol surface in unreconciled. Optional: asOf/changedSince (commit-ish) for ' +
+      'history, type filter, federation (surface producer-repo memory on interfaces you call). Omit task to scan all.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        directory: { type: 'string', description: DIR_DESC },
+        task: { type: 'string', description: 'What you are about to work on (optional).' },
+        limit: { type: 'number', description: 'Max memories to return (default: 10).' },
+        tokenBudget: { type: 'number', description: 'Optional token cap; reports withheld count.' },
+        asOf: { type: 'string', description: 'Commit-ish: memory authoritative as of that commit.' },
+        changedSince: { type: 'string', description: 'Commit-ish: memory recorded/invalidated after it.' },
+        type: { type: 'string', description: 'Restrict notes to this type (decisions excluded when set).' },
+        ...FEDERATION_PROPS,
+      },
     },
   },
 ];
@@ -1241,226 +2300,861 @@ export const TOOL_DEFINITIONS = [
 // MCP SERVER
 // ============================================================================
 
+// Annotations improve Tool Search relevance in Claude Code (BM25/regex ranking).
+// RO = read-only queries, RW_I = writes but idempotent, RW = non-idempotent writes.
+const _RO  = { readOnlyHint: true,  destructiveHint: false, idempotentHint: true  } as const;
+const _RWI = { readOnlyHint: false, destructiveHint: false, idempotentHint: true  } as const;
+const _RW  = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
+// Overwrites or irreversibly changes user-authored state (change: adopt-mcp-protocol-conformance).
+const _RWD  = { readOnlyHint: false, destructiveHint: true, idempotentHint: false } as const;
+const _RWDI = { readOnlyHint: false, destructiveHint: true, idempotentHint: true  } as const;
+
+const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | typeof _RWD | typeof _RWDI> = {
+  orient: _RO, analyze_codebase: _RWI, get_architecture_overview: _RO,
+  prepare_spec_generation: _RO, prepare_spec_repair: _RO,
+  get_refactor_report: _RO, get_call_graph: _RO, get_duplicate_report: _RO,
+  get_signatures: _RO, get_subgraph: _RO, trace_execution_path: _RO,
+  get_mapping: _RO, check_spec_drift: _RO, analyze_impact: _RO, select_tests: _RO, blast_radius: _RO, find_dead_code: _RO, structural_diff: _RO, get_change_coupling: _RO, check_architecture: _RO,
+  get_low_risk_refactor_candidates: _RO, get_leaf_functions: _RO,
+  get_critical_hubs: _RO, get_function_skeleton: _RO, get_god_functions: _RO,
+  suggest_insertion_points: _RO, search_code: _RO, list_spec_domains: _RO,
+  search_specs: _RO, search_unified: _RO, get_spec: _RO, get_function_body: _RO,
+  explain_retrieval_miss: _RO,
+  get_file_dependencies: _RO, generate_change_proposal: _RWD, annotate_story: _RWDI,
+  get_route_inventory: _RO, get_middleware_inventory: _RO,
+  get_schema_inventory: _RO, get_ui_component_inventory: _RO, get_env_vars: _RO,
+  get_external_packages: _RO, audit_spec_coverage: _RO, generate_tests: _RW,
+  get_test_coverage: _RO, get_minimal_context: _RO, get_cluster: _RO,
+  detect_changes: _RO, get_health_map: _RO, get_surprising_connections: _RO, record_decision: _RW, list_decisions: _RO,
+  approve_decision: _RWI, reject_decision: _RWDI, sync_decisions: _RWI,
+  remember: _RW, recall: _RO, verify_claim: _RO,
+  // Audited writers (change: adopt-mcp-protocol-conformance): `persist: true` writes a certificate,
+  // and federation_status adopts newly indexed fingerprints into the federation manifest.
+  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI, federation_status: _RWI,
+  get_landmarks: _RO, get_map: _RO, find_path: _RO,
+  plan_parallel_work: _RO, map_in_flight_conflicts: _RO, get_language_support: _RO,
+  report_coverage_gaps: _RO,
+  certify_public_surface: _RO,
+  get_style_fingerprint: _RO,
+  briefing_since: _RO,
+  find_clones: _RO,
+  analyze_error_propagation: _RO,
+  analyze_env_impact: _RO,
+  locate_symbol_span: _RO,
+};
+
+/** Tool names with an explicit read/write annotation entry, for the coverage guard. */
+export const ANNOTATED_TOOL_NAMES: readonly string[] = Object.keys(TOOL_ANNOTATIONS);
+
+// Tools that can reach external entities (network / LLM) → openWorldHint: true. Audited
+// (change: adopt-mcp-protocol-conformance): map_in_flight_conflicts reads pull requests through `gh`;
+// record_decision starts a background consolidation that can call an LLM. generate_tests,
+// generate_change_proposal, and annotate_story are local over MCP (no LLM service is passed).
+// Everything else is local, deterministic, closed-world analysis.
+const OPEN_WORLD_TOOLS = new Set<string>(['map_in_flight_conflicts', 'record_decision']);
+
+/** Human-readable title from a snake_case tool name (spec-11 annotations). */
+function toolTitle(name: string): string {
+  return name.split('_').map(w => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
+}
+
+/**
+ * Full MCP `annotations` for a tool: read/write hints + title + openWorldHint
+ * (spec-11) + capability family (mcp-quality: CapabilityFamilyTaxonomy). The
+ * `family` is the machine-readable grouping key that makes the full surface
+ * discoverable by family rather than as a flat list, so a client can present
+ * ~6 families and a handful of tools per family.
+ */
+export function toolAnnotations(name: string): Record<string, unknown> {
+  return {
+    title: toolTitle(name),
+    // No fallback (change: adopt-mcp-protocol-conformance): a tool without an explicit entry carries
+    // no read/write hints, which MCP clients read as the conservative defaults (not read-only,
+    // possibly destructive) — never as read-only. `mcp-annotations.test.ts` fails CI on the gap.
+    ...(Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, name) ? TOOL_ANNOTATIONS[name] : {}),
+    openWorldHint: OPEN_WORLD_TOOLS.has(name),
+    ...(capabilityFamily(name) ? { family: capabilityFamily(name) } : {}),
+  };
+}
+
+/**
+ * Render a tool surface grouped by capability family, for `openlore mcp --list-tools`
+ * (mcp-quality: CapabilityFamilyTaxonomy — "the full surface SHALL be discoverable by
+ * family"). This is the human-facing counterpart to the machine-readable
+ * `annotations.family` carried on the wire: an operator inspecting the surface sees ~6
+ * family groups and the tools within one, not a flat list. Pure; returns the text.
+ */
+export function renderToolSurfaceByFamily(tools: Array<{ name: string }>, presetLabel: string): string {
+  const groups = groupToolsByFamily(tools);
+  const toolWord = tools.length === 1 ? 'tool' : 'tools';
+  const familyWord = groups.length === 1 ? 'family' : 'families';
+  const lines: string[] = [`OpenLore MCP tool surface — ${presetLabel} (${tools.length} ${toolWord}, ${groups.length} ${familyWord}):`];
+  for (const { label, tools: familyTools } of groups) {
+    lines.push('');
+    lines.push(label);
+    for (const t of familyTools) lines.push(`  - ${t.name}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Resolve the active tool surface for a selector and render it grouped by family,
+ * for `openlore mcp --list-tools`. Pure (throws on an unknown preset, exactly as
+ * `selectActiveTools` does) so the grouping + selection composition is unit-testable
+ * without driving the CLI process. The short-circuit in `startMcpServer` is thin glue
+ * over this.
+ */
+export function renderActiveToolSurface(selectorOpts: { minimal?: boolean; preset?: string; allTools?: boolean }): string {
+  const tools = selectActiveTools(TOOL_DEFINITIONS, selectorOpts);
+  return renderToolSurfaceByFamily(tools, resolvePresetName(selectorOpts));
+}
+
+const MINIMAL_TOOLS = new Set([
+  'orient', 'search_code', 'record_decision', 'detect_changes', 'check_spec_drift', 'get_health_map',
+]);
+
+// Named tool presets (Spec 14). A small, navigation-focused surface keeps the
+// per-request tool-schema overhead low (the MCP best-practice: schemas for tools
+// the agent never calls are pure overhead) while still exposing the graph-
+// traversal tools a "how does X reach Y" task actually needs — which `minimal`
+// (orient + search + governance) omits. CodeGraph wins its benchmark with a
+// surface like this; openlore's was either too lean (no traversal) or all ~60.
+export const TOOL_PRESETS: Record<string, Set<string>> = {
+  minimal: MINIMAL_TOOLS,
+  // Graph-navigation core: orient to enter, then traverse/trace/impact + compact
+  // symbol bodies — no governance tools, no inventories.
+  navigation: new Set([
+    'orient', 'search_code', 'get_subgraph', 'trace_execution_path',
+    'analyze_impact', 'suggest_insertion_points', 'get_function_skeleton',
+    'get_landmarks', 'get_map', 'find_path',
+  ]),
+  // Code-anchored persistent memory (opt-in): orient to ground, remember to
+  // persist a code-anchored note, recall to retrieve with a freshness verdict.
+  // Deliberately NOT in the default or `minimal` surface (mcp-quality: minimize
+  // the tools an agent must consider).
+  memory: new Set([
+    'orient', 'remember', 'recall',
+  ]),
+  // Claim verification (opt-in): orient to ground, then verify a structural claim
+  // (calls/reaches/dead/impacts/safe-to-change) or a decision-authority claim
+  // (decision-current) and cite the receipt before asserting it to a human.
+  // Deliberately NOT in the default or `minimal` surface (mcp-quality: minimize the
+  // tools an agent must consider). search_code helps the agent name the subject precisely.
+  verify: new Set([
+    'orient', 'search_code', 'verify_claim',
+  ]),
+  // Multi-repo federation (opt-in): the cross-repo conclusion tools plus the
+  // registry status tool. `federation_status` exists ONLY here — the default and
+  // `minimal` surfaces register no federation capability (change:
+  // add-multi-repo-federation; architecture: FederationScopedConclusions opt-in).
+  federation: new Set([
+    'orient', 'federation_status', 'spec_store_status', 'working_set_context', 'change_impact_certificate',
+    'analyze_impact', 'find_dead_code', 'select_tests', 'find_path', 'map_in_flight_conflicts',
+  ]),
+  // Parallel-work coordination (opt-in): orient to ground, then plan_parallel_work to
+  // schedule N proposed tasks into safe-to-dispatch waves + a critical path, or
+  // map_in_flight_conflicts to find collisions across every change already in flight
+  // (branches/PRs/tasks). analyze_impact and find_path help an agent name and scope the
+  // seed symbols a task will touch. Deliberately NOT in the default or `minimal` surface
+  // (mcp-quality: minimize the tools an agent must consider; changes: add-parallel-work-plan,
+  // add-cross-actor-interference-map).
+  coordination: new Set([
+    'orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'analyze_impact', 'find_path',
+  ]),
+  // The navigation core plus governance reads (change: unify-navigation-and-governance-substrate;
+  // architecture: UnifiedStructuralSubstrate). The `navigation` graph-traversal core
+  // PLUS the three highest-value governance *reads* — recall (what is known about the
+  // code I'm touching), verify_claim (settle an assertion before it reaches a human),
+  // blast_radius (weigh a diff). So an out-of-box agent gets the value of the navigation
+  // core plus governance reads — navigate, recall, verify, weigh — not navigation alone.
+  // Holds governance READS only: no remember/record_decision write, no commit gate — so
+  // it carries the read face, NOT the write face (remember + record_decision), which stays
+  // opt-in via --preset memory/minimal/full until a benchmark-gated flip (ADR-0023). Copy
+  // must not describe this preset as carrying both capability faces while that holds. This is the *active*
+  // out-of-box default (LEAN_DEFAULT_PRESET; decision c79ec7ca / ADR-0023, superseding
+  // ADR-0022): the agent benchmark showed the wider surface does not regress task-completion
+  // or selection accuracy and stays within the token-economy budget, across two models and
+  // both repo tiers. The lean navigate-only `navigation` preset remains a one-flag escape.
+  substrate: new Set([
+    'orient', 'search_code', 'get_subgraph', 'trace_execution_path',
+    'analyze_impact', 'suggest_insertion_points', 'get_function_skeleton',
+    'get_landmarks', 'get_map', 'find_path',
+    'recall', 'verify_claim', 'blast_radius',
+    'prepare_spec_generation', 'prepare_spec_repair',
+  ]),
+};
+
+/**
+ * Reviewed ceilings for the deterministic standing-context estimator.
+ *
+ * Every entry records its first measured baseline and bounded headroom. A future
+ * raise therefore changes both a number and its review rationale. `full` is
+ * included because it is a supported preset selector even though it is derived
+ * from the complete registry.
+ *
+ * change: bound-standing-context-cost
+ */
+export const STANDING_CONTEXT_BUDGETS: Record<string, {
+  baselineTokens: number;
+  maxTokens: number;
+  rationale: string;
+}> = {
+  minimal: { baselineTokens: 2_736, maxTokens: 2_950, rationale: 'Exact v1 wire baseline plus 7.8% headroom.' },
+  navigation: { baselineTokens: 3_533, maxTokens: 3_800, rationale: 'Exact v1 wire baseline plus 7.6% headroom.' },
+  memory: { baselineTokens: 1_216, maxTokens: 1_300, rationale: 'Exact v1 wire baseline plus 6.9% headroom.' },
+  verify: { baselineTokens: 1_262, maxTokens: 1_350, rationale: 'Exact v1 wire baseline plus 7.0% headroom.' },
+  federation: { baselineTokens: 3_837, maxTokens: 4_100, rationale: 'Exact v1 wire baseline plus 6.9% headroom.' },
+  coordination: { baselineTokens: 2_487, maxTokens: 2_650, rationale: 'Exact v1 wire baseline plus 6.6% headroom.' },
+  substrate: { baselineTokens: 5_131, maxTokens: 5_500, rationale: 'Exact v1 wire baseline plus 7.2% headroom.' },
+  full: { baselineTokens: 24_140, maxTokens: 25_500, rationale: 'Exact v1 wire baseline plus 5.6% headroom.' },
+};
+
+/**
+ * Return an actionable error when a registered tool is outside the active preset.
+ * Membership is derived from the same sets that drive tools/list; `full` is the
+ * registry itself, so it is appended rather than maintained as another set.
+ */
+export function presetMembershipError(
+  toolName: string,
+  activePreset: string,
+  activeToolNames: ReadonlySet<string>,
+): string | undefined {
+  if (activeToolNames.has(toolName)) return undefined;
+  const containingPresets = Object.entries(TOOL_PRESETS)
+    .filter(([, tools]) => tools.has(toolName))
+    .map(([name]) => name);
+  containingPresets.push(FULL_PRESET);
+  return `Tool "${toolName}" is not available in the active "${activePreset}" preset. ` +
+    `Available in: ${containingPresets.join(', ')}. Re-wire with ` +
+    '`openlore install --preset <name>`.';
+}
+
+/**
+ * Resolve a tool-selector option set to its canonical preset name (change:
+ * default-to-lean-tool-surface). Precedence: `--all-tools`/`--preset full`/`all`
+ * → `full`; `--preset <name>` → that name; legacy `--minimal` → `minimal`; no
+ * selector → the lean default (`LEAN_DEFAULT_PRESET`). Pure; the single source of
+ * truth both `selectActiveTools` and `leanDefaultActive` resolve through, so the
+ * active surface and the breadth-pointer decision can never disagree.
+ */
+export function resolvePresetName(opts: { minimal?: boolean; preset?: string; allTools?: boolean }): string {
+  if (opts.allTools) return FULL_PRESET;
+  if (opts.preset) return opts.preset === FULL_PRESET_ALIAS ? FULL_PRESET : opts.preset;
+  if (opts.minimal) return 'minimal';
+  return LEAN_DEFAULT_PRESET;
+}
+
+/**
+ * Resolve which tools an MCP session exposes (Spec 14; change:
+ * default-to-lean-tool-surface). `--all-tools`/`--preset full` → the full
+ * registry; `--preset <name>` → that preset; legacy `--minimal` → the 'minimal'
+ * preset; **no selector → the lean default surface** (the benchmark-cleared
+ * `LEAN_DEFAULT_PRESET`), NOT the full registry. Breadth is opt-in because schemas
+ * for tools the agent never calls are pure per-request overhead (mcp-quality:
+ * MinimizeToolSurface). An unknown preset throws so a typo fails loudly instead of
+ * silently exposing all tools. Pure + exported for unit testing.
+ */
+export function selectActiveTools<T extends { name: string }>(
+  allTools: T[],
+  opts: { minimal?: boolean; preset?: string; allTools?: boolean },
+): T[] {
+  const presetName = resolvePresetName(opts);
+  // The full surface is the registry itself — no Set to maintain, so adding a
+  // tool never needs a `full` membership edit (and it can't drift out of sync).
+  if (presetName === FULL_PRESET) return allTools;
+  const preset = TOOL_PRESETS[presetName];
+  if (!preset) {
+    // Echo the raw user input (untrimmed/cased) so a near-miss like "Full" or
+    // "full " is legible; the caller catches this and exits cleanly (no stack).
+    throw new Error(`Unknown --preset "${opts.preset ?? presetName}". Known presets: ${[...Object.keys(TOOL_PRESETS), FULL_PRESET].join(', ')}.`);
+  }
+  return allTools.filter(t => preset.has(t.name));
+}
+
 interface McpServerOptions {
   watch?: string;
   watchAuto?: boolean;
+  /** Spawn a shared `openlore serve` daemon when none is running and delegate to
+   * it. Without this, MCP only reuses an already-running daemon. */
+  daemon?: boolean;
   watchDebounce?: string;
+  watchNoEmbed?: boolean;
+  minimal?: boolean;
+  preset?: string;
+  allTools?: boolean;
+  /** Print the active tool surface grouped by capability family to stdout and exit,
+   * without starting the JSON-RPC transport (change: unify-navigation-and-governance-substrate). */
+  listTools?: boolean;
+}
+
+/**
+ * One-line breadth pointer emitted via the MCP `instructions` channel (server
+ * info, NOT a tool schema) when the lean default surface is active, so an agent
+ * that needs governance/memory/verify/federation tools learns the opt-in exists
+ * rather than concluding the capability is absent. Every opt-in is named in the
+ * `--preset <name>` form so it is copy-pasteable into both `openlore mcp` and
+ * `openlore install`. Adds zero tool schemas (change: default-to-lean-tool-surface).
+ */
+export const BREADTH_POINTER =
+  'OpenLore is running its default tool surface (the substrate core: the navigation ' +
+  'core, spec preparation — prepare_spec_generation + prepare_spec_repair — and ' +
+  'governance reads — recall + verify_claim + blast_radius). More tools ' +
+  'are available behind named presets — the full surface (`--preset full`), multi-repo ' +
+  'federation (`--preset federation`), parallel-work coordination (`--preset coordination`), ' +
+  'or the lean navigate-only core (`--preset navigation`). Re-wire with ' +
+  '`openlore install --preset <name>`.';
+
+/**
+ * True when the active surface IS the lean default (the `LEAN_DEFAULT_PRESET`
+ * preset) — whether reached by no selector at all OR by an explicit
+ * `--preset ${LEAN_DEFAULT_PRESET}` (which is how `openlore install` wires the
+ * default). The server cannot tell the two apart and shouldn't: an agent on the
+ * default surface should learn breadth exists regardless of how it got there. Any
+ * OTHER surface — including the lean navigate-only `navigation` escape, and
+ * `minimal`, `memory`, `verify`, `federation`, or `full` — is a deliberate
+ * different choice, so the pointer would be noise and is suppressed. Resolves
+ * through resolvePresetName so it can never disagree with the active tool set.
+ * Exported + pure for unit testing.
+ */
+export function leanDefaultActive(opts: { minimal?: boolean; preset?: string; allTools?: boolean }): boolean {
+  return resolvePresetName(opts) === LEAN_DEFAULT_PRESET;
 }
 
 async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
+  // change: fix-mcp-argument-contract — capture once: callers that omit `directory` use the root the server was
+  // launched for, even if some dependency changes process.cwd() later.
+  const launchRoot = resolve(process.cwd());
+  // --list-tools: print the active surface grouped by capability family and exit,
+  // WITHOUT starting the JSON-RPC transport. This runs before the stdout→stderr
+  // redirection below precisely because here stdout is a normal terminal, not the
+  // protocol stream (mcp-quality: CapabilityFamilyTaxonomy discoverability).
+  if (options.listTools) {
+    const selectorOpts = { minimal: options.minimal, preset: options.preset, allTools: options.allTools };
+    let surface: string;
+    try {
+      surface = renderActiveToolSurface(selectorOpts);
+    } catch (e) {
+      // Unknown preset: fail like a CLI usage error (clean message, exit 2), never start the server.
+      process.stderr.write(`${(e as Error).message}\n`);
+      process.exit(2);
+    }
+    process.stdout.write(surface + '\n');
+    return;
+  }
+
+  // Everything above this line — including `--list-tools` — works with the SDK absent. From here
+  // on the JSON-RPC transport is the whole job, so this is where the optional package is required.
+  let sdk: Awaited<ReturnType<typeof loadMcpSdk>>;
+  try {
+    sdk = await loadMcpSdk();
+  } catch (err) {
+    if (!(err instanceof OptionalFeatureError)) throw err;
+    // stdout is the protocol channel; a diagnostic there would corrupt a client that did connect.
+    process.stderr.write(`${err.message}\n`);
+    process.exit(2);
+  }
+  const { Server, StdioServerTransport } = sdk;
+  const {
+    CallToolRequestSchema,
+    InitializeRequestSchema,
+    ListToolsRequestSchema,
+    McpError,
+    LATEST_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+  } = sdk.types;
+
+  // The MCP stdio transport uses stdout EXCLUSIVELY for the JSON-RPC stream.
+  // Any stray write to stdout — e.g. logger.success("Successfully validated
+  // directory…") from validateDirectory(), which runs on nearly every tool
+  // call — corrupts the protocol and can break strict clients. Route all
+  // console diagnostics to stderr. The SDK transport writes protocol messages
+  // via process.stdout.write directly, so it is unaffected, and logger.error
+  // already uses console.error (stderr).
+  const toStderr = (...args: unknown[]): void => {
+    process.stderr.write(args.map(a => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+  };
+  console.log = toStderr;
+  console.info = toStderr;
+  console.warn = toStderr;
+  console.debug = toStderr;
+
+  // Register the process-wide background index-repair builder (change:
+  // make-index-self-healing). Read-path staleness signals (in mcp-handlers/utils)
+  // trigger repairInBackground, which uses this builder — a forced full rebuild
+  // (init + structural analyze + BM25 corpus, no API key) so a self-heal restores
+  // FULL parity, not just the structural graph. Injected here so the dependency-
+  // light read path never imports the analyzer/install layer itself.
+  registerRepairBuilder(async (dir, buildOpts) => {
+    await buildIndexInChildProcess(dir, { repair: true, mode: buildOpts?.mode });
+  });
+
+  const selectorOpts = { minimal: options.minimal, preset: options.preset, allTools: options.allTools };
+  // A bad `--preset` must fail like a CLI usage error (clean message, exit 2),
+  // not an uncaught throw that dumps a Node stack trace — mirroring how
+  // `openlore install` validates its preset (install/index.ts). stdout is the
+  // JSON-RPC channel, so the message goes to stderr.
+  let activeTools: typeof TOOL_DEFINITIONS;
+  try {
+    activeTools = selectActiveTools(TOOL_DEFINITIONS, selectorOpts);
+  } catch (e) {
+    process.stderr.write(`${(e as Error).message}\n`);
+    process.exit(2);
+  }
+  const activePreset = resolvePresetName(selectorOpts);
+  const activeToolNames = new Set(activeTools.map((tool) => tool.name));
+  // Advertise breadth once via server instructions only when the active surface
+  // IS the lean default (LEAN_DEFAULT_PRESET) — whether reached by no selector or
+  // an explicit `--preset <that name>` (how install wires it). Adds no tool schemas.
+  const instructions = leanDefaultActive(selectorOpts) ? BREADTH_POINTER : undefined;
+
+  // Report the real package version in the MCP initialize handshake rather
+  // than a stale hardcoded string.
+  const { version: pkgVersion } = _require('../../../package.json') as { version: string };
   const server = new Server(
-    { name: 'spec-gen', version: '1.0.0' },
+    { name: 'openlore', version: pkgVersion },
     { capabilities: { tools: {} } }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOL_DEFINITIONS,
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async () =>
+    buildToolListPayload(activeTools, toolAnnotations));
+
+  // Per-session epistemic lease tracker — re-initialized when directory changes.
+  let tracker: EpistemicTracker | undefined;
+  let trackerDir = '';
+  let panicPolicy: PanicResponseMode = 'off';
 
   // --watch-auto: start the watcher on the first tool call that carries a directory
   let autoWatcher: import('../../core/services/mcp-watcher.js').McpWatcher | undefined;
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args = {} } = request.params;
+  // change: fix-process-exit-lifecycle
+  // The stdio server's lifetime is its stdin. Every long-lived resource acquired
+  // during dispatch (the file watcher and its graph store) registers its teardown
+  // here, and stdin EOF / SIGINT / SIGTERM all converge on this one idempotent
+  // path (wired once after connect). Without this, chokidar's handles keep the
+  // event loop alive after the client closes the pipe, leaking a zombie process
+  // per agent session.
+  const lifecycle = createShutdownCoordinator();
+  enableChildProcessBuilds();
+  lifecycle.register(stopChildProcessBuilds);
+
+  // Serve-daemon delegation: when a shared `openlore serve` daemon is available
+  // for a directory, forward tool calls to it (one warm process + one watcher
+  // for the repo, shared across agents) instead of dispatching in-process.
+  // Resolved once per directory; null = no daemon, run locally. By default we
+  // only DISCOVER and reuse an already-running daemon (started by pi, an explicit
+  // `openlore serve`, or another `--daemon` MCP) — so a plain MCP session never
+  // silently leaves a lingering background process. `--daemon` opts in to
+  // SPAWNING a shared daemon when none is running.
+  const daemonByDir = new Map<string, ServeEndpoint | null>();
+  const daemonPending = new Map<string, Promise<ServeEndpoint | null>>();
+  function resolveDaemon(dir: string): Promise<ServeEndpoint | null> {
+    if (!dir) return Promise.resolve(null);
+    if (daemonByDir.has(dir)) return Promise.resolve(daemonByDir.get(dir) ?? null);
+    // Dedup concurrent calls for the same dir — without this, two parallel tool
+    // calls both miss the cache and each call ensureServeDaemon, potentially
+    // spawning two daemons (the dup-guard prevents double-start, but two
+    // spawn-and-poll cycles waste time and connections).
+    if (!daemonPending.has(dir)) {
+      const p = ensureServeDaemon(dir, { spawn: options.daemon === true })
+        .then(ep  => { daemonByDir.set(dir, ep);   daemonPending.delete(dir); return ep; })
+        .catch(()  => { daemonByDir.set(dir, null); daemonPending.delete(dir); return null; });
+      daemonPending.set(dir, p);
+    }
+    return daemonPending.get(dir)!;
+  }
+
+  // Agent identity captured from initialize handshake
+  let agentName = 'unknown';
+  let agentVersion = 'unknown';
+  // WATCH (change: adopt-mcp-protocol-conformance): the MCP 2026-07-28 release-candidate direction
+  // (a stateless core, `initialize` removed) would bypass this custom handler, which is where the
+  // client identity, the negotiated version, the real package version, and the `instructions`
+  // pointer are set. Revisit when that revision is final; nothing is built against the draft.
+  server.setRequestHandler(InitializeRequestSchema, async (request) => {
+    agentName = request.params.clientInfo?.name ?? 'unknown';
+    agentVersion = request.params.clientInfo?.version ?? 'unknown';
+    // Stamp every event this process emits with the client that opened it, so a
+    // repository shared by two agents stays separable at read time
+    // (change: scope-telemetry-by-agent-and-session).
+    setTelemetryIdentity(agentName, agentVersion);
+    // Protocol negotiation (spec-12): echo the client's requested version when we
+    // support it (per the SDK's pinned set), else offer our latest supported one.
+    const requested = request.params.protocolVersion;
+    const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+      ? requested
+      : LATEST_PROTOCOL_VERSION;
+    return {
+      protocolVersion,
+      // Honest capabilities: only `tools`. No `listChanged` — the tool list is
+      // static per session, so we don't advertise a capability we don't implement.
+      capabilities: { tools: {} },
+      serverInfo: { name: 'openlore', version: _pkgVersion },
+      // Breadth pointer on the lean default surface only (change:
+      // default-to-lean-tool-surface). This custom initialize handler overrides
+      // the SDK default, so the pointer must be attached here, not via the Server
+      // constructor's `instructions` option (which this handler shadows).
+      ...(instructions ? { instructions } : {}),
+    };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const { name: _rawName, arguments: rawArgs = {} } = request.params;
+    const hadExplicitDirectory = rawArgs !== null
+      && typeof rawArgs === 'object'
+      && !Array.isArray(rawArgs)
+      && Object.prototype.hasOwnProperty.call(rawArgs, 'directory');
+    const args = rawArgs !== null && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+      ? { ...rawArgs, ...(hadExplicitDirectory ? {} : { directory: launchRoot }) }
+      : rawArgs;
+    // Resolve a deprecated tool-name alias to its canonical name up front, so the
+    // schema lookup, arg validation, tracking, and dispatch all see one name.
+    const name = resolveCanonicalToolName(_rawName);
+
+    // change: enforce-preset-membership-at-dispatch
+    // Presets are a callable governance boundary, not only a tools/list filter.
+    // Reject before watcher bootstrap, validation, tracking, daemon delegation,
+    // or handler dispatch so hidden write tools cannot leave any trace. Resolve
+    // aliases first, while retaining the existing distinct unknown-tool result.
+    const toolDef = TOOL_DEFINITIONS.find(t => t.name === name);
+    if (!toolDef) {
+      return {
+        content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+    }
+    const membershipError = presetMembershipError(name, activePreset, activeToolNames);
+    if (membershipError) {
+      return {
+        content: [{ type: 'text', text: membershipError }],
+        isError: true,
+      };
+    }
+
+    const _dir = args !== null && typeof args === 'object'
+      ? (args as Record<string, unknown>).directory
+      : undefined;
+    let directory = typeof _dir === 'string' ? _dir : '';
+    const _t0 = Date.now();
+
+    // Validate the normalized argument object before watcher bootstrap or any
+    // persistent side effect. Unknown properties are rejected by the shared
+    // guard instead of being silently discarded by handlers.
+    {
+      // A rejected request must be side-effect free: nothing below has run, and telemetry is not
+      // emitted under a directory that has not been validated (telemetry itself creates files).
+      // Rejections are Tool Execution Errors, not JSON-RPC -32602: hosts often swallow protocol
+      // errors, while an `isError` result reaches the model, which can retry with the example
+      // (change: adopt-mcp-protocol-conformance; SEP-1303).
+      const checked = await checkToolArguments(name, args, toolDef.inputSchema, { hadExplicitDirectory, validateDirectory });
+      if (!checked.ok) return checked.result;
+      directory = checked.directory;
+      (args as Record<string, unknown>).directory = directory;
+    }
 
     if (options.watchAuto && !autoWatcher) {
       const dir = (args as Record<string, unknown>).directory;
       if (typeof dir === 'string') {
-        const { resolve } = await import('node:path');
-        const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
-        const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
-        autoWatcher = new McpWatcher({
-          rootPath: resolve(dir),
-          debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
-        });
-        await autoWatcher.start();
-        const cleanup = () => autoWatcher!.stop().then(() => process.exit(0));
-        process.on('SIGINT',  cleanup);
-        process.on('SIGTERM', cleanup);
+        // Prefer a shared serve daemon if one is reachable (reused by default,
+        // or spawned with --daemon) — it runs the watcher (+ continuous
+        // call-graph re-analyze) for the whole repo, so we don't start a second
+        // watcher racing it. Fall back to an in-process watcher otherwise.
+        const ep = await resolveDaemon(dir);
+        if (!ep) {
+          // Cold-start self-bootstrap: if the agent wired the server without ever
+          // running `openlore install`, build the index once in the background so
+          // the session warms up on its own. Non-blocking and fail-soft. We inject
+          // install's full buildIndex (init + analyze + BM25 search index, no API
+          // key) so orient is warmed to full parity, not just the structural graph.
+          const { bootstrapAnalysisInBackground } = await import('../../core/services/cold-start-bootstrap.js');
+          bootstrapAnalysisInBackground(resolve(dir), {
+            analyze: buildIndexInChildProcess,
+          });
+          const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
+          const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
+          const watchConfig = await readOpenLoreConfig(resolve(dir));
+          autoWatcher = new McpWatcher({
+            rootPath: resolve(dir),
+            openspecPath: watchConfig?.openspecPath,
+            debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
+            embed: !options.watchNoEmbed,
+            // selfRebuild (make-index-self-healing): the in-process watcher has no
+            // serve-style rebuild coordinator, so its call graph would age with every
+            // branch switch. Let it spawn its own debounced `analyze --force` on a
+            // HEAD change / budget-exceeded stale region — the graph stays fresh
+            // without a post-commit hook or a running daemon.
+            selfRebuild: true,
+          });
+          const watcherStart = autoWatcher.start();
+          void watcherStart.catch(error => {
+            process.stderr.write(`[mcp-watcher] startup failed: ${(error as Error).message}\n`);
+          });
+          const unregisterRepairHost = registerRepairHost(resolve(dir), staleFiles =>
+            autoWatcher?.requestColdReadRepair(staleFiles) ?? false,
+          );
+          // Teardown routes through the one lifecycle path wired after connect
+          // (stdin EOF / SIGINT / SIGTERM), so this watcher cannot outlive its
+          // transport and no signal implements a partial teardown of its own.
+          lifecycle.register(async () => {
+            unregisterRepairHost();
+            await watcherStart.catch(() => {});
+            await autoWatcher!.stop();
+          });
+        }
       }
     }
 
     try {
-      let result: unknown;
+      const filePath = (args as Record<string, unknown>).filePath;
 
-      if (name === 'orient') {
-        const { directory, task, limit = 5 } = args as { directory: string; task: string; limit?: number };
-        result = await handleOrient(directory, task, limit);
-      } else if (name === 'analyze_codebase') {
-        const { directory, force = false } = args as { directory: string; force?: boolean };
-        result = await handleAnalyzeCodebase(directory, force);
-      } else if (name === 'get_architecture_overview') {
-        const { directory } = args as { directory: string };
-        result = await handleGetArchitectureOverview(directory);
-      } else if (name === 'get_refactor_report') {
-        const { directory } = args as { directory: string };
-        result = await handleGetRefactorReport(directory);
-      } else if (name === 'get_call_graph') {
-        const { directory } = args as { directory: string };
-        result = await handleGetCallGraph(directory);
-      } else if (name === 'get_signatures') {
-        const { directory, filePattern } = args as { directory: string; filePattern?: string };
-        result = await handleGetSignatures(directory, filePattern);
-      } else if (name === 'get_subgraph') {
-        const { directory, functionName, direction = 'downstream', maxDepth = 3, format = 'json' } =
-          args as { directory: string; functionName: string; direction?: 'downstream' | 'upstream' | 'both'; maxDepth?: number; format?: 'json' | 'mermaid' };
-        result = await handleGetSubgraph(directory, functionName, direction, maxDepth, format);
-      } else if (name === 'trace_execution_path') {
-        const { directory, entryFunction, targetFunction, maxDepth = 6, maxPaths = 10 } =
-          args as { directory: string; entryFunction: string; targetFunction: string; maxDepth?: number; maxPaths?: number };
-        result = await handleTraceExecutionPath(directory, entryFunction, targetFunction, maxDepth, maxPaths);
-      } else if (name === 'get_mapping') {
-        const { directory, domain, orphansOnly } = args as { directory: string; domain?: string; orphansOnly?: boolean };
-        result = await handleGetMapping(directory, domain, orphansOnly);
-      } else if (name === 'analyze_impact') {
-        const { directory, symbol, depth = 2 } =
-          args as { directory: string; symbol: string; depth?: number };
-        result = await handleAnalyzeImpact(directory, symbol, depth);
-      } else if (name === 'get_low_risk_refactor_candidates') {
-        const { directory, limit = 5, filePattern } =
-          args as { directory: string; limit?: number; filePattern?: string };
-        result = await handleGetLowRiskRefactorCandidates(directory, limit, filePattern);
-      } else if (name === 'get_leaf_functions') {
-        const { directory, limit = 20, filePattern, sortBy = 'fanIn' } =
-          args as { directory: string; limit?: number; filePattern?: string; sortBy?: 'fanIn' | 'name' | 'file' };
-        result = await handleGetLeafFunctions(directory, limit, filePattern, sortBy);
-      } else if (name === 'get_critical_hubs') {
-        const { directory, limit = 10, minFanIn = 3 } =
-          args as { directory: string; limit?: number; minFanIn?: number };
-        result = await handleGetCriticalHubs(directory, limit, minFanIn);
-      } else if (name === 'get_duplicate_report') {
-        const { directory } = args as { directory: string };
-        result = await handleGetDuplicateReport(directory);
-      } else if (name === 'get_function_skeleton') {
-        const { directory, filePath } = args as { directory: string; filePath: string };
-        result = await handleGetFunctionSkeleton(directory, filePath);
-      } else if (name === 'get_god_functions') {
-        const { directory, filePath, fanOutThreshold = 8 } =
-          args as { directory: string; filePath?: string; fanOutThreshold?: number };
-        result = await handleGetGodFunctions(directory, filePath, fanOutThreshold);
-      } else if (name === 'check_spec_drift') {
-        const { directory, base = 'auto', files = [], domains = [], failOn = 'warning', maxFiles = DEFAULT_DRIFT_MAX_FILES } =
-          args as { directory: string; base?: string; files?: string[]; domains?: string[]; failOn?: 'error' | 'warning' | 'info'; maxFiles?: number };
-        result = await handleCheckSpecDrift(directory, base, files, domains, failOn, maxFiles);
-      } else if (name === 'search_code') {
-        const { directory, query, limit = 10, language, minFanIn } =
-          args as { directory: string; query: string; limit?: number; language?: string; minFanIn?: number };
-        result = await handleSearchCode(directory, query, limit, language, minFanIn);
-      } else if (name === 'suggest_insertion_points') {
-        const { directory, description, limit = 5, language } =
-          args as { directory: string; description: string; limit?: number; language?: string };
-        result = await handleSuggestInsertionPoints(directory, description, limit, language);
-      } else if (name === 'search_specs') {
-        const { directory, query, limit = 10, domain, section } =
-          args as { directory: string; query: string; limit?: number; domain?: string; section?: string };
-        result = await handleSearchSpecs(directory, query, limit, domain, section);
-      } else if (name === 'search_unified') {
-        const { directory, query, limit = 10, language, domain, section } =
-          args as { directory: string; query: string; limit?: number; language?: string; domain?: string; section?: string };
-        result = await handleUnifiedSearch(directory, query, limit, language, domain, section);
-      } else if (name === 'list_spec_domains') {
-        const { directory } = args as { directory: string };
-        result = await handleListSpecDomains(directory);
-      } else if (name === 'get_spec') {
-        const { directory, domain } = args as { directory: string; domain: string };
-        result = await handleGetSpec(directory, domain);
-      } else if (name === 'get_function_body') {
-        const { directory, filePath, functionName } =
-          args as { directory: string; filePath: string; functionName: string };
-        result = await handleGetFunctionBody(directory, filePath, functionName);
-      } else if (name === 'get_file_dependencies') {
-        const { directory, filePath, direction = 'both' } =
-          args as { directory: string; filePath: string; direction?: 'imports' | 'importedBy' | 'both' };
-        result = await handleGetFileDependencies(directory, filePath, direction);
-      } else if (name === 'generate_change_proposal') {
-        const { directory, description, slug, storyContent } =
-          args as { directory: string; description: string; slug: string; storyContent?: string };
-        result = await handleGenerateChangeProposal(directory, description, slug, storyContent);
-      } else if (name === 'annotate_story') {
-        const { directory, storyFilePath, description } =
-          args as { directory: string; storyFilePath: string; description: string };
-        result = await handleAnnotateStory(directory, storyFilePath, description);
-      } else if (name === 'get_decisions') {
-        const { directory, query } = args as { directory: string; query?: string };
-        result = await handleGetDecisions(directory, query);
-      } else if (name === 'get_route_inventory') {
-        const { directory } = args as { directory: string };
-        result = await handleGetRouteInventory(directory);
-      } else if (name === 'get_middleware_inventory') {
-        const { directory } = args as { directory: string };
-        result = await handleGetMiddlewareInventory(directory);
-      } else if (name === 'get_schema_inventory') {
-        const { directory } = args as { directory: string };
-        result = await handleGetSchemaInventory(directory);
-      } else if (name === 'get_ui_components') {
-        const { directory } = args as { directory: string };
-        result = await handleGetUIComponents(directory);
-      } else if (name === 'get_env_vars') {
-        const { directory } = args as { directory: string };
-        result = await handleGetEnvVars(directory);
-      } else if (name === 'get_external_packages') {
-        const { directory } = args as { directory: string };
-        result = await handleGetExternalPackages(directory);
-      } else if (name === 'audit_spec_coverage') {
-        const { directory, maxUncovered = 50, hubThreshold = 5 } =
-          args as { directory: string; maxUncovered?: number; hubThreshold?: number };
-        result = await handleAuditSpecCoverage(directory, maxUncovered, hubThreshold);
-      } else if (name === 'generate_tests') {
-        const { directory, domains, framework, useLlm, dryRun } =
-          args as {
-            directory: string;
-            domains?: string[];
-            framework?: string;
-            useLlm?: boolean;
-            dryRun?: boolean;
-          };
-        result = await handleGenerateTests({ directory, domains, framework, useLlm, dryRun });
-      } else if (name === 'get_test_coverage') {
-        const { directory, domains, minCoverage } =
-          args as { directory: string; domains?: string[]; minCoverage?: number };
-        result = await handleGetTestCoverage({ directory, domains, minCoverage });
-      } else if (name === 'get_minimal_context') {
-        const { directory, functionName, filePath } =
-          args as { directory: string; functionName: string; filePath?: string };
-        result = await handleGetMinimalContext(directory, functionName, filePath);
-      } else if (name === 'get_cluster') {
-        const { directory, functionName } = args as { directory: string; functionName: string };
-        result = await handleGetCluster(directory, functionName);
-      } else if (name === 'detect_changes') {
-        const { directory, base } = args as { directory: string; base?: string };
-        result = await handleDetectChanges(directory, base);
-      } else if (name === 'record_decision') {
-        const { directory, title, rationale, consequences, affectedFiles, supersedes } =
-          args as { directory: string; title: string; rationale: string; consequences?: string; affectedFiles?: string[]; supersedes?: string };
-        result = await handleRecordDecision(directory, title, rationale, consequences, affectedFiles, supersedes);
-      } else if (name === 'list_decisions') {
-        const { directory, status } = args as { directory: string; status?: string };
-        result = await handleListDecisions(directory, status);
-      } else if (name === 'approve_decision') {
-        const { directory, id, note } = args as { directory: string; id: string; note?: string };
-        result = await handleApproveDecision(directory, id, note);
-      } else if (name === 'reject_decision') {
-        const { directory, id, note } = args as { directory: string; id: string; note?: string };
-        result = await handleRejectDecision(directory, id, note);
-      } else if (name === 'sync_decisions') {
-        const { directory, dryRun = false, id } = args as { directory: string; dryRun?: boolean; id?: string };
-        result = await handleSyncDecisions(directory, dryRun, id);
-      } else {
+      // Init (or re-init when project directory changes between calls)
+      if (directory && (!tracker || directory !== trackerDir)) {
+        tracker = createTracker(directory);
+        trackerDir = directory;
+        const cfg = await readOpenLoreConfig(directory);
+        panicPolicy = cfg?.panicResponse?.mode ?? 'off';
+      }
+      // Update epistemic state before dispatch (orient resets tracker internally).
+      // Invariant: only MCP tool calls (this path) feed panic. CLI commands (panic-check,
+      // telemetry) are separate processes that read state but never call updateTracker —
+      // no recursive panic feedback loop from openlore internal commands.
+      if (tracker && directory) {
+        const isOrient = name === 'orient';
+        updateTracker(tracker, name, directory, typeof filePath === 'string' ? filePath : undefined);
+
+        if (panicPolicy !== 'off') {
+          // Read disk state to preserve hook-written fields (lastHookInterventionAt, gryphWindowStart)
+          // that panic-check (separate process) may have set since the last MCP write.
+          const diskState = readPanicState(directory);
+          // orient() runs panic recovery (separate from updateTracker's freshness reset);
+          // every other tool call runs the per-call panic signal update.
+          if (isOrient) {
+            resetPanicOnOrient(tracker, directory);
+          } else {
+            updatePanic(tracker, {
+              density: tracker.density,
+              oscillation: tracker.oscillation,
+              weight: 1,
+              staleDepth: tracker.staleDepth,
+              directory,
+              tool: name,
+            });
+          }
+          // Locked read-modify-write so this per-call score/level update cannot clobber a
+          // concurrent panic-check hook or gryph daemon write. The hook/daemon own the
+          // cross-process fields (interventionCountSinceStable, lastHookInterventionAt,
+          // gryphWindowStart), so they are carried over from the FRESHEST on-disk read, not
+          // from the in-memory tracker. The counter is preserved while panicLevel > 0 (so a
+          // concurrent hook increment survives) and reset to 0 at level 0 — matching the
+          // tracker's own invariant (level 0 ⟺ count 0; see updatePanic/resetPanicOnOrient).
+          const t = tracker; // capture non-null binding for the deferred closure
+          const written = mutatePanicStateLocked(directory, (fresh) => ({
+            ...trackerToPanicState(t, agentName),
+            lastHookInterventionAt: fresh.lastHookInterventionAt,
+            gryphWindowStart: fresh.gryphWindowStart,
+            interventionCountSinceStable: t.panicLevel === 0 ? 0 : fresh.interventionCountSinceStable,
+          }));
+          t.panicRevision = written.revision;
+          t.interventionCountSinceStable = written.interventionCountSinceStable;
+
+          // Feedback loop: did orient() respond to a prior hook intervention?
+          if (isOrient && diskState.lastHookInterventionAt) {
+            const lagMs = Date.now() - new Date(diskState.lastHookInterventionAt).getTime();
+            if (lagMs < 5 * 60 * 1000) {
+              emit(directory, 'panic', {
+                event: 'panic_intervention_outcome',
+                outcome: 'responded',
+                intervention_lag_ms: lagMs,
+                orient_kind: tracker.recentOrientCount >= 3 ? 'spam' : tracker.recentOrientCount >= 2 ? 'rapid' : 'normal',
+              });
+            }
+          }
+        }
+      }
+
+      let result: unknown;
+      let _unknownTool = false;
+
+      // Per-tool timeout (spec-10): race the dispatch against the tool's budget so a
+      // pathological hang can never wedge the server. Slow tools (analysis, LLM) have
+      // generous overrides in MCP_TOOL_TIMEOUT_OVERRIDES.
+      await withToolTimeout((async () => {
+        // Delegate to a shared serve daemon when one is available (warm caches,
+        // single watcher), else dispatch in-process. A daemon transport failure
+        // falls back to in-process so a flaky daemon never breaks a tool call.
+        const ep = await resolveDaemon(directory);
+        try {
+          if (ep) {
+            try {
+              result = await callServeTool(ep, name, args as Record<string, unknown>, directory, extra.signal);
+            } catch (err) {
+              // A 403 means a healthy explicitly narrow daemon rejected a tool
+              // this wider MCP session is authorized to call. Fall back for this
+              // call without evicting that daemon; eligible later calls can still
+              // share its watcher. Reachability and other failures retain the
+              // existing local fallback and endpoint eviction behavior.
+              if (!isServePresetRejection(err)) {
+                daemonByDir.set(directory, null);
+              }
+              const annotations = toolAnnotations(name);
+              const replaySafe =
+                isServePresetRejection(err)
+                || annotations.readOnlyHint === true
+                || annotations.idempotentHint === true;
+              if (!replaySafe) {
+                throw new Error(
+                  `The shared daemon connection failed after dispatching ${name}; its outcome is ` +
+                  'unknown, so OpenLore did not replay this non-idempotent operation locally. ' +
+                  'Inspect repository state before retrying.',
+                  { cause: err },
+                );
+              }
+              result = await dispatchTool(name, args as Record<string, unknown>, directory, extra.signal);
+            }
+          } else {
+            result = await dispatchTool(name, args as Record<string, unknown>, directory, extra.signal);
+          }
+        } catch (err) {
+          if (err instanceof UnknownToolError) {
+            _unknownTool = true;
+            return;
+          }
+          throw err;
+        }
+        // orient emits navigation telemetry tied to the MCP session's agent.
+        if (name === 'orient' && result && typeof result === 'object') {
+          const r = result as Record<string, unknown>;
+          emit(directory, 'orient', {
+            event: 'orient_call',
+            agent: agentName,
+            functions: Array.isArray(r['relevantFunctions']) ? r['relevantFunctions'].length : 0,
+            files: Array.isArray(r['relevantFiles']) ? r['relevantFiles'].length : 0,
+            spec_domains: Array.isArray(r['specDomains']) ? r['specDomains'].length : 0,
+            insertion_points: Array.isArray(r['insertionPoints']) ? r['insertionPoints'].length : 0,
+          });
+        }
+      })(), name);
+
+      if (_unknownTool) {
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
           isError: true,
         };
       }
 
-      const text =
-        typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      // Output cap (spec-10): bound the response to a byte budget rather than blowing
+      // the agent's context. capStructuredResult truncates at the STRUCTURED level so a
+      // JSON result stays valid+parseable (naive byte-truncation of serialized JSON cuts
+      // mid-string-literal — e.g. get_spec on a >256 KB spec — and is unusable).
+      const { text, truncated } = capStructuredResult(result, MCP_TOOL_MAX_BYTES);
 
-      return {
-        content: [{ type: 'text', text }],
-      };
+      emit(directory, 'mcp', {
+        event: 'tool_call', tool: name, ms: Date.now() - _t0, agent: agentName, agent_version: agentVersion,
+        bytes: Buffer.byteLength(text, 'utf8'), outcome: truncated ? 'truncated' : 'ok',
+        panic_level: tracker?.panicLevel ?? 0,
+        panic_score: tracker?.panicScore ?? 0,
+      });
+
+      const signal = tracker ? getFreshnessSignal(tracker) : null;
+
+      // Both freshness and panic signals are separate content items — never
+      // concatenated into the result body — so structured outputs (JSON, patches)
+      // are not corrupted. Panic signal always appended (after result).
+      const content: Array<{ type: 'text'; text: string }> = [];
+      if (signal?.prepend) content.push({ type: 'text', text: signal.text });
+      content.push({ type: 'text', text });
+      if (signal && !signal.prepend) content.push({ type: 'text', text: signal.text });
+
+      // Index self-healing disclosure (change: make-index-self-healing). When a
+      // read-path staleness signal has triggered a background repair for this repo,
+      // append one factual note — served now from the stale index, refresh started,
+      // never blocked, never presented as fresh. A separate content item so it never
+      // corrupts a structured result body. Distinct from the freshness (session-age)
+      // note above and from the absent-index "run analyze" not-ready result.
+      if (directory) {
+        // A repository's FIRST auto-init is disclosed once, before the ordinary
+        // repair note: "no index found" is not a STALE index, and saying so is the
+        // consent half of background auto-init (change: unify-onboarding-entrypoint).
+        const firstTouch = takeFirstTouchNotice(directory);
+        if (firstTouch) {
+          content.push({ type: 'text', text: `\n[openlore index] ${firstTouch} Informational signal.\n` });
+        }
+        // An index-absent conclusion in a repo where auto-init cannot run must name
+        // the suppression, not just the missing index: "no analysis found" alone
+        // reads as a broken install (change: unify-onboarding-entrypoint).
+        const notReady = result as { notReady?: unknown; reason?: unknown } | null;
+        if (notReady && typeof notReady === 'object'
+          && notReady.notReady === true && notReady.reason === 'index-absent') {
+          const suppression = autoInitSuppression(directory);
+          if (suppression) {
+            content.push({
+              type: 'text',
+              text: `\n[openlore index] Background auto-init is off for this directory (${suppression.detail}), `
+                + 'so no index is being built. Run `openlore analyze` to build one. Informational signal.\n',
+            });
+          }
+        }
+        const repair = repairStatusFor(directory);
+        if (repair && !(firstTouch && repair.reason === 'index-absent')) {
+          content.push({
+            type: 'text',
+            text: `\n[openlore index] ${repairDisclosureText(repair.reason)} Informational signal.\n`,
+          });
+        }
+        // The completeness receipt for a partial first-run index (change:
+        // refine-first-run-partial-serving). `dispatchTool` attaches it to the RESULT, so it
+        // reaches this transport, the serve daemon, and every CLI wrapper alike — and this
+        // rendering can never disagree with the structured field a programmatic caller reads.
+        const partialIndex = (result as { partialIndex?: { detail?: unknown } } | null)?.partialIndex;
+        if (partialIndex && typeof partialIndex.detail === 'string') {
+          content.push({
+            type: 'text',
+            text: `\n[openlore index] ${partialIndex.detail} Informational signal.\n`,
+          });
+        }
+      }
+
+      if (tracker && (panicPolicy === 'advisory' || panicPolicy === 'experimental_blocking')) {
+        const panicState = trackerToPanicState(tracker, agentName);
+        const panicText = getPanicSignalText(panicState);
+        if (panicText) {
+          content.push({ type: 'text', text: panicText });
+          // An injected signal is itself an intervention. Increment the SHARED on-disk
+          // counter under the lock so it composes with concurrent panic-check hook
+          // increments rather than clobbering them (the advisory→directive escalation
+          // gate reads this unified count). Carry hook/daemon-owned fields from disk.
+          const t = tracker; // capture non-null binding for the deferred closure
+          const written = mutatePanicStateLocked(directory, (fresh) => ({
+            ...trackerToPanicState(t, agentName),
+            lastHookInterventionAt: fresh.lastHookInterventionAt,
+            gryphWindowStart: fresh.gryphWindowStart,
+            interventionCountSinceStable: fresh.interventionCountSinceStable + 1,
+          }));
+          t.panicRevision = written.revision;
+          t.interventionCountSinceStable = written.interventionCountSinceStable;
+          emit(directory, 'panic', {
+            event: 'panic_signal_injected',
+            panic_level: tracker.panicLevel,
+            panic_score: tracker.panicScore,
+            intervention_count: tracker.interventionCountSinceStable,
+            directive_mode: tracker.interventionCountSinceStable >= 3,
+            tool: name,
+            agent: agentName,
+          });
+        }
+      }
+
+      return { content };
     } catch (err) {
+      // A thrown McpError is a protocol-level error — let the SDK serialize it as a JSON-RPC
+      // error response. Argument validation no longer throws one (it returns an `isError` result).
+      if (err instanceof McpError) throw err;
+      // Error normalization (spec-10): a stable code taxonomy, distinguishing
+      // "repo not analyzed yet" (actionable) from real failures and timeouts.
+      const code = classifyToolError(err);
+      const message = sanitizeMcpError(err);
+      emit(directory, 'mcp', { event: 'tool_error', tool: name, ms: Date.now() - _t0, agent: agentName, code, outcome: 'error', error: message });
       return {
-        content: [{ type: 'text', text: `Tool error: ${sanitizeMcpError(err)}` }],
+        content: [{ type: 'text', text: `Tool error [${code}]: ${message}` }],
         isError: true,
       };
     }
@@ -1469,18 +3163,54 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // change: fix-process-exit-lifecycle
+  // Bind process lifetime to transport lifetime. The client closing stdin (EOF)
+  // is the natural end of a stdio session; SIGINT/SIGTERM are the signalled ends.
+  // All three converge on one idempotent shutdown that runs every registered
+  // teardown and exits — so an agent session leaves no zombie holding a watcher.
+  // The SDK's StdioServerTransport only listens for stdin 'data'/'error' (never
+  // 'end'), so its onclose does NOT fire on EOF — we wire stdin 'end'/'close'
+  // ourselves. `server.onclose` still covers a transport closed by other means.
+  const shutdown = (): void => { void lifecycle.shutdown(0); };
+  server.onclose = shutdown;
+  process.stdin.once('end', shutdown);
+  process.stdin.once('close', shutdown);
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
   if (options.watch) {
     const { resolve } = await import('node:path');
-    const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
-    const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
-    const watcher = new McpWatcher({
-      rootPath: resolve(options.watch),
-      debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
-    });
-    await watcher.start();
-    const cleanup = () => watcher.stop().then(() => process.exit(0));
-    process.on('SIGINT',  cleanup);
-    process.on('SIGTERM', cleanup);
+    const watchDir = resolve(options.watch);
+    // Don't start a second watcher when a daemon is already watching this
+    // directory — that's exactly the invariant this PR establishes.
+    // Check discover-only (spawn:false): --watch is an explicit opt-in; if the
+    // user also started a daemon, they want delegation, not two watchers racing.
+    const existingDaemon = await ensureServeDaemon(watchDir, { spawn: false });
+    if (!existingDaemon) {
+      const { McpWatcher } = await import('../../core/services/mcp-watcher.js');
+      const debounceMs = parseInt(options.watchDebounce ?? '400', 10);
+      const watchConfig = await readOpenLoreConfig(watchDir);
+      const watcher = new McpWatcher({
+        rootPath: watchDir,
+        openspecPath: watchConfig?.openspecPath,
+        debounceMs: isNaN(debounceMs) ? 400 : debounceMs,
+        embed: !options.watchNoEmbed,
+        selfRebuild: true,
+      });
+      const watcherStart = watcher.start();
+      void watcherStart.catch(error => {
+        process.stderr.write(`[mcp-watcher] startup failed: ${(error as Error).message}\n`);
+      });
+      const unregisterRepairHost = registerRepairHost(watchDir, staleFiles =>
+        watcher.requestColdReadRepair(staleFiles),
+      );
+      // Route this watcher's teardown through the same one lifecycle path.
+      lifecycle.register(async () => {
+        unregisterRepairHost();
+        await watcherStart.catch(() => {});
+        await watcher.stop();
+      });
+    }
   }
 }
 
@@ -1489,8 +3219,15 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 // ============================================================================
 
 export const mcpCommand = new Command('mcp')
-  .description('Start spec-gen as an MCP server (stdio transport, for Cline/Claude Code)')
+  .description('Start openlore as an MCP server (stdio transport, for Cline/Claude Code)')
   .option('--watch <directory>', 'Watch a project directory and incrementally re-index signatures on file changes')
   .option('--watch-auto', 'Auto-detect the project directory from the first tool call and start watching', true)
+  .option('--no-watch-auto', 'Disable auto-watch (use for one-shot tool calls, e.g. the orient skill wrapper)')
+  .option('--daemon', 'Delegate tool calls to a shared `openlore serve` daemon, spawning one if needed (coherent state across agents — one warm process + one watcher per repo). Without it, MCP reuses a daemon only if one is already running, else runs in-process.')
   .option('--watch-debounce <ms>', 'Debounce delay in ms before re-indexing after a file change (default: 400)', '400')
+  .option('--watch-no-embed', 'Watch signatures only — skip live vector re-embedding (embeddings refresh at commit). Large repos auto-degrade to this.')
+  .option('--minimal', 'Expose only core 6 tools (orient, search_code, record_decision, detect_changes, check_spec_drift, get_health_map). Pair with alwaysLoad: true in Claude Code for always-visible core tools.')
+  .option('--preset <name>', `Expose a named tool preset. Default (no preset) is the "${LEAN_DEFAULT_PRESET}" surface — the graph-traversal core (orient, search_code, get_subgraph, trace_execution_path, analyze_impact, suggest_insertion_points, get_function_skeleton, get_landmarks, get_map, find_path), spec preparation (prepare_spec_generation + prepare_spec_repair), and governance reads (recall + verify_claim + blast_radius) — NOT the full registry. "navigation" = the lean navigate-only escape (the graph-traversal core alone, no governance or spec-workflow reads); "minimal" = orient+search+governance; "memory" = orient+remember+recall; "verify" = orient+search+verify_claim; "federation" = orient + federation_status + spec_store_status + working_set_context + change_impact_certificate + map_in_flight_conflicts + the four cross-repo conclusion tools; "coordination" = orient + plan_parallel_work + map_in_flight_conflicts + analyze_impact + find_path; "full" = all ${TOOL_DEFINITIONS.length} tools (the prior default). Takes precedence over --minimal.`)
+  .option('--all-tools', `Expose the full surface — all ${TOOL_DEFINITIONS.length} tools (alias for --preset full). Opt-in breadth; the "${LEAN_DEFAULT_PRESET}" default is recommended.`)
+  .option('--list-tools', 'Print the active tool surface grouped by capability family (navigate/change/remember/verify/coordinate/federate) and exit — does not start the server. Respects --preset / --all-tools.')
   .action((options: McpServerOptions) => startMcpServer(options));

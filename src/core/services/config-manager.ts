@@ -1,23 +1,33 @@
 /**
  * Configuration management service
  *
- * Handles reading/writing .spec-gen/config.json and openspec/config.yaml
+ * Handles reading/writing .openlore/config.json and openspec/config.yaml
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import YAML from 'yaml';
-import type { ProjectType, SpecGenConfig } from '../../types/index.js';
+import type { ProjectType, OpenLoreConfig } from '../../types/index.js';
 import { logger } from '../../utils/logger.js';
+import { colorForStderr } from '../../utils/colors.js';
+import { sanitizeForTerminal } from '../../utils/misc.js';
 import {
   DEFAULT_MAX_FILES,
   DEFAULT_ANTHROPIC_MODEL,
-  SPEC_GEN_DIR,
-  SPEC_GEN_CONFIG_FILENAME,
-  SPEC_GEN_CONFIG_REL_PATH,
+  OPENLORE_DIR,
+  OPENLORE_CONFIG_FILENAME,
+  OPENLORE_CONFIG_REL_PATH,
   OPENSPEC_CONFIG_FILENAME,
 } from '../../constants.js';
 import { fileExists } from '../../utils/command-helpers.js';
+import { safeJoin } from '../../utils/path-confinement.js';
+import {
+  validateOpenLoreConfig,
+  backfillRequiredConfigDefaults,
+  isFatalConfigFinding,
+  CONFIG_SCHEMA_VERSION,
+  type ConfigValidationFinding,
+} from './config-schema.js';
 
 /**
  * OpenSpec config.yaml structure
@@ -25,13 +35,62 @@ import { fileExists } from '../../utils/command-helpers.js';
 export interface OpenSpecConfig {
   schema?: string;
   context?: string;
-  'spec-gen'?: {
+  'openlore'?: {
     generatedAt?: string;
     domains?: string[];
     confidence?: number;
     sourceProject?: string;
   };
   [key: string]: unknown;
+}
+
+/**
+ * Process-scoped override for the primary root's config-file location, set by the
+ * CLI when the user passes an explicit global `--config <path>` (change:
+ * wire-global-config-path). It is keyed to the resolved primary root so it
+ * redirects ONLY that root's config file — a federation / spec-store read of a
+ * different repository never matches and always resolves to the peer's own
+ * `.openlore/config.json`. With no explicit `--config`, this stays null and every
+ * path resolves exactly as the default.
+ */
+let primaryConfigOverride: { root: string; configPath: string } | null = null;
+
+/**
+ * Register the explicit config-file path for a primary root. Both arguments are
+ * resolved to absolute paths so a later `resolveOpenLoreConfigPath` comparison is
+ * stable regardless of how a caller spells the root (`.`, cwd, absolute).
+ */
+export function setPrimaryConfigPath(rootPath: string, configPath: string): void {
+  primaryConfigOverride = { root: resolve(rootPath), configPath: resolve(configPath) };
+}
+
+/** Clear the primary-config override (test hook; also for a host reusing the process). */
+export function clearPrimaryConfigPath(): void {
+  primaryConfigOverride = null;
+}
+
+/** Retarget an explicit CLI config to the command's effective primary project root. */
+export function retargetPrimaryConfigRoot(rootPath: string): () => void {
+  if (!primaryConfigOverride) return () => {};
+  const prior = { ...primaryConfigOverride };
+  primaryConfigOverride.root = resolve(rootPath);
+  return () => { primaryConfigOverride = prior; };
+}
+
+/**
+ * The single source of truth for "where is this root's config file". Returns the
+ * registered override ONLY when its root matches the resolved `rootPath`; otherwise
+ * the default `<rootPath>/.openlore/config.json`. Every config read/write/exists
+ * check — and the two direct readers outside this module — routes through here so
+ * an explicit `--config` is honored uniformly.
+ */
+export function resolveOpenLoreConfigPath(rootPath: string, configPath?: string): string {
+  const absRoot = resolve(rootPath);
+  if (configPath) return resolve(absRoot, configPath);
+  if (primaryConfigOverride && resolve(rootPath) === primaryConfigOverride.root) {
+    return primaryConfigOverride.configPath;
+  }
+  return safeJoin(absRoot, join(OPENLORE_DIR, OPENLORE_CONFIG_FILENAME));
 }
 
 /**
@@ -49,11 +108,11 @@ async function ensureDir(dirPath: string): Promise<void> {
 }
 
 /**
- * Get default spec-gen configuration
+ * Get default openlore configuration
  */
-export function getDefaultConfig(projectType: ProjectType, openspecPath: string): SpecGenConfig {
+export function getDefaultConfig(projectType: ProjectType, openspecPath: string): OpenLoreConfig {
   return {
-    version: '1.0.0',
+    version: CONFIG_SCHEMA_VERSION,
     projectType,
     openspecPath,
     analysis: {
@@ -65,50 +124,173 @@ export function getDefaultConfig(projectType: ProjectType, openspecPath: string)
       model: DEFAULT_ANTHROPIC_MODEL,
       domains: 'auto',
     },
+    panicResponse: { mode: 'off' },
     createdAt: new Date().toISOString(),
     lastRun: null,
   };
 }
 
+/** Apply non-destructive compatibility defaults before schema validation. */
+export function normalizeOpenLoreConfig(parsed: unknown): {
+  config: unknown;
+  findings: ConfigValidationFinding[];
+} {
+  const record = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : {};
+  const projectType = typeof record.projectType === 'string'
+    ? record.projectType as ProjectType
+    : 'unknown';
+  const openspecPath = typeof record.openspecPath === 'string'
+    ? record.openspecPath
+    : './openspec';
+  return backfillRequiredConfigDefaults(parsed, getDefaultConfig(projectType, openspecPath));
+}
+
 /**
- * Read spec-gen configuration from .spec-gen/config.json
+ * Per-process memory of config-validation warnings already emitted, so a hub caller
+ * (`readOpenLoreConfig` has ~45 call sites) emits each finding at most once per process
+ * instead of once per read (change: add-config-schema-validation).
  */
-export async function readSpecGenConfig(rootPath: string): Promise<SpecGenConfig | null> {
-  const configPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_CONFIG_FILENAME);
+const emittedConfigWarnings = new Set<string>();
+
+/** An existing config file parsed as JSON but is unsafe to expose as `OpenLoreConfig`. */
+export class InvalidOpenLoreConfigError extends Error {
+  constructor(
+    public readonly configPath: string,
+    public readonly findings: readonly ConfigValidationFinding[],
+  ) {
+    const keys = findings.map(finding => finding.key ?? finding.kind).join(', ');
+    super(`Invalid ${configPath}: correct ${keys} or re-run 'openlore init' to recreate the configuration.`);
+    this.name = 'InvalidOpenLoreConfigError';
+  }
+}
+
+/** Test hook: clear the per-process config-validation warning dedup memory. */
+export function resetConfigValidationWarnings(): void {
+  emittedConfigWarnings.clear();
+}
+
+/**
+ * Emit schema findings once per process. Unknown keys and version skew are advisory;
+ * required-field and declared-type failures are emitted here and rejected by the read
+ * boundary before the parsed object is returned.
+ *
+ * Emitted to STDERR (honoring the logger's quiet/noColor state), not stdout: this is a
+ * ~45-caller hub read by machine-output paths — `--json` commands, `orient`, and the MCP
+ * JSON-RPC stream — where a warning on stdout would corrupt the output. Humans still see
+ * the diagnostic in their terminal; `openlore doctor` additionally surfaces it as a
+ * structured `Config schema` finding.
+ */
+function emitConfigValidationWarnings(
+  configPath: string,
+  findings: readonly ConfigValidationFinding[],
+): void {
+  if (findings.length === 0) return;
+  const { quiet } = logger.getOptions();
+  if (quiet) return; // errors-only mode — match logger.warning's suppression
+  // Through the shared color layer, which keys off STDERR's own TTY state. A
+  // hand-rolled escape honoured `--no-color` but not redirection, so this was the one
+  // line that wrote raw ANSI into a piped/captured stderr while every other output
+  // path stripped it.
+  const prefix = `${colorForStderr().yellow('[warn]')}`;
+  for (const finding of findings) {
+    const signature = `${configPath} ${finding.kind} ${finding.key ?? ''}`;
+    if (emittedConfigWarnings.has(signature)) continue;
+    emittedConfigWarnings.add(signature);
+    // `finding.message` quotes the offending config text back — an unknown KEY NAME or a
+    // version string read straight out of .openlore/config.json, which is repository
+    // content and therefore untrusted. Unsanitized, a key named with a `\x1b[2K\r`
+    // prefix erases whatever this hub already printed. `openlore doctor` wraps the same
+    // findings in safe(); this was the sibling sink that did not. Only the message is
+    // sanitized: `prefix` is OpenLore's own colour, whose ESC must survive.
+    process.stderr.write(`${prefix} ${OPENLORE_CONFIG_REL_PATH}: ${sanitizeForTerminal(finding.message, { keepNewlines: true })}\n`);
+  }
+}
+
+/**
+ * Read openlore configuration from .openlore/config.json
+ */
+export async function readOpenLoreConfig(rootPath: string, explicitConfigPath?: string): Promise<OpenLoreConfig | null> {
+  const configPath = resolveOpenLoreConfigPath(rootPath, explicitConfigPath);
   let content: string;
   try {
     content = await readFile(configPath, 'utf-8');
   } catch {
     return null; // File doesn't exist — normal case before init
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(content) as SpecGenConfig;
+    parsed = JSON.parse(content) as unknown;
   } catch (err) {
     logger.warning(`Failed to parse ${configPath}: ${(err as Error).message}`);
-    logger.warning(`Delete ${SPEC_GEN_CONFIG_REL_PATH} and run 'spec-gen init' to recreate it.`);
+    logger.warning(`Delete ${configPath} and run 'openlore init' to recreate it.`);
     return null;
   }
+  const normalized = normalizeOpenLoreConfig(parsed);
+  const validationFindings = validateOpenLoreConfig(normalized.config);
+  emitConfigValidationWarnings(configPath, [...normalized.findings, ...validationFindings]);
+  const fatalFindings = validationFindings.filter(isFatalConfigFinding);
+  if (fatalFindings.length > 0) {
+    throw new InvalidOpenLoreConfigError(configPath, fatalFindings);
+  }
+  return normalized.config as OpenLoreConfig;
 }
 
 /**
- * Write spec-gen configuration to .spec-gen/config.json
+ * Strict config boundary for enforcement surfaces. Unlike the compatibility reader,
+ * only an absent file is represented by null; unreadable, malformed, and schema-fatal
+ * files throw so a configured gate cannot silently degrade to the no-policy default.
  */
-export async function writeSpecGenConfig(
+export async function readOpenLoreConfigStrict(
   rootPath: string,
-  config: SpecGenConfig
-): Promise<void> {
-  const configDir = join(rootPath, SPEC_GEN_DIR);
-  const configPath = join(configDir, SPEC_GEN_CONFIG_FILENAME);
+  explicitConfigPath?: string,
+): Promise<OpenLoreConfig | null> {
+  const configPath = resolveOpenLoreConfigPath(rootPath, explicitConfigPath);
+  let content: string;
+  try {
+    content = await readFile(configPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`Unable to read ${configPath}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content) as unknown;
+  } catch (error) {
+    throw new Error(`Invalid JSON in ${configPath}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  const normalized = normalizeOpenLoreConfig(parsed);
+  const validationFindings = validateOpenLoreConfig(normalized.config);
+  emitConfigValidationWarnings(configPath, [...normalized.findings, ...validationFindings]);
+  const fatalFindings = validationFindings.filter((finding) =>
+    isFatalConfigFinding(finding) ||
+    finding.key === 'enforcement.policy' ||
+    finding.key?.startsWith('enforcement.policy.') === true,
+  );
+  if (fatalFindings.length > 0) throw new InvalidOpenLoreConfigError(configPath, fatalFindings);
+  return normalized.config as OpenLoreConfig;
+}
 
-  await ensureDir(configDir);
+/**
+ * Write openlore configuration to .openlore/config.json
+ */
+export async function writeOpenLoreConfig(
+  rootPath: string,
+  config: OpenLoreConfig,
+  explicitConfigPath?: string,
+): Promise<void> {
+  const configPath = resolveOpenLoreConfigPath(rootPath, explicitConfigPath);
+
+  await ensureDir(dirname(configPath));
   await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
 }
 
 /**
- * Check if spec-gen config already exists
+ * Check if openlore config already exists
  */
-export async function specGenConfigExists(rootPath: string): Promise<boolean> {
-  return fileExists(join(rootPath, SPEC_GEN_DIR, SPEC_GEN_CONFIG_FILENAME));
+export async function openloreConfigExists(rootPath: string, configPath?: string): Promise<boolean> {
+  return fileExists(resolveOpenLoreConfigPath(rootPath, configPath));
 }
 
 /**
@@ -165,19 +347,60 @@ export async function createOpenSpecStructure(openspecPath: string): Promise<voi
   await ensureDir(join(openspecPath, 'specs'));
 }
 
+/** A spec directory discovered on disk before `init` decides where to point. */
+export interface DetectedSpecDir {
+  /** openspec-root, relative to the project root (config `openspecPath`). */
+  root: string;
+  /** The `<root>/specs` directory, relative to the project root. */
+  specsRel: string;
+  /** Count of `*.md` files found beneath the specs dir. */
+  count: number;
+}
+
 /**
- * Merge existing OpenSpec config with spec-gen metadata
+ * Detect an existing specs directory so `init` does not create an empty
+ * `openspec/` blind to specs that already live in `docs/specs/` or `specs/`
+ * (Spec 26 B5). Candidate openspec-roots are scanned in priority order; the
+ * first whose `<root>/specs` contains at least one `*.md` wins. Returns null
+ * when nothing is found.
+ */
+export async function detectExistingSpecDir(rootPath: string): Promise<DetectedSpecDir | null> {
+  // root (relative) → specs live at `<root>/specs`. '.' covers a bare `specs/`.
+  const candidateRoots = ['openspec', 'docs', '.'];
+  for (const root of candidateRoots) {
+    const specsRel = root === '.' ? 'specs' : `${root}/specs`;
+    const specsDir = join(rootPath, specsRel);
+    let count = 0;
+    try {
+      const stack = [specsDir];
+      while (stack.length) {
+        const dir = stack.pop()!;
+        for (const d of await readdir(dir, { withFileTypes: true })) {
+          if (d.isDirectory()) stack.push(join(dir, d.name));
+          else if (d.name.endsWith('.md')) count++;
+        }
+      }
+    } catch {
+      continue; // specs dir doesn't exist — try the next candidate
+    }
+    if (count > 0) return { root, specsRel, count };
+  }
+  return null;
+}
+
+/**
+ * Merge existing OpenSpec config with openlore metadata
  */
 export function mergeOpenSpecConfig(
   existing: OpenSpecConfig | null,
-  specGenMeta: OpenSpecConfig['spec-gen']
+  openloreMeta: OpenSpecConfig['openlore']
 ): OpenSpecConfig {
   if (existing) {
     return {
       ...existing,
-      'spec-gen': {
-        ...existing['spec-gen'],
-        ...specGenMeta,
+      'openlore': {
+        ...existing['openlore'],
+        ...openloreMeta,
       },
     };
   }
@@ -185,6 +408,6 @@ export function mergeOpenSpecConfig(
   return {
     schema: 'spec-driven',
     context: '',
-    'spec-gen': specGenMeta,
+    'openlore': openloreMeta,
   };
 }

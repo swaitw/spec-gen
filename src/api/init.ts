@@ -1,55 +1,56 @@
 /**
- * spec-gen init — programmatic API
+ * openlore init — programmatic API
  *
- * Detects project type and creates spec-gen configuration.
- * No side effects (no process.exit, no console.log).
+ * Detects project type and creates openlore configuration.
+ * Performs the documented filesystem initialization without process control or console output.
  */
 
-import { resolve, relative } from 'node:path';
-import { SPEC_GEN_DIR, SPEC_GEN_CONFIG_REL_PATH, DEFAULT_OPENSPEC_PATH } from '../constants.js';
+import { resolve } from 'node:path';
+import { OPENLORE_DIR, OPENLORE_CONFIG_REL_PATH, DEFAULT_OPENSPEC_PATH } from '../constants.js';
 import {
   detectProjectType,
   getProjectTypeName,
 } from '../core/services/project-detector.js';
 import {
   getDefaultConfig,
-  writeSpecGenConfig,
-  specGenConfigExists,
+  readOpenLoreConfig,
+  writeOpenLoreConfig,
+  openloreConfigExists,
   openspecDirExists,
   createOpenSpecStructure,
+  detectExistingSpecDir,
 } from '../core/services/config-manager.js';
-import {
-  gitignoreExists,
-  isInGitignore,
-  addToGitignore,
-} from '../core/services/gitignore-manager.js';
+import { ensureGitignored } from '../core/services/gitignore-manager.js';
 import type { InitApiOptions, InitResult, ProgressCallback } from './types.js';
+import { safeJoin } from '../utils/path-confinement.js';
+import { withLoggerOptions } from '../utils/logger.js';
+import { errors, isOpenLoreError } from '../utils/errors.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'init', step, status, detail });
 }
 
 /**
- * Initialize spec-gen in a project directory.
+ * Initialize openlore in a project directory.
  *
- * Creates `.spec-gen/config.json`, the `openspec/` directory structure,
+ * Creates `.openlore/config.json`, the `openspec/` directory structure,
  * and updates `.gitignore`.
  *
- * @throws Error if openspec path is outside project root
- * @throws Error if config exists and force is false
+ * @throws OpenLoreError if initialization fails; an existing config returns `created: false`
  */
-export async function specGenInit(options: InitApiOptions = {}): Promise<InitResult> {
-  const rootPath = options.rootPath ?? process.cwd();
-  const openspecRelPath = options.openspecPath ?? DEFAULT_OPENSPEC_PATH;
-  const openspecFullPath = resolve(rootPath, openspecRelPath);
+async function init(options: InitApiOptions): Promise<InitResult> {
+  const rootPath = resolve(options.rootPath ?? process.cwd());
+  const configPath = options.configPath ?? OPENLORE_CONFIG_REL_PATH;
+  let openspecRelPath = options.openspecPath ?? DEFAULT_OPENSPEC_PATH;
+  // Point at existing specs (docs/specs/, specs/) rather than creating an empty
+  // openspec/ blind to them, unless an explicit path was given (Spec 26 B5).
+  if (!options.openspecPath) {
+    const detected = await detectExistingSpecDir(rootPath);
+    if (detected && detected.root !== 'openspec') openspecRelPath = detected.root;
+  }
+  const openspecFullPath = safeJoin(rootPath, openspecRelPath);
   const force = options.force ?? false;
   const { onProgress } = options;
-
-  // Validate path traversal
-  const relPath = relative(rootPath, openspecFullPath);
-  if (relPath.startsWith('..')) {
-    throw new Error('OpenSpec path must be within the project directory.');
-  }
 
   // Detect project type
   progress(onProgress, 'Detecting project type', 'start');
@@ -58,12 +59,13 @@ export async function specGenInit(options: InitApiOptions = {}): Promise<InitRes
   progress(onProgress, 'Detecting project type', 'complete', projectType);
 
   // Check existing config
-  const configExists = await specGenConfigExists(rootPath);
+  const configExists = await openloreConfigExists(rootPath, options.configPath);
   if (configExists && !force) {
+    const existingConfig = await readOpenLoreConfig(rootPath, options.configPath);
     progress(onProgress, 'Configuration exists', 'skip');
     return {
-      configPath: SPEC_GEN_CONFIG_REL_PATH,
-      openspecPath: openspecRelPath,
+      configPath,
+      openspecPath: existingConfig?.openspecPath ?? openspecRelPath,
       projectType,
       created: false,
     };
@@ -72,7 +74,7 @@ export async function specGenInit(options: InitApiOptions = {}): Promise<InitRes
   // Create config
   progress(onProgress, 'Creating configuration', 'start');
   const config = getDefaultConfig(detection.projectType, openspecRelPath);
-  await writeSpecGenConfig(rootPath, config);
+  await writeOpenLoreConfig(rootPath, config, options.configPath);
   progress(onProgress, 'Creating configuration', 'complete');
 
   // Create openspec directory
@@ -85,21 +87,27 @@ export async function specGenInit(options: InitApiOptions = {}): Promise<InitRes
     progress(onProgress, 'OpenSpec directory exists', 'skip');
   }
 
-  // Update .gitignore
-  const hasGitignore = await gitignoreExists(rootPath);
-  if (hasGitignore) {
-    const alreadyIgnored = await isInGitignore(rootPath, `${SPEC_GEN_DIR}/`);
-    if (!alreadyIgnored) {
-      progress(onProgress, 'Updating .gitignore', 'start');
-      await addToGitignore(rootPath, `${SPEC_GEN_DIR}/`, 'spec-gen analysis artifacts');
-      progress(onProgress, 'Updating .gitignore', 'complete');
-    }
-  }
+  // Ensure .openlore/ analysis artifacts (multi-MB lance binaries) are ignored,
+  // creating .gitignore when absent so a fresh `git init` repo doesn't leak them.
+  progress(onProgress, 'Updating .gitignore', 'start');
+  const gitignoreResult = await ensureGitignored(rootPath, `${OPENLORE_DIR}/`, 'openlore analysis artifacts');
+  progress(onProgress, 'Updating .gitignore', gitignoreResult === 'present' ? 'skip' : 'complete');
 
   return {
-    configPath: SPEC_GEN_CONFIG_REL_PATH,
+    configPath,
     openspecPath: openspecRelPath,
     projectType,
     created: true,
   };
+}
+
+export function openloreInit(options: InitApiOptions = {}): Promise<InitResult> {
+  return withLoggerOptions({ quiet: options.quiet ?? true }, async () => {
+    try {
+      return await init(options);
+    } catch (error) {
+      if (isOpenLoreError(error)) throw error;
+      throw errors.pipelineFailed(`Initialization failed: ${(error as Error).message}`, error);
+    }
+  });
 }

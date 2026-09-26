@@ -1,21 +1,34 @@
 ## Interactive Graph Viewer
 
-`spec-gen view` launches a local React app that visualises your codebase analysis and lets you explore spec requirements side-by-side with the dependency graph.
+`openlore view` launches a local React app that visualises your codebase analysis and lets you explore spec requirements side-by-side with the dependency graph.
 
 ```bash
 # Run analysis first (if not already done)
-spec-gen analyze
+openlore analyze
 
 # Launch the viewer (opens browser automatically)
-spec-gen view
+openlore view
 
 # Options
-spec-gen view --port 4000          # custom port (default: 5173)
-spec-gen view --host 0.0.0.0       # expose on LAN
-spec-gen view --no-open            # don't open browser automatically
-spec-gen view --analysis <path>    # custom analysis dir (default: .spec-gen/analysis/)
-spec-gen view --spec <path>        # custom spec dir (default: ./openspec/specs/)
+openlore view --port 4000          # custom port (default: 5173)
+openlore view --host 127.0.0.1     # bind host (default loopback)
+openlore view --no-open            # don't open browser automatically
+openlore view --analysis <path>    # custom analysis dir (default: .openlore/analysis/)
+openlore view --spec <path>        # custom spec dir (default: ./openspec/specs/)
 ```
+
+### The entry link
+
+The viewer prints a URL containing a `?token=`. Opening it exchanges that token for a
+session cookie and redirects to the clean URL, so the token does not stay in your address
+bar or history. `--no-open` prints the link instead of launching a browser — paste it into
+whichever browser you want. The link stays usable while the viewer is running (so you can
+open a second browser); restarting issues a fresh one and invalidates the old.
+
+**Treat the link as a password.** Every route, including the page itself, requires it: the
+viewer exposes a chat endpoint that spends your LLM API key and can read the analyzed repo,
+so anyone who can reach the port *and* has the link can use both. Without the link they get
+a 401. If you lose it, stop and re-run `openlore view` for a fresh one.
 
 ### Views
 
@@ -41,7 +54,7 @@ Example queries:
 - "Where would I add a new API endpoint?"
 - "Show me the impact of changing the authentication service"
 
-The chat requires an LLM API key (same provider configuration as `spec-gen generate`). Viewer-only operations like graph browsing, skeleton view, and search do not require an API key.
+The chat requires an LLM API key (same provider configuration as `openlore generate`). Viewer-only operations like graph browsing, skeleton view, and search do not require an API key.
 
 ### Right panel tabs (select a node to activate)
 
@@ -64,24 +77,36 @@ The viewer auto-loads all available data on startup:
 
 | Endpoint | Source | Required? |
 |----------|--------|-----------|
-| `/api/dependency-graph` | `.spec-gen/analysis/dependency-graph.json` | Yes |
-| `/api/llm-context` | `.spec-gen/analysis/llm-context.json` | No |
-| `/api/refactor-priorities` | `.spec-gen/analysis/refactor-priorities.json` | No |
-| `/api/mapping` | `.spec-gen/analysis/mapping.json` | No |
+| `/api/dependency-graph` | `.openlore/analysis/dependency-graph.json` | Yes |
+| `/api/llm-context` | `.openlore/analysis/llm-context.json` | No |
+| `/api/refactor-priorities` | `.openlore/analysis/refactor-priorities.json` | No |
+| `/api/mapping` | `.openlore/analysis/mapping.json` | No |
 | `/api/spec-requirements` | `openspec/specs/**/*.md` + `mapping.json` | No |
 | `/api/skeleton?file=` | Source file on disk | No |
-| `/api/search?q=` | `.spec-gen/analysis/vector-index/` | No (`--embed`) |
+| `/api/search?q=` | `.openlore/analysis/vector-index/` | No (`--embed`) |
 
-Run `spec-gen generate` to produce `mapping.json` and the spec files. Once present, the **Spec** tab shows the full requirement body for each selected file.
+Run `openlore generate` to produce `mapping.json` and the spec files. Once present, the **Spec** tab shows the full requirement body for each selected file.
+
+### Freshness and file safety
+
+Every analysis-artifact response includes its generated time and freshness status. When
+recorded and assessable, it also includes the analyzed and current commit. If tracked or
+untracked source files changed after analysis, the viewer
+shows a dismissible **STALE ANALYSIS** banner; run `openlore analyze` before relying on the
+graph. When freshness cannot be assessed, the API reports `unassessable` instead of
+claiming the graph is current.
+
+Viewer file reads use the same symlink-aware project-root confinement as MCP tools.
+Spec traversal skips symlinks and stops at 2 MB of Markdown; `/api/spec` reports whether
+that ceiling truncated its response.
 
 ### View Options
 
 ```bash
-spec-gen view [options]
-  --analysis <path>    Analysis directory (default: .spec-gen/analysis/)
+openlore view [options]
+  --analysis <path>    Analysis directory (default: .openlore/analysis/)
   --spec <path>        Spec files directory (default: ./openspec/specs/)
   --port <n>           Port (default: 5173)
-  --host <host>        Bind host (default: 127.0.0.1; use 0.0.0.0 for LAN)
+  --host <host>        Bind host (default: 127.0.0.1)
   --no-open            Skip automatic browser open
 ```
-

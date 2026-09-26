@@ -1,37 +1,51 @@
 /**
- * spec-gen drift command
+ * openlore drift command
  *
  * Detects spec drift: finds code changes not reflected in specs.
  * Can be used standalone or as a pre-commit hook.
  */
 
 import { Command } from 'commander';
-import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
-import { join } from 'node:path';
+import { sanitizeForTerminal as safe } from '../../utils/misc.js';
+import { basename, join } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { resolveTrustedApiBase, resolveTrustedSslVerify } from '../../core/services/repo-config-trust.js';
+import { redirectConsoleToStderr } from '../../utils/quiet-stdout.js';
 import { fileExists, formatDuration, parseList, resolveLLMProvider } from '../../utils/command-helpers.js';
 import {
   DEFAULT_DRIFT_MAX_FILES,
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
-  SPEC_GEN_LOGS_SUBDIR,
-  SPEC_GEN_CONFIG_REL_PATH,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
+  OPENLORE_LOGS_SUBDIR,
+  OPENLORE_CONFIG_REL_PATH,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
   ARTIFACT_REPO_STRUCTURE,
 } from '../../constants.js';
 import type { DriftOptions, DriftIssue, DriftResult, DriftSeverity } from '../../types/index.js';
-import { readSpecGenConfig } from '../../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import {
   getChangedFiles,
-  isGitRepository,
+  resolveBaseRefDisclosed,
+  isGitRepositoryRoot,
   buildSpecMap,
   buildADRMap,
   detectDrift,
 } from '../../core/drift/index.js';
 import { suggestTestsForDrift } from '../../core/drift/test-suggester.js';
 import { createLLMService } from '../../core/services/llm-service.js';
+import { isLlmLoggingEnabled } from '../../core/services/llm-logging-policy.js';
 import type { LLMService } from '../../core/services/llm-service.js';
+import { resolveOpenspecDir } from '../../utils/openspec-dir.js';
+import {
+  displayHookPath,
+  hookManagerWarning,
+  isResolvedGitRepository,
+  resolveGitHookTarget,
+  resolveTrustedHookLauncher,
+  shellQuote,
+  updateHookFile,
+} from '../git-hooks.js';
 
 // ============================================================================
 // TYPES
@@ -59,7 +73,7 @@ function severityIcon(severity: DriftSeverity): string {
   }
 }
 
-function kindLabel(kind: string): string {
+export function kindLabel(kind: string): string {
   switch (kind) {
     case 'gap': return 'gap';
     case 'stale': return 'stale';
@@ -67,6 +81,8 @@ function kindLabel(kind: string): string {
     case 'orphaned-spec': return 'orphaned';
     case 'adr-gap': return 'adr-gap';
     case 'adr-orphaned': return 'adr-orphaned';
+    case 'memory-drifted': return 'memory-drifted';
+    case 'memory-orphaned': return 'memory-orphaned';
     default: return kind;
   }
 }
@@ -76,24 +92,26 @@ function displayIssue(issue: DriftIssue, verbose: boolean): void {
   const sev = severityLabel(issue.severity);
 
   console.log('');
-  console.log(`   ${icon} [${sev}] ${kindLabel(issue.kind)}: ${issue.filePath}`);
+  console.log(`   ${icon} [${sev}] ${kindLabel(issue.kind)}: ${safe(issue.filePath)}`);
 
   if (issue.domain) {
-    console.log(`      Spec: ${issue.specPath ?? issue.domain}`);
+    console.log(`      Spec: ${safe(issue.specPath ?? issue.domain)}`);
   }
 
   if (verbose || issue.severity === 'error') {
-    console.log(`      ${issue.message}`);
+    // message/suggestion are assembled from the same spec and file paths that the
+    // filePath/specPath lines above wrap in safe() — same untrusted text, one layer in.
+    console.log(`      ${safe(issue.message)}`);
   }
 
   if (issue.changedLines) {
     console.log(`      +${issue.changedLines.added}/-${issue.changedLines.removed} lines`);
   }
 
-  console.log(`      -> ${issue.suggestion}`);
+  console.log(`      -> ${safe(issue.suggestion)}`);
 }
 
-function displaySummary(result: DriftResult): void {
+export function displaySummary(result: DriftResult): void {
   console.log('');
   console.log('   ──────────────────────────────────────');
   console.log('');
@@ -106,6 +124,17 @@ function displaySummary(result: DriftResult): void {
   if (result.summary.orphanedSpecs > 0) parts.push(`Orphaned: ${result.summary.orphanedSpecs}`);
   if (result.summary.adrGaps > 0) parts.push(`ADR gaps: ${result.summary.adrGaps}`);
   if (result.summary.adrOrphaned > 0) parts.push(`ADR orphaned: ${result.summary.adrOrphaned}`);
+  if (result.summary.memoryDrifted > 0) parts.push(`Memory drifted: ${result.summary.memoryDrifted}`);
+  if (result.summary.memoryOrphaned > 0) parts.push(`Memory orphaned: ${result.summary.memoryOrphaned}`);
+  // Counted, never listed: these anchors drifted outside the code under review.
+  // Naming the switch keeps the omission auditable rather than silent
+  // (change: scope-advisory-noise-to-touched-code).
+  if (result.summary.memoryOutOfScope > 0) {
+    parts.push(
+      `Memory drifted outside this change: ${result.summary.memoryOutOfScope} ` +
+      `(not listed; --memory-scope repository to enumerate)`
+    );
+  }
 
   if (parts.length === 0) {
     console.log('     No issues found');
@@ -122,118 +151,309 @@ function displaySummary(result: DriftResult): void {
 // HOOK MANAGEMENT
 // ============================================================================
 
-const HOOK_MARKER = '# spec-gen-drift-hook';
-const HOOK_CONTENT = `
+const HOOK_MARKER = '# openlore-drift-hook';
+type HookBlockLocation = { start: number; end: number };
+
+function findDriftHookBlock(content: string): HookBlockLocation | { error: string } | null {
+  const starts = [...content.matchAll(/^# openlore-drift-hook\r?$/gm)];
+  const ends = [...content.matchAll(/^# end-openlore-drift-hook\r?$/gm)];
+  if (starts.length === 0 && ends.length === 0) return null;
+  if (starts.length !== 1 || ends.length !== 1 || starts[0].index === undefined || ends[0].index === undefined) {
+    return { error: 'the existing OpenLore drift block has malformed or duplicate markers' };
+  }
+  const start = starts[0].index;
+  const endStart = ends[0].index;
+  if (endStart <= start) return { error: 'the existing OpenLore drift block markers are out of order' };
+  return { start, end: endStart + ends[0][0].length };
+}
+
+function terminalHookCommand(content: string): 'exit' | 'exec' | null {
+  const executableLines = content.split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith('#'));
+  const last = executableLines.at(-1) ?? '';
+  if (/^exit(?:\s+[^#\s]+)?(?:\s+#.*)?$/.test(last)) return 'exit';
+  if (/^exec(?:\s|$)/.test(last)) return 'exec';
+  return null;
+}
+
+const SHELL_INTERPRETERS = new Set(['sh', 'ash', 'bash', 'dash', 'ksh', 'yash', 'zsh']);
+
+function usesShellInterpreter(shebang: string): boolean {
+  if (!shebang.startsWith('#!')) return true;
+  const parts = shebang.slice(2).trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return false;
+  let interpreter = basename(parts[0]);
+  if (interpreter === 'env') {
+    let index = 1;
+    while (parts[index]?.startsWith('-')) index++;
+    interpreter = basename(parts[index] ?? '');
+  }
+  return SHELL_INTERPRETERS.has(interpreter);
+}
+
+const renderHookContent = (nodePath: string, cliPath: string) => `
 ${HOOK_MARKER}
+OPENLORE_DRIFT_PREVIOUS_EXIT=$?
 # Automatically check for spec drift before committing
-# Installed by: spec-gen drift --install-hook
+# Installed by: openlore drift --install-hook
 
-# Run spec-gen drift in static mode (fast, no LLM)
-# Use --json for machine-parseable output, suppress only npx banner noise
-DRIFT_OUTPUT=$(npx --yes spec-gen drift --fail-on warning --json 2>/dev/null)
-DRIFT_EXIT=$?
+# Bound both runtime and captured output. A broken/skewed launcher is an
+# infrastructure failure, never evidence of drift and never an unbounded commit hang.
+if OPENLORE_DRIFT_OUTPUT=$(${shellQuote(nodePath)} -e '
+const { spawn, spawnSync } = require("node:child_process");
+const requestedCommand = process.argv[1];
+const command = process.execPath;
+const args = [requestedCommand, "drift", "--fail-on", "warning", "--json"];
+const cap = 1024 * 1024;
+const stdoutChunks = [];
+const stderrChunks = [];
+let stdoutBytes = 0;
+let stderrBytes = 0;
+let forcedReason = "";
+let launchError = null;
+const child = spawn(command, args, {
+  detached: process.platform !== "win32",
+  stdio: ["ignore", "pipe", "pipe"],
+  windowsHide: true,
+});
+const killTree = signal => {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+  } else {
+    try { process.kill(-child.pid, signal); } catch { /* process already exited */ }
+  }
+};
+let killTimer;
+const stop = reason => {
+  if (forcedReason) return;
+  forcedReason = reason;
+  killTree("SIGTERM");
+  killTimer = setTimeout(() => killTree("SIGKILL"), 1000);
+};
+const timeout = setTimeout(() => stop("timed out after 60 seconds"), 60000);
+child.stdout.on("data", chunk => {
+  const remaining = Math.max(0, cap - stdoutBytes);
+  if (remaining > 0) stdoutChunks.push(chunk.subarray(0, remaining));
+  stdoutBytes += chunk.length;
+  if (stdoutBytes > cap) stop("exceeded the 1 MiB stdout limit");
+});
+child.stderr.on("data", chunk => {
+  const remaining = Math.max(0, cap - stderrBytes);
+  if (remaining > 0) stderrChunks.push(chunk.subarray(0, remaining));
+  stderrBytes += chunk.length;
+  if (stderrBytes > cap) stop("exceeded the 1 MiB stderr limit");
+});
+child.on("error", error => { launchError = error; });
+child.on("close", code => {
+  clearTimeout(timeout);
+  // On POSIX, keep the group SIGKILL escalation alive after the leader closes:
+  // a descendant may have ignored SIGTERM and detached its stdio. Windows taskkill
+  // already applies /t /f to the full tree on the first termination request.
+  if (killTimer && (process.platform === "win32" || !forcedReason)) clearTimeout(killTimer);
+  const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+  const stderr = Buffer.concat(stderrChunks).toString("utf8");
+  if (stderr) {
+    const safeStderr = stderr.split(/\\r?\\n/).slice(0, 50).map(line => Array.from(line)
+      .map(ch => { const code = ch.charCodeAt(0); return code < 32 || (code >= 127 && code <= 159) ? " " : ch; })
+      .join("").replace(/ +/g, " ").slice(0, 500)).join("\\n");
+    process.stderr.write(safeStderr + (safeStderr ? "\\n" : ""));
+  }
+  if (stdout) process.stdout.write(stdout);
+  if (forcedReason) console.error("openlore: drift launcher " + forcedReason);
+  if (launchError) console.error("openlore: drift launcher failed: " + launchError.message);
+  process.exitCode = forcedReason || launchError ? 2 : (Number.isInteger(code) ? code : 2);
+});
+' ${shellQuote(cliPath)}); then
+  OPENLORE_DRIFT_EXIT=0
+else
+  OPENLORE_DRIFT_EXIT=$?
+fi
 
-if [ $DRIFT_EXIT -ne 0 ]; then
+if OPENLORE_DRIFT_VERDICT=$(printf '%s\n' "$OPENLORE_DRIFT_OUTPUT" | ${shellQuote(nodePath)} -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const d = JSON.parse(input);
+    if (d && d.hasDrift === true) process.stdout.write("drift");
+    else if (d && d.hasDrift === false) {
+      const counts = [d.totalChangedFiles, d.analyzedFiles, d.filesOmitted, d.specRelevantFiles];
+      const valid = counts.every(n => Number.isSafeInteger(n) && n >= 0) &&
+        d.totalChangedFiles === d.analyzedFiles + d.filesOmitted &&
+        d.specRelevantFiles <= d.analyzedFiles;
+      process.stdout.write(valid ? (d.filesOmitted > 0 ? "incomplete:" + d.filesOmitted : "clean") : "invalid");
+    } else process.stdout.write("invalid");
+  } catch { process.stdout.write("invalid"); }
+});
+'); then
+  :
+else
+  OPENLORE_DRIFT_VERDICT=invalid
+fi
+
+if [ "$OPENLORE_DRIFT_EXIT" -eq 1 ] && [ "$OPENLORE_DRIFT_VERDICT" = "drift" ]; then
   echo ""
-  echo "spec-gen: Spec drift detected! Commit blocked."
+  echo "openlore: Spec drift detected! Commit blocked."
   echo ""
-  # Show concise summary from JSON output
-  if command -v python3 > /dev/null 2>&1; then
-    echo "$DRIFT_OUTPUT" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    s = d.get('summary', {})
-    parts = []
-    if s.get('gaps', 0): parts.append(str(s['gaps']) + ' gap(s)')
-    if s.get('stale', 0): parts.append(str(s['stale']) + ' stale')
-    if s.get('uncovered', 0): parts.append(str(s['uncovered']) + ' uncovered')
-    if s.get('orphanedSpecs', 0): parts.append(str(s['orphanedSpecs']) + ' orphaned')
-    print('  Issues: ' + ', '.join(parts))
-    for i in d.get('issues', [])[:5]:
-        sev = i['severity'].upper()
-        print('  [' + sev + '] ' + i['kind'] + ': ' + i['filePath'])
-    if len(d.get('issues', [])) > 5:
-        print('  ... and ' + str(len(d['issues']) - 5) + ' more')
-except: pass
-" 2>/dev/null
-  else
-    echo "  (Install python3 for detailed issue summary in hook output)"
-  fi
+  # Node is guaranteed by OpenLore. Sanitize repository-controlled strings
+  # before printing them to a terminal and keep the summary bounded.
+  printf '%s\n' "$OPENLORE_DRIFT_OUTPUT" | ${shellQuote(nodePath)} -e '
+let input = "";
+const safe = value => Array.from(String(value ?? ""))
+  .map(ch => { const code = ch.charCodeAt(0); return code < 32 || (code >= 127 && code <= 159) ? " " : ch; })
+  .join("").replace(/ +/g, " ").slice(0, 240);
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => { input += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const d = JSON.parse(input);
+    const s = d && typeof d.summary === "object" ? d.summary : {};
+    const fields = [["gaps", "gap(s)"], ["stale", "stale"], ["uncovered", "uncovered"],
+      ["orphanedSpecs", "orphaned"], ["adrGaps", "ADR gap(s)"], ["adrOrphaned", "ADR orphaned"],
+      ["memoryDrifted", "memory drifted"], ["memoryOrphaned", "memory orphaned"]];
+    const parts = fields.filter(([key]) => Number.isFinite(s[key]) && s[key] > 0)
+      .map(([key, label]) => String(s[key]) + " " + label);
+    console.log("  Issues: " + parts.join(", "));
+    const issues = Array.isArray(d.issues) ? d.issues : [];
+    for (const issue of issues.slice(0, 5)) {
+      console.log("  [" + safe(issue && issue.severity).toUpperCase() + "] " +
+        safe(issue && issue.kind) + ": " + safe(issue && issue.filePath));
+    }
+    if (issues.length > 5) console.log("  ... and " + (issues.length - 5) + " more");
+  } catch { /* The verdict parser already classified malformed output. */ }
+});
+' 2>/dev/null
   echo ""
-  echo "  Run 'spec-gen drift' for full details."
+  echo "  Run 'openlore drift' for full details."
   echo "  To skip this check: git commit --no-verify"
   echo ""
   exit 1
+elif [ "$OPENLORE_DRIFT_EXIT" -eq 0 ] && [ "\${OPENLORE_DRIFT_VERDICT%%:*}" = "incomplete" ]; then
+  OPENLORE_DRIFT_OMITTED=\${OPENLORE_DRIFT_VERDICT#incomplete:}
+  echo ""
+  echo "openlore: Spec drift could not be fully checked ($OPENLORE_DRIFT_OMITTED changed file(s) omitted); the drift check will not block this commit."
+  echo "  Re-run with a larger --max-files value before relying on a no-drift result."
+  echo ""
+elif [ "$OPENLORE_DRIFT_EXIT" -ne 0 ] || [ "$OPENLORE_DRIFT_VERDICT" != "clean" ]; then
+  echo ""
+  echo "openlore: Spec drift could not be checked (exit $OPENLORE_DRIFT_EXIT); the drift check will not block this commit."
+  echo "  See the error output above for the reason."
+  echo ""
 fi
-# end-spec-gen-drift-hook
+
+# Preserve a failure from hook content that ran before OpenLore was appended.
+if [ "$OPENLORE_DRIFT_PREVIOUS_EXIT" -ne 0 ]; then
+  exit "$OPENLORE_DRIFT_PREVIOUS_EXIT"
+fi
+unset OPENLORE_DRIFT_PREVIOUS_EXIT OPENLORE_DRIFT_COMMAND OPENLORE_DRIFT_OUTPUT
+unset OPENLORE_DRIFT_EXIT OPENLORE_DRIFT_VERDICT OPENLORE_DRIFT_OMITTED
+# end-openlore-drift-hook
 `.trimStart();
 
-async function installPreCommitHook(rootPath: string): Promise<void> {
-  const hooksDir = join(rootPath, '.git', 'hooks');
-  const hookPath = join(hooksDir, 'pre-commit');
+export async function installPreCommitHook(rootPath: string): Promise<void> {
+  const target = await resolveGitHookTarget(rootPath, 'pre-commit');
+  const hookPath = target.hookPath;
 
-  if (!(await fileExists(join(rootPath, '.git')))) {
+  if (!(await isResolvedGitRepository(rootPath, target))) {
     logger.error('Not a git repository. Cannot install hook.');
-    process.exitCode = 1;
+    process.exitCode = 2;
     return;
   }
-
-  // Ensure hooks directory exists (may not in bare clones or some CI setups)
-  await mkdir(hooksDir, { recursive: true });
-
-  // Check if hook already exists
-  let existingContent = '';
-  if (await fileExists(hookPath)) {
-    existingContent = await readFile(hookPath, 'utf-8');
-
-    if (existingContent.includes(HOOK_MARKER)) {
-      logger.success('Pre-commit hook is already installed.');
-      return;
-    }
-
-    // Append to existing hook
-    logger.discovery('Existing pre-commit hook found. Appending spec-gen drift check.');
-    const newContent = existingContent.trimEnd() + '\n\n' + HOOK_CONTENT;
-    await writeFile(hookPath, newContent, 'utf-8');
-  } else {
-    // Create new hook
-    const newContent = '#!/bin/sh\n\n' + HOOK_CONTENT;
-    await writeFile(hookPath, newContent, 'utf-8');
+  if (!target.canInstall) {
+    logger.warning(hookManagerWarning(target, 'openlore drift --fail-on warning --quiet'));
+    return;
   }
+  const launcher = await resolveTrustedHookLauncher(rootPath);
+  if (!launcher) { logger.error('Cannot pin an OpenLore installation outside this repository. Install OpenLore globally and retry.'); process.exitCode = 2; return; }
+  const hookContent = renderHookContent(launcher.node, launcher.cli);
 
-  await chmod(hookPath, 0o755);
-  logger.success('Pre-commit hook installed at .git/hooks/pre-commit');
+  let updated = false;
+  let appended = false;
+  let incompatibleReason: string | null = null;
+  const result = await updateHookFile(hookPath, (existing) => {
+    if (existing !== null) {
+      const shebang = existing.split(/\r?\n/, 1)[0];
+      if (!usesShellInterpreter(shebang)) {
+        incompatibleReason = `the existing hook uses a non-shell interpreter (${shebang})`;
+        return null;
+      }
+    }
+    if (existing !== null) {
+      const block = findDriftHookBlock(existing);
+      if (block && 'error' in block) {
+        incompatibleReason = block.error;
+        return null;
+      }
+      if (block) {
+        updated = true;
+        return existing.slice(0, block.start) + hookContent.trimEnd() + existing.slice(block.end);
+      }
+    }
+    appended = existing !== null;
+    const terminal = existing ? terminalHookCommand(existing) : null;
+    if (terminal) {
+      incompatibleReason = `the existing hook ends with an unconditional ${terminal}, so appended checks would be unreachable`;
+      return null;
+    }
+    return existing
+      ? existing.trimEnd() + '\n\n' + hookContent
+      : '#!/bin/sh\n\n' + hookContent;
+  });
+  if (result.status === 'unavailable') {
+    logger.warning(`Cannot install the drift hook at ${displayHookPath(hookPath)}: ${result.reason}`);
+    return;
+  }
+  if (incompatibleReason) {
+    logger.warning(`Cannot install the drift hook automatically: ${incompatibleReason}. Add "openlore drift --fail-on warning" to the hook manager manually.`);
+    return;
+  }
+  if (updated) {
+    logger.success('Pre-commit hook updated.');
+    return;
+  }
+  if (appended) logger.discovery('Existing pre-commit hook found. Appending openlore drift check.');
+  logger.success(`Pre-commit hook installed at ${displayHookPath(hookPath)}`);
   logger.discovery('Drift will be checked before each commit. Use --no-verify to skip.');
 }
 
-async function uninstallPreCommitHook(rootPath: string): Promise<void> {
-  const hookPath = join(rootPath, '.git', 'hooks', 'pre-commit');
-
-  if (!(await fileExists(hookPath))) {
+export async function uninstallPreCommitHook(rootPath: string): Promise<void> {
+  const { hookPath } = await resolveGitHookTarget(rootPath, 'pre-commit');
+  let hookFound = false;
+  let blockFound = false;
+  let malformedReason: string | null = null;
+  let deleted = false;
+  const result = await updateHookFile(hookPath, (existing) => {
+    if (existing === null) return null;
+    hookFound = true;
+    const block = findDriftHookBlock(existing);
+    if (!block) return null;
+    if ('error' in block) {
+      malformedReason = block.error;
+      return null;
+    }
+    blockFound = true;
+    const cleaned = (existing.slice(0, block.start) + existing.slice(block.end)).trim();
+    if (!cleaned || (cleaned.startsWith('#!') && !cleaned.includes('\n') && usesShellInterpreter(cleaned))) {
+      deleted = true;
+      return undefined;
+    }
+    return cleaned + '\n';
+  });
+  if (result.status === 'unavailable') {
+    logger.warning(`Cannot uninstall the drift hook at ${displayHookPath(hookPath)}: ${result.reason}`);
+  } else if (malformedReason) {
+    logger.warning(`Cannot uninstall the drift hook automatically: ${malformedReason}. Remove the marked block manually.`);
+  } else if (!hookFound) {
     logger.warning('No pre-commit hook found.');
-    return;
-  }
-
-  const content = await readFile(hookPath, 'utf-8');
-  if (!content.includes(HOOK_MARKER)) {
-    logger.warning('Pre-commit hook does not contain spec-gen drift check.');
-    return;
-  }
-
-  // Remove the spec-gen block
-  const newContent = content
-    .replace(/\n*# spec-gen-drift-hook[\s\S]*?# end-spec-gen-drift-hook\n*/g, '')
-    .trim();
-
-  if (!newContent || newContent === '#!/bin/sh') {
-    // Hook file is now empty — remove the shebang-only file
-    const { unlink } = await import('node:fs/promises');
-    await unlink(hookPath);
-    logger.success('Pre-commit hook removed (file deleted — was only spec-gen).');
+  } else if (!blockFound) {
+    logger.warning('Pre-commit hook does not contain openlore drift check.');
+  } else if (deleted) {
+    logger.success('Pre-commit hook removed (file deleted — was only openlore).');
   } else {
-    await writeFile(hookPath, newContent + '\n', 'utf-8');
-    logger.success('Spec-gen drift check removed from pre-commit hook.');
+    logger.success('OpenLore drift check removed from pre-commit hook.');
   }
 }
 
@@ -298,17 +518,22 @@ export const driftCommand = new Command('drift')
     'After detecting drift, list the test files that cover affected domains',
     false
   )
+  .option(
+    '--memory-scope <scope>',
+    'Enumerate stale memories for the changed files only, or repository-wide (changed-files | repository)',
+    'changed-files'
+  )
   .addHelpText(
     'after',
     `
 Examples:
-  $ spec-gen drift                    Check for drift against main branch
-  $ spec-gen drift --base develop     Compare against develop branch
-  $ spec-gen drift --json             Output JSON for CI integration
-  $ spec-gen drift --fail-on error    Only fail on error-level drift
-  $ spec-gen drift --use-llm          Use LLM for semantic analysis
-  $ spec-gen drift --install-hook     Install as pre-commit hook
-  $ spec-gen drift --uninstall-hook   Remove pre-commit hook
+  $ openlore drift                    Check for drift against main branch
+  $ openlore drift --base develop     Compare against develop branch
+  $ openlore drift --json             Output JSON for CI integration
+  $ openlore drift --fail-on error    Only fail on error-level drift
+  $ openlore drift --use-llm          Use LLM for semantic analysis
+  $ openlore drift --install-hook     Install as pre-commit hook
+  $ openlore drift --uninstall-hook   Remove pre-commit hook
 
 Drift categories:
   gap:           Code changed but spec not updated
@@ -320,6 +545,11 @@ Pre-commit hook:
   Install with --install-hook to automatically check for drift
   before each commit. The hook runs in static mode (no LLM)
   for fast execution.
+
+Exit codes:
+  0: no drift at or above the configured threshold
+  1: drift found
+  2: drift could not be checked
 `
   )
   .action(async function (this: Command, options: Partial<DriftOptions>) {
@@ -339,31 +569,36 @@ Pre-commit hook:
       installHook: options.installHook ?? false,
       uninstallHook: options.uninstallHook ?? false,
       suggestTests: options.suggestTests ?? false,
+      memoryScope: options.memoryScope === 'repository' ? 'repository' : 'changed-files',
       failOn: (options.failOn as DriftSeverity) ?? 'warning',
       maxFiles: (() => {
         // Commander routes --max-files to parent when both parent and subcommand define it.
         // Check globalOpts first for the user-provided value, fall back to subcommand default.
         const raw = globalOpts.maxFiles ?? options.maxFiles ?? String(DEFAULT_DRIFT_MAX_FILES);
-        return typeof raw === 'string' ? parseInt(raw, 10) : raw;
+        return typeof raw === 'string' ? Number(raw) : raw;
       })(),
       verbose: options.verbose ?? globalOpts.verbose ?? false,
       quiet: globalOpts.quiet ?? false,
       noColor: globalOpts.color === false,
-      config: globalOpts.config ?? SPEC_GEN_CONFIG_REL_PATH,
+      config: globalOpts.config ?? OPENLORE_CONFIG_REL_PATH,
     };
 
-    if (isNaN(opts.maxFiles) || opts.maxFiles < 1) {
+    if (!Number.isSafeInteger(opts.maxFiles) || opts.maxFiles < 1) {
       logger.error('--max-files must be a positive integer');
-      process.exitCode = 1;
+      process.exitCode = 2;
       return;
     }
 
     // Validate failOn
     if (!['error', 'warning', 'info'].includes(opts.failOn)) {
       logger.error('--fail-on must be one of: error, warning, info');
-      process.exitCode = 1;
+      process.exitCode = 2;
       return;
     }
+
+    // --json: keep stdout pure (logs → stderr) by construction, matching
+    // orient/verify, so a future logger call in this path can't corrupt the JSON.
+    const restoreStdout = opts.json ? redirectConsoleToStderr() : null;
 
     try {
       // ========================================================================
@@ -386,61 +621,64 @@ Pre-commit hook:
         logger.section('Spec Drift Detection');
       }
 
-      // Check git repo
-      if (!(await isGitRepository(rootPath))) {
-        logger.error('Not a git repository. Drift detection requires git.');
-        process.exitCode = 1;
+      // Check git repo. Root-only (see api/drift.ts): drift joins repo-root-relative
+      // git paths against the analyzed-root spec map, so it runs only at the repo root;
+      // below-root it refuses rather than silently join mismatched path frames.
+      if (!(await isGitRepositoryRoot(rootPath))) {
+        logger.error('Not a git repository (or not at its root). Drift detection requires git and must run at the repository root.');
+        process.exitCode = 2;
         return;
       }
 
-      // Load spec-gen config
-      const specGenConfig = await readSpecGenConfig(rootPath);
-      if (!specGenConfig) {
-        logger.error('No spec-gen configuration found. Run "spec-gen init" first.');
-        process.exitCode = 1;
+      // Load openlore config
+      const openloreConfig = await readOpenLoreConfig(rootPath);
+      if (!openloreConfig) {
+        logger.error('No openlore configuration found. Run "openlore init" first.');
+        process.exitCode = 2;
         return;
       }
 
       // Create LLM service if --use-llm is specified
       let llm: LLMService | undefined;
       if (opts.useLlm) {
-        const resolved = resolveLLMProvider(specGenConfig);
+        const resolved = resolveLLMProvider(openloreConfig);
         if (!resolved) {
           logger.error('No LLM API key found. --use-llm requires an API key.');
           logger.discovery('Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY + OPENAI_COMPAT_BASE_URL.');
-          process.exitCode = 1;
+          process.exitCode = 2;
           return;
         }
 
         try {
           llm = createLLMService({
             provider: resolved.provider,
-            model: specGenConfig.generation?.model,
+            model: openloreConfig.generation?.model,
             openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
-            apiBase: globalOpts.apiBase ?? specGenConfig.llm?.apiBase,
-            sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig.llm?.sslVerify ?? true,
-            timeout: globalOpts.timeout ?? specGenConfig.generation?.timeout,
-            enableLogging: true,
-            logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
+            apiBase: resolveTrustedApiBase(globalOpts.apiBase, openloreConfig?.llm?.apiBase),
+            sslVerify: resolveTrustedSslVerify(globalOpts.insecure, openloreConfig?.llm?.sslVerify),
+            timeout: globalOpts.timeout ?? openloreConfig.generation?.timeout,
+            enableLogging: isLlmLoggingEnabled(),
+            logDir: join(rootPath, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR),
+            logRoot: rootPath,
           });
           if (!opts.json) {
             logger.discovery(`LLM enabled (${resolved.provider}) — gap issues will be semantically analyzed`);
           }
         } catch (error) {
           logger.error(`Failed to create LLM service: ${(error as Error).message}`);
-          process.exitCode = 1;
+          process.exitCode = 2;
           return;
         }
       }
 
       // Determine openspec path
-      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+      const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
       const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
 
       // Check if specs exist
       if (!(await fileExists(specsPath))) {
-        logger.error('No specs found. Run "spec-gen generate" first.');
-        process.exitCode = 1;
+        logger.error('No specs found. Run "openlore generate" first.');
+        process.exitCode = 2;
         return;
       }
 
@@ -449,6 +687,19 @@ Pre-commit hook:
       // ========================================================================
       if (!opts.json) {
         logger.discovery('Analyzing git changes...');
+      }
+
+      // Disclose a base-ref fallback instead of quietly diffing against something the
+      // caller did not ask for. `resolveBaseRefDisclosed` is the shared home of this
+      // verdict (fix-cli-conclusion-honesty); `blast-radius` already surfaces it and
+      // `certify-public-surface` is fatal on it — `drift` was the one --base command
+      // that silently substituted `main` for a typo'd ref and reported success.
+      const baseDisclosure = await resolveBaseRefDisclosed(rootPath, opts.base);
+      if (baseDisclosure.fellBack && !opts.json) {
+        logger.warning(
+          `Base ref "${baseDisclosure.requested}" did not resolve — comparing against ` +
+            `"${baseDisclosure.resolved}" instead.`,
+        );
       }
 
       const gitResult = await getChangedFiles({
@@ -471,14 +722,17 @@ Pre-commit hook:
             timestamp: new Date().toISOString(),
             baseRef: gitResult.resolvedBase,
             totalChangedFiles: 0,
+            analyzedFiles: 0,
+            filesOmitted: 0,
             specRelevantFiles: 0,
             issues: [],
-            summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, total: 0 },
+            summary: { gaps: 0, stale: 0, uncovered: 0, orphanedSpecs: 0, adrGaps: 0, adrOrphaned: 0, memoryDrifted: 0, memoryOrphaned: 0, memoryOutOfScope: 0, total: 0 },
             hasDrift: false,
             duration: Date.now() - startTime,
             mode: 'static',
           };
-          console.log(JSON.stringify(emptyResult, null, 2));
+          // Straight to stdout so it bypasses the console→stderr redirect.
+          process.stdout.write(JSON.stringify(emptyResult, null, 2) + '\n');
         } else {
           logger.success('No changes detected. Specs are up to date.');
         }
@@ -502,11 +756,11 @@ Pre-commit hook:
       }
 
       // Check for repo-structure.json for enhanced mapping
-      const repoStructurePath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
+      const repoStructurePath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
       const hasRepoStructure = await fileExists(repoStructurePath);
 
       if (!hasRepoStructure && !opts.json) {
-        logger.debug('No prior analysis found. Using spec headers only for file mapping. Run "spec-gen analyze" for better detection.');
+        logger.debug('No prior analysis found. Using spec headers only for file mapping. Run "openlore analyze" for better detection.');
       }
 
       const specMap = await buildSpecMap({
@@ -544,21 +798,25 @@ Pre-commit hook:
         changedFiles: gitResult.files,
         failOn: opts.failOn,
         domainFilter: opts.domains.length > 0 ? opts.domains : undefined,
-        openspecRelPath: specGenConfig.openspecPath ?? OPENSPEC_DIR,
+        openspecRelPath: openloreConfig.openspecPath ?? OPENSPEC_DIR,
         llm,
         baseRef: gitResult.resolvedBase,
         adrMap: adrMap ?? undefined,
+        memoryScope: opts.memoryScope,
       });
 
       // Fill in the base ref and actual total count (before --max-files truncation)
       result.baseRef = gitResult.resolvedBase;
       result.totalChangedFiles = actualChangedFiles;
+      result.analyzedFiles = gitResult.files.length;
+      result.filesOmitted = actualChangedFiles - gitResult.files.length;
 
       // ========================================================================
       // PHASE 5: DISPLAY RESULTS
       // ========================================================================
       if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
+        // Straight to stdout so it bypasses the console→stderr redirect.
+        process.stdout.write(JSON.stringify(result, null, 2) + '\n');
       } else if (opts.quiet) {
         // Quiet mode: only show the final pass/fail line
         if (result.hasDrift) {
@@ -570,11 +828,23 @@ Pre-commit hook:
           if (warnCount > 0) parts.push(`${warnCount} warning${warnCount > 1 ? 's' : ''}`);
           if (infoCount > 0 && errorCount === 0 && warnCount === 0) parts.push(`${infoCount} info`);
           logger.error(`Drift detected: ${parts.join(', ')}`);
+        } else if (result.filesOmitted > 0) {
+          console.error(
+            `openlore: Drift check incomplete: ${result.analyzedFiles} changed files analyzed, ` +
+            `${result.filesOmitted} omitted.`,
+          );
         }
       } else {
         if (result.issues.length === 0) {
           logger.blank();
-          logger.success('No spec drift detected. Specs are in sync with code changes.');
+          if (result.filesOmitted > 0) {
+            logger.warning(
+              `No drift detected in ${result.analyzedFiles} analyzed changed files; ` +
+              `${result.filesOmitted} changed files were omitted, so the result is incomplete.`,
+            );
+          } else {
+            logger.success('No spec drift detected. Specs are in sync with code changes.');
+          }
           const duration = Date.now() - startTime;
           logger.info('Duration', formatDuration(duration));
         } else {
@@ -624,22 +894,28 @@ Pre-commit hook:
       // Suggest tests for drifted domains
       if (opts.suggestTests && result.hasDrift && !opts.json) {
         const suggestion = await suggestTestsForDrift(result, rootPath);
+        if (suggestion.omittedFiles > 0) {
+          logger.warning(
+            `${suggestion.omittedFiles} test-looking file${suggestion.omittedFiles === 1 ? ' was' : 's were'} ` +
+            'unreadable or above the scan size limit; suggested tests may be incomplete.',
+          );
+        }
         if (suggestion.domains.length > 0) {
           logger.blank();
           console.log('   Suggested tests for affected domains:');
           console.log('');
           for (const d of suggestion.domains) {
-            console.log(`   ${d.domain}  (${d.testFiles.length} file${d.testFiles.length !== 1 ? 's' : ''})`);
+            console.log(`   ${safe(d.domain)}  (${d.testFiles.length} file${d.testFiles.length !== 1 ? 's' : ''})`);
             for (const f of d.testFiles) {
-              console.log(`     → ${f}`);
+              console.log(`     → ${safe(f)}`);
             }
           }
           console.log('');
-          console.log(`   Run: npx vitest ${suggestion.allFiles.join(' ')}`);
+          console.log('   Run the listed files with your project test runner.');
           logger.blank();
         } else {
           logger.blank();
-          logger.info('Suggest tests', 'No spec-gen test files found for affected domains. Run "spec-gen test" to generate them.');
+          logger.info('Suggest tests', 'No openlore test files found for affected domains. Run "openlore test" to generate them.');
         }
       }
 
@@ -653,6 +929,8 @@ Pre-commit hook:
       if (process.env.DEBUG) {
         console.error(error);
       }
-      process.exitCode = 1;
+      process.exitCode = 2;
+    } finally {
+      restoreStdout?.();
     }
   });

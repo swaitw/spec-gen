@@ -1,12 +1,22 @@
 /**
- * Core type definitions for spec-gen
+ * Core type definitions for openlore
  */
 
 // Project detection types
 export type ProjectType = 'nodejs' | 'python' | 'rust' | 'go' | 'java' | 'ruby' | 'php' | 'unknown';
 
+// Panic response impact level
+// off: panic subsystem disabled. Freshness/epistemic tracking always runs regardless. (default)
+// observe: panic scoring + state file, no intervention — observe the engine without acting
+// advisory: full pipeline with L2+ response injection
+// experimental_blocking: advisory + a runtime-mediated block signal at L4. EXPLICITLY OPT-IN and
+//   never a default. The payload always carries advisory:true — OpenLore recommends, the runtime
+//   decides enforcement; OpenLore never mandates. Do NOT enable by default until the observe-mode
+//   accuracy gate is cleared (`openlore panic-validate`) — a false positive can block a correct call.
+export type PanicResponseMode = 'off' | 'observe' | 'advisory' | 'experimental_blocking';
+
 // Configuration types
-export interface SpecGenConfig {
+export interface OpenLoreConfig {
   version: string;
   projectType: ProjectType;
   openspecPath: string;
@@ -14,21 +24,283 @@ export interface SpecGenConfig {
   generation: GenerationConfig;
   llm?: LLMConfig;
   embedding?: EmbeddingConfig;
+  /** Deterministic retrieval enhancements. Vocabulary expansion defaults on. */
+  retrieval?: RetrievalConfig;
+  panicResponse?: {
+    /**
+     * Controls the panic response subsystem. Default: 'off'.
+     *
+     * 'off' disables: panic scoring, panic state persistence, panic interventions,
+     *   panic telemetry, panic hook output.
+     *   Behavioral metrics required by the freshness engine (density, oscillation,
+     *   localityConfidence) continue to be computed in-memory as part of EpistemicLease.
+     * 'observe': panic scoring + state written, no intervention (collect only).
+     * 'advisory': full pipeline with L2+ response injection.
+     * 'experimental_blocking': advisory + a runtime block signal at L4 (advisory:true always
+     *   present — the runtime decides enforcement). Opt-in only; never enable by default until the
+     *   observe-mode accuracy gate (`openlore panic-validate`) is cleared.
+     */
+    mode: PanicResponseMode;
+  };
+  /**
+   * Optional background auto-initialization switch (change:
+   * unify-onboarding-entrypoint). Default `true`. When `false`, no background
+   * auto-init or self-healing repair runs for this repository — explicit
+   * commands (`openlore analyze`, `openlore install`) are unaffected. The
+   * environment opt-out `OPENLORE_NO_AUTO_ANALYZE` remains equivalent.
+   */
+  autoInit?: boolean;
   createdAt: string;
   lastRun: string | null;
+  /**
+   * Optional pre-flight blast-radius guard configuration
+   * (change: add-preflight-blast-radius-guard). The guard is advisory by
+   * default; `block` names the high-risk patterns the git hook should fail a
+   * commit on. Empty/absent = advisory-only (the default posture).
+   */
+  blastRadius?: BlastRadiusConfig;
+  /**
+   * Optional binding to an external spec store that declares the code
+   * repositories its plans target and reference (change: add-spec-store-binding).
+   * Configuration only: OpenLore reads the declared relationships and never
+   * clones, writes to, synchronizes, or fences the store or any target. Absent
+   * binding = unchanged single-repository behavior.
+   */
+  specStore?: SpecStoreConfig;
+  /**
+   * Optional governance behavior (change: add-decision-autopilot). With
+   * `autopilot: true`, the decisions commit gate auto-accepts verified decisions
+   * (distinct `auto-approved` status, actor recorded on an append-only ledger),
+   * syncs them to specs, and never blocks a commit; blocking human review is the
+   * behavior when absent/false. Autopilot never touches a human-rejected decision.
+   */
+  governance?: {
+    autopilot?: boolean;
+  };
+  /**
+   * Optional declared covering surfaces + advisory posture for the change-impact
+   * certificate (change: add-change-impact-certificate). A covering surface is a
+   * declared semantic/governance boundary (a set of symbols or files), not a
+   * directory glob. The certificate is advisory by default; `block` opts specific
+   * surface severities into failing a commit. Absent = no surfaces declared.
+   */
+  impactCertificate?: ImpactCertificateConfig;
+  /**
+   * Optional task-scoped context injection settings
+   * (change: add-task-scoped-context-injection). When enabled (the default),
+   * `openlore orient --inject` — wired by `openlore install` as a per-task
+   * pre-turn hook — emits a bounded, attributed, ignorable orientation block so
+   * the agent's first turn begins already oriented to the task, amortizing the
+   * per-task `orient` round-trip to zero. Absent = task-scoped injection enabled
+   * with documented defaults.
+   */
+  contextInjection?: ContextInjectionConfig;
+  /**
+   * Optional unified enforcement policy (change: add-finding-enforcement-policy).
+   * Maps a stable governance finding `code` to one enforcement class — the single
+   * declarative source of truth for "what blocks a commit, what merely advises, and
+   * what is deliberately silenced," decoupling a finding's intrinsic severity (owned
+   * by its source) from this repository's risk posture (owned here). Additive and
+   * optional: an absent or empty policy preserves today's behavior exactly (advisory
+   * by default). Supersedes the per-surface `blastRadius.block` / `impactCertificate.block`
+   * sugar, which now lowers onto this policy.
+   */
+  enforcement?: EnforcementConfig;
+  /**
+   * Repository-content secret redaction. Tool output is redacted by default; setting
+   * `toolOutput` to false is an explicit trusted-solo opt-out.
+   */
+  secretRedaction?: {
+    toolOutput?: boolean;
+  };
+  /** Trusted producers for optional signed graph-bundle imports. */
+  bundle?: BundleConfig;
+  /** Optional explicit workspace boundaries. When absent, analyzer manifests are detected. */
+  workspace?: WorkspaceConfig;
+  /** Pi extension settings, including who owns daemon spawn authority. */
+  pi?: PiConfig;
+}
+
+export interface PiConfig {
+  /**
+   * Whether the Pi extension may spawn its own daemon when none is discovered. Default `true`.
+   * Set to `false` when a supervising host already runs one daemon per working tree: an
+   * extension-initiated spawn would then be a second, unsupervised process outliving the session
+   * (change: extend-api-for-supervising-hosts). Discovery and use of an existing daemon are
+   * unaffected. The `OPENLORE_PI_NO_SPAWN` environment variable overrides this.
+   */
+  spawnDaemon?: boolean;
+  /**
+   * Which OpenLore tools are active when a Pi session starts. Default `'lean'`: the tools of the
+   * MCP `substrate` preset plus `openlore_configure` and `openlore_activate_tools`, which turns on
+   * the other tool groups on demand. `'all'` activates every OpenLore tool at session start
+   * (change: add-pi-lean-tool-surface).
+   */
+  toolSurface?: 'lean' | 'all';
+}
+
+export interface WorkspaceShardConfig {
+  /** Stable CLI name used by `analyze --shard`. */
+  name: string;
+  /** Repository-relative package root. */
+  root: string;
+}
+
+export interface WorkspaceConfig {
+  /** Explicit boundaries replace manifest detection; unmatched files belong to `root`. */
+  shards?: WorkspaceShardConfig[];
+}
+
+export interface BundleTrustedSigner {
+  /** Inline Ed25519 public key in SPKI PEM form. */
+  publicKey: string;
+  /** Optional human-readable label; cryptographic identity is always the key fingerprint. */
+  label?: string;
+}
+
+export interface BundleConfig {
+  trustedSigners?: BundleTrustedSigner[];
+}
+
+/**
+ * How the gate treats a governance finding, independent of the finding's severity
+ * (changes: add-finding-enforcement-policy, add-enforcement-baseline-ratchet).
+ * `blocking` fails the gate; `frozen` records existing debt and fails only on findings
+ * outside that baseline; `advisory` reports without failing (the default); `off` is a
+ * recorded, inspectable silence — the finding remains visible.
+ */
+export type EnforcementClass = 'blocking' | 'frozen' | 'advisory' | 'off';
+
+/**
+ * A repository's declared enforcement policy: a map from a stable finding `code`
+ * to its enforcement class. Additive — a code absent from the map keeps its
+ * source-declared default. An unrecognized code is retained (a policy may name a
+ * code before its source ships) and surfaced as a non-failing config finding.
+ */
+export interface EnforcementConfig {
+  policy?: Record<string, EnforcementClass>;
+}
+
+/** Whether task-scoped context injection is active (change: add-task-scoped-context-injection). */
+export type ContextInjectionMode = 'off' | 'task-scoped';
+
+/**
+ * Task-scoped context-injection settings. All fields optional; the documented
+ * defaults are applied when absent (mode `task-scoped`, ~600-token budget, and
+ * the relevance-gate thresholds below). The gate is deterministic and never
+ * learned: `orient --inject` emits the full block only when the task's graph
+ * match clears the threshold, otherwise it degrades to a single pointer line.
+ */
+export interface ContextInjectionConfig {
+  /** `off` makes `orient --inject` a no-op (exit 0); does not affect SessionStart/MCP. Default `task-scoped`. */
+  mode?: ContextInjectionMode;
+  /** Hard cap on the injected block size, in estimated tokens. Default 600. */
+  tokenBudget?: number;
+  /** Relevance gate: minimum matched-function count to emit a full block. Default 2. */
+  relevanceMinMatches?: number;
+  /** Relevance gate: a match with at least this fan-in (or a hub) clears the gate structurally. Default 2. */
+  relevanceMinFanIn?: number;
+  /** Relevance gate: minimum top match score (semantic/hybrid scale only) to clear the gate. Default 0.3. */
+  relevanceMinScore?: number;
+  /**
+   * Turn-intent gate: withhold the briefing on repository-management turns
+   * (push, open/merge a PR, cut a release, write the changelog) before any
+   * structural lookup runs. Deterministic and fail-open — a turn is management
+   * only on positive evidence with no code-work signal. Default true; set false
+   * to orient on every turn as before.
+   */
+  intentGate?: boolean;
+}
+
+/** Named high-risk patterns the blast-radius hook may block on (opt-in). */
+export type BlastRadiusBlockPattern = 'orphans-anchored-memory' | 'orphans-anchored-decision';
+
+export interface BlastRadiusConfig {
+  block?: BlastRadiusBlockPattern[];
+}
+
+/** Severity of a declared covering surface (change: add-change-impact-certificate). */
+export type CoveringSurfaceSeverity = 'info' | 'warn' | 'critical';
+
+/**
+ * One member of a declared covering surface: a symbol name and/or a repo-relative
+ * file. A symbol resolves to exactly one indexed node (unique-name match) or it
+ * degrades to a finding; a file contributes all of its internal symbols.
+ */
+export interface CoveringSurfaceMember {
+  symbol?: string;
+  file?: string;
+}
+
+/**
+ * A declared covering surface — a semantic or governance boundary a proposed
+ * change is assessed against. Additive: absent = no surface assessment.
+ */
+export interface CoveringSurfaceConfig {
+  /** Stable, user-facing name (e.g. "client", "data-handling", "regulated"). */
+  name: string;
+  /** The boundary members (symbols and/or files). */
+  members: CoveringSurfaceMember[];
+  /** Optional severity; a surface marked `critical` MAY be opted into blocking. */
+  severity?: CoveringSurfaceSeverity;
+}
+
+export interface ImpactCertificateConfig {
+  /** Declared covering surfaces this repository is assessed against. */
+  surfaces?: CoveringSurfaceConfig[];
+  /**
+   * Surface severities whose newly-opened paths the git hook should block a commit
+   * on (opt-in). Empty/absent = advisory-only (the default posture).
+   */
+  block?: CoveringSurfaceSeverity[];
+}
+
+/**
+ * A binding to an external spec store (change: add-spec-store-binding). The
+ * store is a standalone repository that holds specs/changes; `targets` and
+ * `references` are repository NAMES resolved against the federation registry
+ * (`.openlore/federation.json`). A target is a code repository the store's work
+ * is about; a reference is upstream context it draws on.
+ */
+export interface SpecStoreConfig {
+  /** Stable, user-facing name for the store. */
+  name: string;
+  /** Absolute or home-relative path to the external spec repository. */
+  path: string;
+  /** Federation-registered names of the code repositories the store targets. */
+  targets: string[];
+  /** Federation-registered names of repositories the store references for context. */
+  references?: string[];
 }
 
 export interface EmbeddingConfig {
-  /** Base URL of the OpenAI-compatible embeddings endpoint */
-  baseUrl: string;
-  /** Embedding model name */
-  model: string;
-  /** API key — optional for local servers */
+  /**
+   * Embedding provider.
+   *  - `'remote'` (default): an OpenAI-compatible `/embeddings` endpoint
+   *    (`baseUrl` + `model` required).
+   *  - `'local'`: an on-device, CPU-only embedder requiring no endpoint and no
+   *    API key. The model is lazily downloaded and cached on first use. `model`
+   *    is optional (defaults to a pinned small model); `baseUrl`/`apiKey` are
+   *    ignored.
+   * Omitting `provider` keeps the historical behaviour: a remote endpoint when
+   * `baseUrl` + `model` are present, otherwise no embeddings (keyword default).
+   */
+  provider?: 'remote' | 'local';
+  /** Base URL of the OpenAI-compatible embeddings endpoint (remote provider) */
+  baseUrl?: string;
+  /** Embedding model name (required for remote; optional override for local) */
+  model?: string;
+  /** API key — optional for local servers (remote provider only) */
   apiKey?: string;
   /** Maximum number of texts per embedding batch (default: 64) */
   batchSize?: number;
   /** Disable SSL certificate verification (e.g. self-signed certs on local servers) */
   skipSslVerify?: boolean;
+}
+
+export interface RetrievalConfig {
+  /** Set false to disable repository-vocabulary query expansion without rebuilding indexes. */
+  vocabularyExpansion?: boolean;
 }
 
 export interface AnalysisConfig {
@@ -38,7 +310,7 @@ export interface AnalysisConfig {
 }
 
 export interface GenerationConfig {
-  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'claude-code' | 'mistral-vibe' | 'gemini-cli' | 'cursor-agent';
+  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'gemini-cli' | 'antigravity-cli' | 'cursor-agent';
   model?: string;
   openaiCompatBaseUrl?: string;
   skipSslVerify?: boolean;
@@ -72,6 +344,8 @@ export interface FileMetadata {
   isConfig: boolean;
   isTest: boolean;
   isGenerated: boolean;
+  /** True when the file contains only OpenLore installer-managed content. */
+  tooling?: boolean;
 }
 
 export interface ScoredFile extends FileMetadata {
@@ -94,6 +368,25 @@ export interface FileWalkerResult {
     byDirectory: Record<string, number>;
     skippedCount: number;
     skippedReasons: Record<string, number>;
+    /**
+     * How many symlinks were FOLLOWED into the corpus (a symlinked source dir, a vendored file),
+     * as opposed to the skipped-link reasons in `skippedReasons`. Present only when > 0, so a
+     * corpus reachable only through a link is explainable from the summary alone.
+     */
+    symlinkFollowed?: number;
+    /**
+     * `includePatterns` the caller set that matched no admitted file — a silent config no-op made
+     * visible. Present only when non-empty and the walk was not truncated (a truncated walk can't
+     * prove a pattern matched nothing, since matches could lie beyond the cap).
+     */
+    includePatternsUnmatched?: string[];
+    /**
+     * Present only when the walk stopped at the `maxFiles` cap. The corpus is then a truncated
+     * prefix of the repository — `limit` is the cap that was hit and `atPath` is where the walk
+     * stopped — so a partial corpus is never presented as complete. Absent means the walk
+     * completed within the cap.
+     */
+    truncated?: { limit: number; atPath: string };
   };
   rootPath: string;
   timestamp: string;
@@ -228,7 +521,9 @@ export type DriftIssueKind =
   | 'uncovered' // New file/function with no matching spec at all
   | 'orphaned-spec' // Spec references files that no longer exist
   | 'adr-gap' // Code changed in domain referenced by an ADR
-  | 'adr-orphaned'; // ADR references domains that no longer exist in specs
+  | 'adr-orphaned' // ADR references domains that no longer exist in specs
+  | 'memory-drifted' // Code-anchored memory's subject changed since it was recorded
+  | 'memory-orphaned'; // Code-anchored memory's subject no longer exists
 
 export interface DriftOptions extends GlobalOptions {
   base: string;
@@ -241,6 +536,8 @@ export interface DriftOptions extends GlobalOptions {
   failOn: DriftSeverity;
   maxFiles: number;
   suggestTests: boolean;
+  /** Enumerate stale memories for the reviewed changeset only (default) or repository-wide. */
+  memoryScope: 'changed-files' | 'repository';
 }
 
 export interface DriftIssue {
@@ -258,7 +555,13 @@ export interface DriftIssue {
 export interface DriftResult {
   timestamp: string;
   baseRef: string;
+  /** Total changed files before any analysis limit is applied. */
   totalChangedFiles: number;
+  /** Changed files actually examined by drift detection. */
+  analyzedFiles: number;
+  /** Changed files omitted because the analysis limit was reached. */
+  filesOmitted: number;
+  /** Spec-relevant files among analyzedFiles, not totalChangedFiles. */
   specRelevantFiles: number;
   issues: DriftIssue[];
   summary: {
@@ -268,6 +571,15 @@ export interface DriftResult {
     orphanedSpecs: number;
     adrGaps: number;
     adrOrphaned: number;
+    memoryDrifted: number;
+    memoryOrphaned: number;
+    /**
+     * Drifted/orphaned anchors OUTSIDE the reviewed scope: counted, not
+     * enumerated (change: scope-advisory-noise-to-touched-code). Their verdicts
+     * are computed identically to the enumerated ones — only the presentation
+     * differs. 0 on an unscoped, repository-wide run.
+     */
+    memoryOutOfScope: number;
     total: number;
   };
   hasDrift: boolean;
@@ -367,26 +679,134 @@ export interface AuditStaleDomain {
   staleSince: string;
 }
 
+/**
+ * Coverage availability is BINARY; the detail lives in a stable reason code.
+ *
+ * The previous `missing | invalid | stale` states leaked into arithmetic paths
+ * where an unusable mapping was reported as numeric zero, which generic agents
+ * and dashboards read as an observed count (change `harden-spec-workflow-lifecycle`,
+ * decision 5d3ac32a). Consumers MUST branch on `state` before using any
+ * mapping-dependent number.
+ */
+export type MappingCoverageState = 'available' | 'unavailable';
+
+export type MappingCoverageReason =
+  | 'mapping-not-generated'
+  | 'invalid-json'
+  | 'incompatible-provenance'
+  | 'fingerprint-mismatch'
+  | 'scoped-artifact'
+  | 'analysis-unavailable'
+  | 'specs-unavailable';
+
+export interface MappingCoverageStatus {
+  state: MappingCoverageState;
+  reason?: MappingCoverageReason;
+  message?: string;
+  remediation?: string;
+  artifactPath: string;
+  /** Where available coverage came from: the persisted cache, or an in-memory rebuild. */
+  source?: 'cache' | 'derived';
+  /**
+   * Why the persisted cache was not used, when coverage is nonetheless available.
+   * Observability only — an unusable cache never degrades availability, because the
+   * links are re-derived from the specs and the current graph.
+   */
+  cacheReason?: MappingCoverageReason;
+}
+
+/**
+ * Backward-compatible numeric summary for the public v2 API.
+ *
+ * Consumers MUST branch on `AuditReport.mappingCoverage.state` before treating
+ * mapping-dependent values as observations. When coverage is unavailable these
+ * legacy numeric fields remain zero so existing v2 TypeScript consumers keep
+ * their source contract; MCP/composite responses replace them with `null`.
+ */
+export interface AuditCoverageSummary {
+  /** Mapping-independent: the analyzed function total is always observable. */
+  totalFunctions: number;
+  coveredFunctions: number;
+  coveragePct: number;
+  uncoveredCount: number;
+  hubGapCount: number;
+  orphanRequirementCount: number;
+  /** Mapping-independent: staleness is computed from spec/source timestamps. */
+  staleDomainCount: number;
+}
+
 export interface AuditReport {
   generatedAt: string;
-  summary: {
-    totalFunctions: number;
-    coveredFunctions: number;
-    coveragePct: number;
-    uncoveredCount: number;
-    hubGapCount: number;
-    orphanRequirementCount: number;
-    staleDomainCount: number;
-  };
+  mappingCoverage: MappingCoverageStatus;
+  summary: AuditCoverageSummary;
   uncoveredFunctions: AuditUncoveredFunction[];
   hubGaps: AuditUncoveredFunction[];
   orphanRequirements: AuditOrphanRequirement[];
   staleDomains: AuditStaleDomain[];
+  /** Structural scenario observations; a reaching test is never proof of an assertion. */
+  scenarioVerification?: {
+    caveat: string;
+    scenarios: Array<{
+      domain: string;
+      specFile: string;
+      requirement: string;
+      scenario: string;
+      checkability: 'checkable' | 'unverifiable-shape';
+      shapeReason?: string;
+      label: 'verification-path-exists' | 'no-reaching-test' | 'not-assessable';
+      reason?: string;
+      tests: Array<{ file: string; test: string }>;
+      /** Number found before the per-scenario name cap; a traversal cap may lower this. */
+      testCount?: number;
+      testsTruncated?: boolean;
+    }>;
+  };
 }
 
 // ============================================================================
 // DECISIONS
 // ============================================================================
+
+export type DecisionScope =
+  | 'local'        // single file, no cross-cutting concern
+  | 'component'    // single component/service/module boundary
+  | 'cross-domain' // touches multiple spec domains or service contracts
+  | 'system';      // global constraint (auth, data model, infra, API protocol)
+
+/**
+ * Terminal verdict a draft receives from consolidation
+ * (change: explain-decision-rejection). A draft may no longer simply stop
+ * existing: every input draft carries one of these, and `pending` is the honest
+ * state of a draft consolidation has not reached yet — never a silent rejection.
+ */
+export type DecisionDisposition = 'pending' | 'promoted' | 'merged-into' | 'rejected';
+
+/**
+ * Stable reason codes for a disposition. Source-declared (see
+ * `DECISION_DISPOSITION_REASONS` in `src/core/decisions/disposition.ts`) so a
+ * caller can branch on the code and a human can read the description.
+ */
+export type DecisionDispositionReason =
+  | 'promoted-as-recorded'
+  | 'promoted-with-rewrite'
+  | 'merged-into-consolidated'
+  | 'superseded-by-later-draft'
+  | 'not-in-consolidated-set'
+  | 'no-supporting-diff'
+  | 'awaiting-consolidation'
+  | 'legacy-unknown';
+
+/**
+ * The author's own words, kept verbatim when consolidation re-derives a
+ * decision's content from the diff (change: explain-decision-rejection).
+ * Recorded text is never rewritten in place — the served content and what the
+ * author actually wrote are both readable.
+ */
+export interface AuthorStatement {
+  title: string;
+  rationale: string;
+  recordedAt: string;
+}
 
 export type DecisionStatus =
   | 'draft'         // recorded by agent during dev session
@@ -394,8 +814,43 @@ export type DecisionStatus =
   | 'verified'      // cross-checked against diff — has code evidence
   | 'phantom'       // recorded but no matching code change found
   | 'approved'      // human/agent approved for sync
+  | 'auto-approved' // accepted by decision autopilot: synced to specs, awaiting optional human review
   | 'rejected'      // human/agent rejected
   | 'synced';       // written to spec files
+
+export type DecisionConstraintEligibilityStatus = 'eligible' | 'ineligible' | 'unclassified';
+
+export type DecisionConstraintEligibility =
+  | { status: 'unclassified' }
+  | { status: 'ineligible'; reason: string }
+  | {
+      status: 'eligible';
+      /** The concrete repository property covered by the declared rules. */
+      enforcedBoundary: string;
+      /** The part of the decision that still requires human judgment. */
+      humanReviewRemainder?: string;
+    };
+
+interface DecisionConstraintBase {
+  /** Stable within the governing decision. */
+  id: string;
+  /** Repository-relative path prefix that bounds where this rule is evaluated. */
+  scope: string;
+  reason?: string;
+}
+
+export type DecisionConstraintRule =
+  | (DecisionConstraintBase & { kind: 'layers'; layers: Record<string, string[]> })
+  | (DecisionConstraintBase & { kind: 'forbidden'; from: string; to: string })
+  | (DecisionConstraintBase & { kind: 'allowedOnly'; module: string; mayDependOn: string[] });
+
+export interface DecisionConstraintBlock {
+  /** Open integer so unsupported persisted versions can be reported, never cast away. */
+  version: number;
+  /** Absence is normalized to the honest unclassified state. */
+  eligibility?: DecisionConstraintEligibility;
+  rules: DecisionConstraintRule[];
+}
 
 /** A single architectural decision recorded during a dev session. */
 export interface PendingDecision {
@@ -413,35 +868,309 @@ export interface PendingDecision {
   affectedDomains: string[];
   affectedFiles: string[];
 
+  /**
+   * Structural anchors binding this decision to the code it describes, resolved
+   * deterministically against the call graph at record time. Optional and
+   * additive: legacy decisions recorded before anchoring fall back to file-level
+   * freshness derived from `affectedFiles`. See {@link StructuralAnchor}.
+   */
+  anchors?: StructuralAnchor[];
+
   /** ID of a prior decision this one supersedes (agent signals a reversal) */
   supersedes?: string;
+
+  /**
+   * Terminal verdict from consolidation and its stable reason
+   * (change: explain-decision-rejection). Additive: a record written before this
+   * existed reads as `legacy-unknown`, never as a rejection.
+   */
+  disposition?: DecisionDisposition;
+  dispositionReason?: DecisionDispositionReason;
+  /** Set exactly when `disposition` is `merged-into`: the surviving decision's id. */
+  mergedIntoId?: string;
+  /** When the disposition was assigned (ISO). */
+  dispositionAt?: string;
+  /**
+   * The agent-recorded title/rationale, retained verbatim when consolidation
+   * re-derived the served content. Present only when the two differ.
+   */
+  authorStatement?: AuthorStatement;
 
   // Provenance
   sessionId: string;
   recordedAt: string;
   consolidatedAt?: string;
   verifiedAt?: string;
+  /** Origin of free text that a reviewer must treat as untrusted until approval. */
+  contentOrigin: 'agent-recorded' | 'llm-extracted' | 'legacy-unknown';
+
+  // Scope — gates ADR creation: only cross-domain and system produce ADRs
+  scope?: DecisionScope;
+  /**
+   * The scope the author passed explicitly at record time, if any. Consolidation keeps
+   * it instead of the LLM's classification, so an author's `--scope system` is not
+   * silently lowered. Absent when the scope was inferred. (issue #512)
+   */
+  authorScope?: DecisionScope;
+
+  /**
+   * Optional deterministic architecture constraints governed by this decision's
+   * lifecycle (change: add-decision-bound-code-constraints). Legacy records omit
+   * the block and remain valid and unclassified.
+   */
+  constraints?: DecisionConstraintBlock;
+  /** Retained lifecycle tombstone while an older durable projection still exists. */
+  durableLifecycleConflict?: boolean;
 
   // Verification output
   confidence: 'high' | 'medium' | 'low';
+  /** Evidence basis for the verification verdict; absent on legacy decisions. */
+  verificationEvidence?: 'git-diff' | 'none';
   evidenceFile?: string;
 
   // Review
   reviewedAt?: string;
   reviewNote?: string;
+  /**
+   * Who accepted this decision: 'human' (explicit approve) or 'autopilot'
+   * (decision autopilot auto-accepted it). Absent on decisions accepted before
+   * this field existed — treated as 'human'. Provenance is never silently
+   * upgraded: a later human review sets humanReviewedAt, it does not rewrite
+   * approvedBy. (change: add-decision-autopilot)
+   */
+  approvedBy?: 'human' | 'autopilot';
+  /** Set when a human reviewed (promoted or rejected) an auto-accepted decision. */
+  humanReviewedAt?: string;
 
   // Sync tracking
   syncedAt?: string;
   syncedToSpecs: string[];
 }
 
-/** Persistent store written to .spec-gen/decisions/pending.json */
+/** Persistent store written to .openlore/decisions/pending.json */
 export interface DecisionStore {
   version: '1';
   /** Cleared when a new session starts (new commit cycle) */
   sessionId: string;
   updatedAt: string;
+  /**
+   * Monotonic write counter for atomic compare-and-swap on save
+   * (change: harden-memory-integrity-invariant). Additive — defaults to 0 for
+   * legacy stores written before this field existed.
+   */
+  sequence?: number;
   /** Set after consolidation runs — gate uses this to skip no_decisions_recorded warning */
   lastConsolidatedAt?: string;
+  /** Hash of the changed source snapshot assessed by the last consolidation. */
+  lastConsolidatedSourceFingerprint?: string;
   decisions: PendingDecision[];
+}
+
+// ============================================================================
+// CODE-ANCHORED MEMORY (change: add-code-anchored-memory-staleness)
+// ============================================================================
+
+/**
+ * A structural anchor binds a persisted memory to the code it describes so that
+ * the memory can self-invalidate deterministically when that code changes or
+ * dies. Resolution and freshness use only static analysis — no LLM.
+ *
+ * - Symbol-level anchor: `nodeId` + `symbolName` set, `contentHash` is the hash
+ *   of the function's source span captured at record time.
+ * - File-level anchor: only `filePath` set (with optional `contentHash` = the
+ *   file's content hash at record time). Used when no symbol resolves, and for
+ *   legacy decisions backfilled from `affectedFiles`.
+ */
+export interface StructuralAnchor {
+  /** Call-graph node id; absent for a file-level anchor. */
+  nodeId?: string;
+  /**
+   * Content-addressed, location-independent stable id of the anchored symbol
+   * (add-content-addressed-stable-symbol-ids). Recorded alongside `nodeId` so a
+   * symbol that is later moved/renamed can be re-resolved when its `nodeId` no
+   * longer matches. Absent on anchors recorded before this change and on symbols
+   * with no derivable stable id — both keep their exact current behavior.
+   */
+  stableId?: string;
+  /** Symbol name resolved at record time; absent for a pure file-level anchor. */
+  symbolName?: string;
+  /** Repo-relative path of the anchored file. Always present. */
+  filePath: string;
+  /**
+   * Hash of the anchored span at record time. For a symbol anchor, the function
+   * source span; for a file anchor, the whole-file content. Absent for a truly
+   * legacy file anchor with no captured baseline (only existence can be checked).
+   */
+  contentHash?: string;
+  /**
+   * Provenance recorded when this anchor was carried across an unambiguous
+   * rename/move (add-symbol-identity-continuity). The identity fields above were
+   * re-pointed from `from` to the current symbol; `contentHash` keeps its original
+   * baseline so the freshness check still reports `fresh` (exact-body carry) or
+   * `drifted` (the rename changed the span). Additive + auditable: a wrong carry
+   * can be traced back. Absent on anchors that never moved.
+   */
+  carriedAcross?: ContinuityProvenance;
+  /**
+   * Disclosure for an orphaned symbol anchor whose disappeared symbol had MORE
+   * than one equally-plausible destination after a re-analysis
+   * (add-symbol-identity-continuity). No carry-forward occurs (ambiguity is never
+   * resolved by guessing); these are the candidate new locations
+   * (`filePath::symbolName`) for a human/agent to reconcile. Absent unless an
+   * ambiguous move was detected for this anchor.
+   */
+  possiblyMovedTo?: string[];
+}
+
+/** How a symbol's identity moved between two indexed states (add-symbol-identity-continuity). */
+export type ContinuityReason = 'renamed' | 'moved' | 'renamed-and-moved';
+
+/**
+ * The evidence basis for a continuity match (add-symbol-identity-continuity):
+ * - `exact-body` — the new symbol's source span is byte-identical to the old one
+ *   (a pure move; the name did not change).
+ * - `exact-signature` — the new span is identical to the old one EXCEPT the symbol's
+ *   own name changed (a rename), verified by substituting the new name back to the
+ *   old name and confirming it hashes to the recorded baseline span — NOT a mere
+ *   parameter-shape match.
+ * Both are admitted only on a strict one-to-one match; anything ambiguous yields
+ * no pair (see {@link StructuralAnchor.possiblyMovedTo}).
+ */
+export type ContinuityBasis = 'exact-body' | 'exact-signature';
+
+/** Recorded when an anchor is carried across a rename/move. */
+export interface ContinuityProvenance {
+  /** The prior symbol the anchor was carried from. */
+  from: { symbolName?: string; filePath: string };
+  reason: ContinuityReason;
+  basis: ContinuityBasis;
+  /** HEAD commit SHA at carry time (deterministic, read from git); absent outside a repo. */
+  atCommit?: string;
+}
+
+/** Deterministic freshness verdict for a single anchor or an aggregated memory. */
+export type MemoryFreshness = 'fresh' | 'drifted' | 'orphaned';
+
+/** Highest-significance symbol retained in a stale-region receipt. */
+export interface StaleRegionSymbol {
+  id: string;
+  name: string;
+  filePath: string;
+  fanIn: number;
+  fanOut: number;
+}
+
+/** Per-file structural contribution persisted beside a stale mark. */
+export interface StaleFileComposition {
+  symbolCount: number;
+  hubCount: number;
+  chokepointCount: number;
+  topSymbol?: StaleRegionSymbol;
+}
+
+/** Aggregate context for the explicitly stale region. */
+export interface StaleRegionComposition extends StaleFileComposition {
+  fileCount: number;
+  /** Stale files whose resident node facts were unavailable for classification. */
+  unclassifiedFileCount?: number;
+}
+
+/** The freshness of one anchor, with the new location when a rename was detected. */
+export interface AnchorVerdict {
+  anchor: StructuralAnchor;
+  freshness: MemoryFreshness;
+  /** New location when the anchored symbol was confidently renamed/relocated. */
+  relocatedTo?: string;
+  /**
+   * True when this verdict is `drifted` ONLY because the symbol sits in an
+   * explicitly-marked stale region whose topology a budget-exceeded incremental
+   * update did not recompute — the symbol's own span is unchanged. Lets callers
+   * explain "not yet reconciled" vs "the code itself changed"
+   * (fix-transitive-incremental-staleness).
+   */
+  staleRegion?: boolean;
+  /** Structural context for the stale region; never changes the drifted verdict. */
+  staleRegionComposition?: StaleRegionComposition;
+}
+
+/**
+ * Evidence behind a `fresh` verdict (add-trust-calibrated-context-economy). The
+ * exact span and hash OpenLore already compared to produce `fresh` — surfaced so
+ * an agent can cite it and skip re-reading the source. Never attached to a
+ * `drifted` or `orphaned` fact.
+ */
+export interface GroundingCertificate {
+  /** Resolved symbol name; absent for a file-level certificate. */
+  symbol?: string;
+  /** Repo-relative path of the verified file. */
+  filePath: string;
+  /** 1-based inclusive line range of the verified span, when known. */
+  lineSpan?: { start: number; end: number };
+  /** Hash of the verified span — the same hash the freshness check compared. */
+  contentHash: string;
+}
+
+/**
+ * Closed set of caller-supplied memory classifications (add-bitemporal-typed-memory-operations).
+ * Caller-supplied label only — never inferred or classified by an LLM. An absent or
+ * unrecognized value resolves to `note`, so legacy memories and unlabeled writes behave as today.
+ */
+export type MemoryType =
+  | 'invariant'
+  | 'gotcha'
+  | 'rationale'
+  | 'convention'
+  | 'preference'
+  | 'todo'
+  | 'note';
+
+/** The seven valid memory types, for runtime validation/normalization. */
+export const MEMORY_TYPES: readonly MemoryType[] = [
+  'invariant', 'gotcha', 'rationale', 'convention', 'preference', 'todo', 'note',
+];
+
+/**
+ * A general, code-anchored agent memory (kind `note`) — the substrate behind the
+ * `remember`/`recall` tools. Stored separately from the decision gate in
+ * .openlore/memory/notes.json so it never touches the commit pipeline.
+ */
+export interface AnchoredMemory {
+  /** Stable 8-char id derived from content + resolved anchors (content-anchor dedup). */
+  id: string;
+  kind: 'note';
+  content: string;
+  anchors: StructuralAnchor[];
+  recordedAt: string;
+  /** Free-form retrieval tags (optional). */
+  tags?: string[];
+  /**
+   * Caller-supplied classification from the closed {@link MemoryType} set; absent ⇒ `note`.
+   * (add-bitemporal-typed-memory-operations) Never inferred.
+   */
+  type?: MemoryType;
+  /**
+   * Bitemporal valid-time marker: the `HEAD` commit SHA at record time, read from git
+   * (deterministic, no LLM). Absent for legacy memories ⇒ treated as always-valid.
+   * (add-bitemporal-typed-memory-operations)
+   */
+  validFromCommit?: string;
+  /** Transaction-time of invalidation (ISO); set when this memory is superseded. */
+  invalidatedAt?: string;
+  /** The `HEAD` commit SHA at the time this memory was invalidated. */
+  invalidatedByCommit?: string;
+  /** Id of the prior memory this one supersedes (provenance for the lifecycle op). */
+  supersedes?: string;
+}
+
+/** Persistent store written to .openlore/memory/notes.json */
+export interface MemoryStore {
+  version: '1';
+  updatedAt: string;
+  /**
+   * Monotonic write counter for atomic compare-and-swap on save
+   * (change: harden-memory-integrity-invariant). Additive — defaults to 0 for
+   * legacy stores written before this field existed.
+   */
+  sequence?: number;
+  memories: AnchoredMemory[];
 }

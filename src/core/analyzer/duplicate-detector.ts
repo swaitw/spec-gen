@@ -12,6 +12,7 @@
 
 import { createHash } from 'node:crypto';
 import type { CallGraphResult } from './call-graph.js';
+import { buildLineIndex, lineFromIndex } from './line-index.js';
 
 // ============================================================================
 // TYPES
@@ -123,30 +124,120 @@ const KEYWORDS = new Set([
 // NORMALIZATION
 // ============================================================================
 
-function stripComments(text: string): string {
-  // // single-line (JS/TS/Go/Rust/Java)
-  text = text.replace(/\/\/[^\n]*/g, '');
-  // # single-line (Python/Ruby)
-  text = text.replace(/#[^\n]*/g, '');
-  // /* */ multi-line
-  text = text.replace(/\/\*[\s\S]*?\*\//g, '');
-  // Python """ and ''' docstrings
-  text = text.replace(/"""[\s\S]*?"""/g, '');
-  text = text.replace(/'''[\s\S]*?'''/g, '');
-  return text;
+/**
+ * Languages where `#` begins a line comment. The `#` line-comment rule is applied
+ * ONLY for these; in C-family languages `#` is code (JS `#private` fields, C
+ * preprocessor `#include`, Rust `#[attr]`, Swift `#selector`, Lua `#len`), so
+ * stripping it there truncated real code. Matched case-insensitively against the
+ * call graph's language display names (`node.language`). An unknown/undefined
+ * language falls back to treating `#` as a comment — the pre-fix behavior, whose
+ * original target was Python/Ruby.
+ */
+const HASH_LINE_COMMENT_LANGUAGES = new Set([
+  'python', 'ruby', 'elixir', 'bash', 'shell', 'sh', 'zsh', 'php',
+  'perl', 'r', 'powershell', 'coffeescript', 'nim', 'crystal',
+  'toml', 'yaml', 'dockerfile', 'makefile', 'terraform', 'hcl',
+]);
+
+function hashStartsLineComment(language?: string): boolean {
+  if (!language) return true; // legacy default: `#` was Python/Ruby-targeted
+  return HASH_LINE_COMMENT_LANGUAGES.has(language.toLowerCase());
+}
+
+/**
+ * Strip comments from a function body WITHOUT corrupting string literals.
+ *
+ * A single left-to-right scan classifies each character as code, string, or
+ * comment. Comment/docstring characters are removed; string-literal CONTENTS are
+ * preserved verbatim, so two bodies differing only in a literal (a URL host, a
+ * hex color) stay distinguishable. This replaces the old string-blind regex
+ * passes, whose line- and block-comment rules ran over raw text and truncated a
+ * literal at the first comment-looking marker inside it (`//` in a URL, `#` in a
+ * hex color or anchor, Ruby `#{...}` interpolation, JS `#private`).
+ *
+ * `hashIsComment` selects the `#` line-comment rule (see `hashStartsLineComment`).
+ * Triple-quoted `"""`/`'''` blocks are removed as docstrings (unchanged
+ * behavior). Escapes inside a string are honored so `"\""` does not terminate
+ * early. An unterminated string or block comment runs to end-of-input —
+ * degrading to the old over-stripping, never to something worse.
+ */
+function stripComments(text: string, hashIsComment: boolean): string {
+  const n = text.length;
+  let out = '';
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    const c2 = text[i + 1];
+
+    // Line comment: //
+    if (c === '/' && c2 === '/') {
+      let j = i + 2;
+      while (j < n && text[j] !== '\n') j++;
+      i = j;
+      continue;
+    }
+    // Block comment: /* ... */
+    if (c === '/' && c2 === '*') {
+      let j = i + 2;
+      while (j < n && !(text[j] === '*' && text[j + 1] === '/')) j++;
+      i = Math.min(n, j + 2); // consume the closing */
+      continue;
+    }
+    // Line comment: # (language-selected)
+    if (c === '#' && hashIsComment) {
+      let j = i + 1;
+      while (j < n && text[j] !== '\n') j++;
+      i = j;
+      continue;
+    }
+    // Triple-quoted docstring: """ ... """ or ''' ... ''' → removed
+    if ((c === '"' || c === "'") && text[i + 1] === c && text[i + 2] === c) {
+      const q = c;
+      let j = i + 3;
+      while (j < n && !(text[j] === q && text[j + 1] === q && text[j + 2] === q)) j++;
+      i = Math.min(n, j + 3); // consume the closing triple-quote
+      continue;
+    }
+    // String literal: " ... ", ' ... ', ` ... ` → contents preserved
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c;
+      out += c;
+      let j = i + 1;
+      while (j < n) {
+        const cj = text[j];
+        if (cj === '\\') {
+          // Escape sequence: copy the backslash and the escaped char verbatim.
+          out += cj;
+          if (j + 1 < n) out += text[j + 1];
+          j += 2;
+          continue;
+        }
+        out += cj;
+        j++;
+        if (cj === q) break; // closing delimiter reached
+      }
+      i = j;
+      continue;
+    }
+
+    // Ordinary code character
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /** Type 1: strip comments + collapse whitespace */
-function normalizeType1(text: string): string {
-  return stripComments(text).replace(/\s+/g, ' ').trim();
+function normalizeType1(text: string, language?: string): string {
+  return stripComments(text, hashStartsLineComment(language)).replace(/\s+/g, ' ').trim();
 }
 
 /**
  * Type 2: Type 1 + replace non-keyword identifiers with sequential placeholders.
  * Same identifier name → same placeholder within the function scope.
  */
-function normalizeType2(text: string): string {
-  const base = normalizeType1(text);
+function normalizeType2(text: string, language?: string): string {
+  const base = normalizeType1(text, language);
   const seen = new Map<string, string>();
   let counter = 0;
   return base.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (match) => {
@@ -168,7 +259,22 @@ function tokenize(normalizedText: string): string[] {
   return normalizedText.match(/\S+/g) ?? [];
 }
 
+/**
+ * How many shingle sets have been built. Exact, deterministic instrumentation for the one property
+ * that memory and timing can only measure flakily: that a set is built for at most
+ * `MAX_NEAR_FUNCTIONS` bodies rather than for every function in the repository.
+ */
+let _shingleBuilds = 0;
+
+/** Test-only: read and reset the shingle-construction counter. */
+export function _takeShingleBuildCountForTesting(): number {
+  const n = _shingleBuilds;
+  _shingleBuilds = 0;
+  return n;
+}
+
 function getShingles(tokens: string[], k = SHINGLE_SIZE): Set<string> {
+  _shingleBuilds++;
   const s = new Set<string>();
   for (let i = 0; i <= tokens.length - k; i++) {
     s.add(tokens.slice(i, i + k).join('\x00'));
@@ -178,8 +284,13 @@ function getShingles(tokens: string[], k = SHINGLE_SIZE): Set<string> {
 
 function jaccard(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 && b.size === 0) return 1;
+  // Iterate the SMALLER set and probe the larger: the intersection is symmetric, so
+  // the cost is min(|a|,|b|) rather than |a|. It matters because `findClones` puts a
+  // caller-supplied query on one side of every comparison — iterating the query's set
+  // let the caller set the per-candidate cost of a whole-repo scan.
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
   let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
+  for (const x of small) if (large.has(x)) inter++;
   return inter / (a.size + b.size - inter);
 }
 
@@ -187,16 +298,23 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 // LINE NUMBER HELPERS
 // ============================================================================
 
-/** Compute 1-based line number of a byte offset in source text */
-function byteOffsetToLine(content: string, byteOffset: number): number {
-  // Count newlines before the offset
-  let line = 1;
-  const end = Math.min(byteOffset, content.length);
-  for (let i = 0; i < end; i++) {
-    if (content[i] === '\n') line++;
-  }
-  return line;
-}
+/**
+ * 1-based line number of a byte offset, via a per-file newline index.
+ *
+ * The obvious version counts newlines from index 0 on every call, which is O(offset) — and this is
+ * called twice per function, BEFORE the size filters, so the repository-wide cost is
+ * Σ(functions × file length). That is quadratic in exactly the wrong variable: a long file with
+ * many functions pays its own length once per function. Measured on microsoft/TypeScript, whose
+ * `checker.ts` alone is ~3 MB: 85.5s of pure line-counting, against 0.23s for this version — the
+ * same work, 371× less of it. A 17× growth in node count had produced a 170× growth in time.
+ *
+ * The index is built once per file and binary-searched. `MAX_NEAR_FUNCTIONS` bounds the O(n²)
+ * near-clone pass further down, and on a large repository that pass is skipped entirely — so the
+ * constant that looks like this file's safety valve was guarding the cheap path while this ran
+ * unbounded.
+ */
+// Both live in `line-index.ts` — the same quadratic line-counting appeared in the import
+// parser, where it was 50% of an entire analyze run on a large file.
 
 // ============================================================================
 // MAIN FUNCTION
@@ -218,25 +336,43 @@ export function detectDuplicates(
     instance: CloneInstance;
     t1Hash: string;
     t2Hash: string;
-    shingles: Set<string>;
+    /**
+     * Enough to rebuild the shingle set on demand. The set itself is NOT kept: it is read only by
+     * the near-clone pass, which is gated to at most `MAX_NEAR_FUNCTIONS` entries, so building one
+     * per function was pure waste on every repository above that gate — which is most of them.
+     * Measured on a 3,500-file repository: 1,270 MB of shingle strings, none of them ever read,
+     * and the peak of the entire analyze run.
+     */
+    startIndex: number;
+    endIndex: number;
+    language: string;
   }
 
   const entries: Entry[] = [];
+  // One newline index per FILE, not per function: the nodes of a file are visited together, and
+  // rebuilding it per node would restore the quadratic cost this replaced.
+  const lineIndexCache = new Map<string, number[]>();
 
   for (const node of callGraph.nodes.values()) {
     const content = fileContentMap.get(node.filePath);
     if (!content) continue;
 
+    let lineIndex = lineIndexCache.get(node.filePath);
+    if (lineIndex === undefined) {
+      lineIndex = buildLineIndex(content);
+      lineIndexCache.set(node.filePath, lineIndex);
+    }
+
     // Compute line numbers from byte offsets
-    const startLine = byteOffsetToLine(content, node.startIndex);
-    const endLine = byteOffsetToLine(content, node.endIndex);
+    const startLine = lineFromIndex(lineIndex, node.startIndex);
+    const endLine = lineFromIndex(lineIndex, node.endIndex);
     const lineCount = endLine - startLine + 1;
 
     if (lineCount < MIN_LINES) continue;
 
     const body = content.slice(node.startIndex, node.endIndex);
-    const t1 = normalizeType1(body);
-    const t2 = normalizeType2(body);
+    const t1 = normalizeType1(body, node.language);
+    const t2 = normalizeType2(body, node.language);
     const tokens = tokenize(t2);
 
     if (tokens.length < MIN_TOKENS) continue;
@@ -251,7 +387,9 @@ export function detectDuplicates(
       },
       t1Hash: sha16(t1),
       t2Hash: sha16(t2),
-      shingles: getShingles(tokens),
+      startIndex: node.startIndex,
+      endIndex: node.endIndex,
+      language: node.language,
     });
   }
 
@@ -306,6 +444,19 @@ export function detectDuplicates(
     .filter(e => !alreadyGrouped.has(e.origIdx));
 
   if (ungrouped.length >= 2 && ungrouped.length <= MAX_NEAR_FUNCTIONS) {
+    // Built HERE, for at most `MAX_NEAR_FUNCTIONS` bodies, rather than for every function during
+    // extraction. Recomputing costs one re-slice + normalize + tokenize per surviving entry, which
+    // is bounded and small; keeping them for everything was unbounded and, above this gate,
+    // entirely unused.
+    const shinglesOf = new Map<number, Set<string>>();
+    for (let i = 0; i < ungrouped.length; i++) {
+      const e = ungrouped[i];
+      const content = fileContentMap.get(e.instance.file);
+      shinglesOf.set(i, content === undefined
+        ? new Set<string>()
+        : getShingles(tokenize(normalizeType2(content.slice(e.startIndex, e.endIndex), e.language))));
+    }
+
     const nearGrouped = new Set<number>(); // indices into `ungrouped`
 
     for (let i = 0; i < ungrouped.length; i++) {
@@ -314,7 +465,7 @@ export function detectDuplicates(
 
       for (let j = i + 1; j < ungrouped.length; j++) {
         if (nearGrouped.has(j)) continue;
-        const sim = jaccard(ungrouped[i].shingles, ungrouped[j].shingles);
+        const sim = jaccard(shinglesOf.get(i)!, shinglesOf.get(j)!);
         if (sim >= NEAR_THRESHOLD) {
           group.push(j);
           nearGrouped.add(j);
@@ -323,10 +474,15 @@ export function detectDuplicates(
 
       if (group.length >= 2) {
         nearGrouped.add(i);
-        // Use minimum pairwise similarity as the group's score (conservative)
+        // Group score = the ALL-PAIRS minimum similarity (the honest floor). Computing it
+        // seed-vs-member only overstated cohesion: two members each 0.85-similar to the seed
+        // can be far less similar to each other. Groups are tiny (bounded by the near pass), so
+        // O(group²) is negligible.
         let minSim = 1.0;
-        for (let k = 1; k < group.length; k++) {
-          minSim = Math.min(minSim, jaccard(ungrouped[i].shingles, ungrouped[group[k]].shingles));
+        for (let a = 0; a < group.length; a++) {
+          for (let b = a + 1; b < group.length; b++) {
+            minSim = Math.min(minSim, jaccard(shinglesOf.get(group[a])!, shinglesOf.get(group[b])!));
+          }
         }
         const repIdx = group[0];
         cloneGroups.push({
@@ -365,4 +521,204 @@ export function detectDuplicates(
       cloneGroupCount: cloneGroups.length,
     },
   };
+}
+
+// ============================================================================
+// ONE-VS-ALL CLONE QUERY
+// ============================================================================
+//
+// `detectDuplicates` answers the whole-repo audit question (every clone group),
+// and its near-clone (Type 3) pass is O(n²) so it is skipped above
+// MAX_NEAR_FUNCTIONS. `findClones` answers the edit-time question — "what
+// existing functions are clones of THIS one body?" — by comparing a single
+// query against every indexed function. That is O(n), so it computes near
+// clones of the query even on repos where the whole-repo pass declines to run.
+//
+// It reuses the exact same normalization, shingling, Jaccard, and evidence
+// thresholds as `detectDuplicates`: no new algorithm, clone type, or constant.
+
+/** Evidence floor (lines) for a clone-query — same threshold as the whole-repo detector. */
+export const CLONE_MIN_LINES = MIN_LINES;
+/** Evidence floor (normalized tokens) for a clone-query — same threshold as the whole-repo detector. */
+export const CLONE_MIN_TOKENS = MIN_TOKENS;
+/** Default near-clone Jaccard floor — same threshold as the whole-repo detector. */
+export const CLONE_NEAR_THRESHOLD = NEAR_THRESHOLD;
+
+/** Hard lower bound on a caller-supplied near-clone similarity floor. */
+const NEAR_FLOOR_MIN = 0.1;
+
+/** The minimum node shape `findClones` needs — satisfied by both `FunctionNode` and its serialized form. */
+export interface CloneQueryNode {
+  filePath: string;
+  name: string;
+  className?: string;
+  startIndex: number;
+  endIndex: number;
+  /** Source language of the node, surfaced on each match so cross-language matches are visible. */
+  language?: string;
+}
+
+export interface CloneMatch {
+  type: CloneType;
+  /** 1.0 for exact/structural; rounded Jaccard for near. */
+  similarity: number;
+  file: string;
+  functionName: string;
+  className?: string;
+  startLine: number;
+  endLine: number;
+  /**
+   * The match's source language. Normalization is language-agnostic, so a `near` match CAN be in a
+   * different language than the query (cross-language clones are out of scope — see the tool docs);
+   * surfacing the language makes that disclosed limitation actionable rather than implied by the path.
+   */
+  language?: string;
+}
+
+export interface CloneQueryOptions {
+  /** Near-clone Jaccard floor for this query (default CLONE_NEAR_THRESHOLD, clamped to [0.1, 1]). */
+  minSimilarity?: number;
+  /** Cap on returned matches (default: unlimited). */
+  limit?: number;
+  /**
+   * Exclude the query's own instance (symbol mode), identified by its file + byte range. The byte
+   * range (not the name) is the identity: it is unique per file and collision-proof, so the query is
+   * never wrongly matched against itself and a different function is never wrongly excluded.
+   */
+  exclude?: { filePath: string; startIndex: number; endIndex: number };
+  /**
+   * The query's source language (symbol mode: the node's language; snippet mode: unknown). It
+   * governs the `#` line-comment rule for BOTH the query and every candidate, so the comparison is
+   * one consistent linguistic lens — a `#`-comment Python candidate is never spuriously matched to
+   * a `#`-code TS query. Undefined (snippet mode) falls back to the legacy `#`-as-comment default.
+   */
+  queryLanguage?: string;
+}
+
+export interface CloneQueryResult {
+  matches: CloneMatch[];
+  /** Query was below the evidence floor (too few lines/tokens) — no comparison performed. */
+  belowThreshold: boolean;
+  /** Number of indexed functions actually compared against (above their own evidence floor). */
+  comparedAgainst: number;
+  /** The near-clone similarity floor used (after clamping). */
+  similarityFloor: number;
+}
+
+const CLONE_TYPE_RANK: Record<CloneType, number> = { exact: 0, structural: 1, near: 2 };
+
+/**
+ * Find the existing functions that are clones of a single query body.
+ *
+ * @param queryBody       raw source of the query (a function body, or a snippet)
+ * @param queryLineCount  line span of the query (for the evidence floor)
+ * @param files           source contents keyed by the same paths the nodes use
+ * @param nodes           indexed functions to compare against (Map values or serialized array)
+ */
+export function findClones(
+  queryBody: string,
+  queryLineCount: number,
+  files: Array<{ path: string; content: string }>,
+  nodes: Iterable<CloneQueryNode>,
+  options: CloneQueryOptions = {},
+): CloneQueryResult {
+  // NaN-safe: `??` only catches null/undefined, so a non-finite minSimilarity (e.g. a CLI
+  // `--min foo` → parseFloat → NaN, or Infinity) would otherwise propagate to a NaN floor that
+  // silently drops every near match and serializes as `null`. Coerce non-finite to the default.
+  const requestedFloor = Number.isFinite(options.minSimilarity as number)
+    ? (options.minSimilarity as number)
+    : NEAR_THRESHOLD;
+  const floor = Math.min(1, Math.max(NEAR_FLOOR_MIN, requestedFloor));
+
+  // The query's language governs the `#` rule for the query AND every candidate, so both sides of
+  // each comparison share one linguistic lens (see `queryLanguage`).
+  const lang = options.queryLanguage;
+
+  // ---- Fingerprint the query ----
+  const qT1 = normalizeType1(queryBody, lang);
+  const qT2 = normalizeType2(queryBody, lang);
+  const qTokens = tokenize(qT2);
+  if (queryLineCount < MIN_LINES || qTokens.length < MIN_TOKENS) {
+    return { matches: [], belowThreshold: true, comparedAgainst: 0, similarityFloor: floor };
+  }
+  const qT1Hash = sha16(qT1);
+  const qT2Hash = sha16(qT2);
+  const qShingles = getShingles(qTokens);
+
+  const fileContentMap = new Map(files.map(f => [f.path, f.content]));
+  const matches: CloneMatch[] = [];
+  let comparedAgainst = 0;
+  // Same per-file newline index as `detectDuplicates`. This path is an MCP tool (`find_clones`),
+  // so the cost was paid on EVERY request rather than once per analyze.
+  const lineIndexCache = new Map<string, number[]>();
+
+  for (const node of nodes) {
+    const content = fileContentMap.get(node.filePath);
+    if (!content) continue;
+
+    let lineIndex = lineIndexCache.get(node.filePath);
+    if (lineIndex === undefined) {
+      lineIndex = buildLineIndex(content);
+      lineIndexCache.set(node.filePath, lineIndex);
+    }
+
+    // Skip the query's own instance (symbol mode) before any work or counting. Identity is the
+    // file + byte range (collision-proof), never the name.
+    if (
+      options.exclude &&
+      node.filePath === options.exclude.filePath &&
+      node.startIndex === options.exclude.startIndex &&
+      node.endIndex === options.exclude.endIndex
+    ) {
+      continue;
+    }
+
+    const startLine = lineFromIndex(lineIndex, node.startIndex);
+    const endLine = lineFromIndex(lineIndex, node.endIndex);
+    if (endLine - startLine + 1 < MIN_LINES) continue;
+
+    const body = content.slice(node.startIndex, node.endIndex);
+    const tokens = tokenize(normalizeType2(body, lang));
+    if (tokens.length < MIN_TOKENS) continue;
+
+    comparedAgainst++;
+
+    const base = {
+      file: node.filePath,
+      functionName: node.name,
+      className: node.className,
+      startLine,
+      endLine,
+      language: node.language,
+    };
+
+    if (sha16(normalizeType1(body, lang)) === qT1Hash) {
+      matches.push({ type: 'exact', similarity: 1.0, ...base });
+    } else if (sha16(normalizeType2(body, lang)) === qT2Hash) {
+      matches.push({ type: 'structural', similarity: 1.0, ...base });
+    } else {
+      const sim = jaccard(qShingles, getShingles(tokens));
+      if (sim >= floor) {
+        matches.push({ type: 'near', similarity: Math.round(sim * 100) / 100, ...base });
+      }
+    }
+  }
+
+  // Fully deterministic order: exact → structural → near, similarity desc, then a tie-break that
+  // disambiguates every distinct match — file, startLine, endLine, then function name — so two
+  // functions can never collide on the sort key (which would otherwise leave the final order at the
+  // mercy of input iteration order). Byte-identical across re-evaluations of a fixed query/index.
+  const cmpStr = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0);
+  matches.sort(
+    (a, b) =>
+      CLONE_TYPE_RANK[a.type] - CLONE_TYPE_RANK[b.type] ||
+      b.similarity - a.similarity ||
+      cmpStr(a.file, b.file) ||
+      a.startLine - b.startLine ||
+      a.endLine - b.endLine ||
+      cmpStr(a.functionName, b.functionName),
+  );
+
+  const limited = options.limit && options.limit > 0 ? matches.slice(0, options.limit) : matches;
+  return { matches: limited, belowThreshold: false, comparedAgainst, similarityFloor: floor };
 }

@@ -1,5 +1,5 @@
 /**
- * Standardized logging interface for spec-gen
+ * Standardized logging interface for openlore
  *
  * Provides semantic log levels with specific visual treatments:
  * - DISCOVERY: Finding files, detecting patterns, scanning directories
@@ -12,6 +12,8 @@
 
 import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { sanitizeForTerminal } from './misc.js';
 
 export type LogLevel = 'discovery' | 'analysis' | 'inference' | 'success' | 'warning' | 'error' | 'debug';
 
@@ -28,6 +30,26 @@ const defaultOptions: LoggerOptions = {
   noColor: false,
   timestamps: false,
 };
+
+interface LoggerRequestContext {
+  options: Partial<LoggerOptions>;
+  /** API quiet means no console writes at all; configured CLI quiet still shows errors. */
+  muteAll: boolean;
+}
+
+const loggerOptionsStorage = new AsyncLocalStorage<LoggerRequestContext>();
+
+/**
+ * Run a host request with logger options that are local to its async call chain.
+ * Concurrent API calls therefore cannot mute or reconfigure each other's output.
+ */
+export function withLoggerOptions<T>(options: Partial<LoggerOptions>, callback: () => T): T {
+  const inherited = loggerOptionsStorage.getStore();
+  return loggerOptionsStorage.run({
+    options: { ...inherited?.options, ...options },
+    muteAll: inherited?.muteAll === true || options.quiet === true,
+  }, callback);
+}
 
 /**
  * Semantic prefixes for each log level.
@@ -90,19 +112,28 @@ export class Logger {
    * Get current options
    */
   getOptions(): LoggerOptions {
-    return { ...this.options };
+    const context = loggerOptionsStorage.getStore();
+    return {
+      ...this.options,
+      ...context?.options,
+      ...(context?.muteAll ? { quiet: true } : {}),
+    };
   }
 
   /**
    * Format a message with optional timestamp
    */
   private formatMessage(level: LogLevel, message: string): string {
-    const prefix = isTTY && !this.options.noColor ? PREFIXES_EMOJI[level] : PREFIXES_ASCII[level];
-    const colorFn = this.options.noColor ? (s: string) => s : COLORS[level];
+    const options = this.getOptions();
+    const prefix = isTTY && !options.noColor ? PREFIXES_EMOJI[level] : PREFIXES_ASCII[level];
+    const colorFn = options.noColor ? (s: string) => s : COLORS[level];
 
-    let formattedMessage = `${prefix} ${message}`;
+    // Messages routinely carry repository-derived text (paths, symbol names). Strip
+    // control sequences here, once, rather than at every call site — the prefix and
+    // the color wrapper below are added afterwards, so OpenLore's own color survives.
+    let formattedMessage = `${prefix} ${sanitizeForTerminal(message, { keepNewlines: true })}`;
 
-    if (this.options.timestamps) {
+    if (options.timestamps) {
       const timestamp = new Date().toISOString();
       formattedMessage = `[${timestamp}] ${formattedMessage}`;
     }
@@ -114,13 +145,15 @@ export class Logger {
    * Core log method
    */
   private log(level: LogLevel, message: string): void {
+    if (loggerOptionsStorage.getStore()?.muteAll) return;
+    const options = this.getOptions();
     // In quiet mode, only show errors
-    if (this.options.quiet && level !== 'error') {
+    if (options.quiet && level !== 'error') {
       return;
     }
 
     // Debug messages only show in verbose mode
-    if (level === 'debug' && !this.options.verbose) {
+    if (level === 'debug' && !options.verbose) {
       return;
     }
 
@@ -204,8 +237,9 @@ export class Logger {
    * @returns Spinner control object with succeed/fail/stop methods
    */
   spinner(message: string): SpinnerController {
+    const options = this.getOptions();
     // Don't show spinners in quiet mode or CI (timestamps mode)
-    if (this.options.quiet || this.options.timestamps) {
+    if (options.quiet || options.timestamps) {
       // Return a no-op controller
       return new SpinnerController(null, this);
     }
@@ -221,7 +255,7 @@ export class Logger {
       spinner: 'dots',
     });
 
-    if (!this.options.noColor) {
+    if (!options.noColor) {
       spinner.start();
     } else {
       // In no-color mode, just print the message
@@ -250,7 +284,7 @@ export class Logger {
    * Print a blank line (respects quiet mode)
    */
   blank(): void {
-    if (!this.options.quiet) {
+    if (!this.getOptions().quiet) {
       console.log();
     }
   }
@@ -259,10 +293,12 @@ export class Logger {
    * Print a section header
    */
   section(title: string): void {
-    if (this.options.quiet) return;
+    title = sanitizeForTerminal(title);
+    const options = this.getOptions();
+    if (options.quiet) return;
 
     this.blank();
-    if (this.options.noColor) {
+    if (options.noColor) {
       console.log(`=== ${title} ===`);
     } else {
       console.log(chalk.bold.underline(title));
@@ -274,9 +310,12 @@ export class Logger {
    * Print a key-value pair for summaries
    */
   info(key: string, value: string | number): void {
-    if (this.options.quiet) return;
+    key = sanitizeForTerminal(key);
+    if (typeof value === 'string') value = sanitizeForTerminal(value);
+    const options = this.getOptions();
+    if (options.quiet) return;
 
-    if (this.options.noColor) {
+    if (options.noColor) {
       console.log(`  ${key}: ${value}`);
     } else {
       console.log(`  ${chalk.dim(key + ':')} ${value}`);
@@ -287,10 +326,12 @@ export class Logger {
    * Print a list item
    */
   listItem(item: string, indent: number = 0): void {
-    if (this.options.quiet) return;
+    item = sanitizeForTerminal(item);
+    const options = this.getOptions();
+    if (options.quiet) return;
 
     const prefix = '  '.repeat(indent) + '•';
-    if (this.options.noColor) {
+    if (options.noColor) {
       console.log(`${prefix} ${item}`);
     } else {
       console.log(`${chalk.dim(prefix)} ${item}`);

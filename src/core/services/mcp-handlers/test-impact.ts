@@ -1,0 +1,786 @@
+/**
+ * Deterministic Test Impact Selection (spec-19) — static, call-graph-based
+ * regression test selection (RTS) served to the agent at edit time.
+ *
+ * "I changed parseConfig() — which tests should I run?" is answered by walking the
+ * call graph *backward* from the change to every test that transitively reaches it.
+ * grep can't (the reach is through indirect calls); the model is slow and guesses;
+ * a deterministic graph does it instantly over edges we already store (`calls`,
+ * `tested_by`, inheritance).
+ *
+ * change: fix-test-selection-soundness
+ * change: add-test-selection-safeguard-tiers
+ *
+ * Soundness is stated honestly: this is an OVER-APPROXIMATE PRIORITIZER, not a
+ * sound replacement for the full suite. Direct/static dispatch is safely
+ * over-approximated; dynamic dispatch, reflection, and DI can under-select.
+ */
+
+import { validateDirectory, readCachedContext, diagnoseIndexUnservable } from './utils.js';
+import { resolveFederationScope, findCrossRepoTests } from '../../federation/resolver.js';
+import { loadTraversalIndex } from './traversal.js';
+import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
+import { SUBGRAPH_MAX_DEPTH_LIMIT } from '../../../constants.js';
+import { assembleBoundary, buildPairEdgeIndex, computeStaleness, edgeBasisWithinSet } from './confidence-boundary.js';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { isTestFile } from '../../analyzer/test-file.js';
+import { gitPathArgs } from '../../../utils/git-args.js';
+import { execFileGit } from '../../../utils/git-exec.js';
+import {
+  loadDynamicBoundaryReport,
+  dynamicBoundaryCrossing,
+} from './dynamic-boundary-disclosure.js';
+import {
+  computeSymbolChangedSet,
+  coverSeedFiles,
+  granularityCaveat,
+  granularityReceipt,
+  importsAddedCaveat,
+  noChangeClaim,
+  seededUnchangedCaveat,
+  narrowSeedsToChangedSymbols,
+  type ChangeGranularityReceipt,
+  type DiffEntry,
+  type SymbolChangedSet,
+} from '../symbol-changed-set.js';
+
+export interface SelectTestsInput {
+  directory: string;
+  /** Explicit changed symbols (function/method names). */
+  changedSymbols?: string[];
+  /** Git ref to diff the working tree against (e.g. "HEAD", "main"). */
+  diffRef?: string;
+  /** Max backward-reachability depth (default 12, capped). */
+  maxDepth?: number;
+  /**
+   * Restrict backward reachability to directly-resolved edges only, ignoring
+   * synthesized dynamic-dispatch edges (spec: add-synthesized-dynamic-dispatch-edges).
+   * Default false (synthesized edges are traversed, so tests reaching changed code
+   * only through a callback/event/route are still selected).
+   */
+  directResolvedOnly?: boolean;
+  /**
+   * Opt in to federation scope: also select tests in consumer repos that reach a
+   * call site of a changed published symbol. (change: add-multi-repo-federation)
+   */
+  federation?: boolean;
+  /** Restrict the federation scope to these registry repo names (default: all). */
+  federationRepos?: string[];
+}
+
+type Confidence = 'high' | 'medium' | 'low';
+const CONF_RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * Why a test was selected (change: add-test-selection-safeguard-tiers). The always-select tiers are
+ * git facts that do not depend on the graph reaching anything; they outrank reachability because
+ * missing them is unrecoverable — the test the user just edited or added is exactly the one to run.
+ */
+export const SELECTION_REASON = {
+  newTest: 'included: new test',
+  changedTest: 'included: test file itself changed',
+  reaches: (depth: number) => `included: reaches changed symbol at depth ${depth}`,
+  sameFile: 'included: tests a function in the same file as a changed symbol',
+} as const;
+
+/** Reason strength: a lower number is the stronger, tier-first receipt. */
+function reasonRank(reason: string): number {
+  if (reason === SELECTION_REASON.newTest) return 0;
+  if (reason === SELECTION_REASON.changedTest) return 1;
+  if (reason === SELECTION_REASON.sameFile) return 3;
+  return 2;
+}
+
+/** Tier first, then the shallower reaching depth (numerically — "depth 10" is weaker than "depth 2"). */
+function compareReasons(a: string, b: string): number {
+  const depth = (reason: string) => Number(/depth (\d+)$/.exec(reason)?.[1] ?? 0);
+  return reasonRank(a) - reasonRank(b) || depth(a) - depth(b) || a.localeCompare(b);
+}
+
+/** A whole test file selected by a tier before the analysis indexed any test in it. */
+const WHOLE_FILE_TEST = '*';
+
+interface SelectedTest {
+  test: string;
+  file: string;
+  viaPath: string[];
+  confidence: Confidence;
+  /** The strongest reason this test was selected. */
+  reason: string;
+  /** Every other reason that also selected it, strongest first. */
+  alsoIncludedBecause?: string[];
+  /**
+   * The reaching path crosses synthesized (heuristically recovered) edges: how many, and the rules
+   * that produced them. Absent when the path rests on direct resolution only, or the test was selected
+   * by a tier rather than a path. Existing provenance labels only — no score.
+   */
+  structuralBasis?: { synthesizedEdges: number; synthesizedBy: string[] };
+}
+
+/** Resolve changed symbols → seed production nodes (exact name preferred). */
+export function seedsFromSymbols(cg: SerializedCallGraph, symbols: string[]): FunctionNode[] {
+  return resolveSymbolSeeds(cg, symbols).seeds;
+}
+
+interface SymbolSeedResolution {
+  seeds: FunctionNode[];
+  widened: Array<{ query: string; count: number; examples: Array<{ name: string; file: string }> }>;
+}
+
+const WIDENED_SYMBOL_EXAMPLE_LIMIT = 8;
+
+/**
+ * Cap on `changedSymbols`, mirroring the tool schema's advertised `maxItems: 100`.
+ * The schema bound is now enforced at the transport, but this handler is also called
+ * in-process (blast_radius, the CLI), so the bound lives where the cost is paid:
+ * resolution is synchronous and scans the whole node set per symbol, and every MISS
+ * takes the more expensive substring branch — so the cheapest request to author is
+ * the most expensive to serve.
+ */
+const MAX_CHANGED_SYMBOLS = 100;
+
+/** Resolve symbols and retain the substring-fallback receipt for callers that disclose it. */
+function resolveSymbolSeeds(cg: SerializedCallGraph, symbols: string[]): SymbolSeedResolution {
+  const out = new Map<string, FunctionNode>();
+  const widened: SymbolSeedResolution['widened'] = [];
+
+  // One pass over the graph builds the lowercased name index every symbol then probes,
+  // instead of two filters (with a per-node `toLowerCase()` allocation) PER SYMBOL.
+  // Positions are retained so a match list is assembled in cg.nodes order — byte-for-byte
+  // the order the old `cg.nodes.filter(...)` produced, which seeds and `examples` depend on.
+  const byLowerName = new Map<string, Array<{ i: number; node: FunctionNode }>>();
+  cg.nodes.forEach((n, i) => {
+    if (n.isExternal || n.isTest) return;
+    const key = n.name.toLowerCase();
+    const bucket = byLowerName.get(key);
+    if (bucket) bucket.push({ i, node: n });
+    else byLowerName.set(key, [{ i, node: n }]);
+  });
+  const inNodeOrder = (hits: Array<{ i: number; node: FunctionNode }>): FunctionNode[] =>
+    hits.slice().sort((a, b) => a.i - b.i).map(h => h.node);
+
+  for (const sym of symbols) {
+    const lower = sym.toLowerCase();
+    if (lower.trim().length === 0) continue;
+    const exact = inNodeOrder(byLowerName.get(lower) ?? []);
+    const fallback = exact.length === 0
+      ? inNodeOrder(
+        [...byLowerName.entries()]
+          .filter(([name]) => name.includes(lower))
+          .flatMap(([, hits]) => hits),
+      )
+      : [];
+    const pick = exact.length > 0 ? exact : fallback;
+    if (fallback.length > 0) {
+      widened.push({
+        query: sym,
+        count: fallback.length,
+        examples: fallback
+          .map(n => ({ name: n.name, file: n.filePath }))
+          .sort((a, b) => a.file.localeCompare(b.file) || a.name.localeCompare(b.name))
+          .slice(0, WIDENED_SYMBOL_EXAMPLE_LIMIT),
+      });
+    }
+    for (const n of pick) out.set(n.id, n);
+  }
+  return { seeds: [...out.values()], widened };
+}
+
+/** Tolerant file match: exact or suffix either way. */
+function fileMatches(nodeFile: string, changed: string): boolean {
+  if (nodeFile === changed) return true;
+  const a = nodeFile.replace(/^\/+/, ''), b = changed.replace(/^\/+/, '');
+  return a === b || a.endsWith('/' + b) || b.endsWith('/' + a);
+}
+
+/** Resolve changed files (from a diff) → seed production nodes. */
+export function seedsFromFiles(cg: SerializedCallGraph, files: string[]): FunctionNode[] {
+  const out = new Map<string, FunctionNode>();
+  for (const n of cg.nodes) {
+    if (n.isExternal || n.isTest) continue;
+    if (files.some(f => fileMatches(n.filePath, f))) out.set(n.id, n);
+  }
+  return [...out.values()];
+}
+
+/** Test identity for dedup across the two discovery paths. */
+function testKey(file: string, name: string): string {
+  return `${file}\0${name}`;
+}
+
+/**
+ * Select the tests that transitively reach a set of changed symbols/files.
+ * Read-only, deterministic, offline. Returns `unknown` (additive-by-cast).
+ */
+export async function handleSelectTests(
+  input: SelectTestsInput,
+  /**
+   * In-process reuse only (never part of the advertised MCP schema): the changed-set a composing
+   * caller already computed for the SAME base ref and diff. `blast_radius` and `briefing_since` both
+   * compose this handler, and re-deriving the set costs a second round of git reads and parses for
+   * a provably identical answer.
+   */
+  precomputed?: { changedSet?: SymbolChangedSet },
+): Promise<unknown> {
+  const absDir = await validateDirectory(input.directory);
+  const ctx = await readCachedContext(absDir);
+  if (!ctx) return await diagnoseIndexUnservable(absDir);
+  if (!ctx.callGraph) return { error: 'Call graph not available. Re-run analyze_codebase.' };
+
+  const cg = ctx.callGraph as SerializedCallGraph;
+  const maxDepth = Math.max(1, Math.min(input.maxDepth ?? 12, SUBGRAPH_MAX_DEPTH_LIMIT));
+
+  // ── Resolve the changed set ────────────────────────────────────────────────
+  // Precedence: explicit changedSymbols → diffRef → default to the working-tree
+  // diff vs HEAD. The default matters for weak tool-callers (e.g. a local model
+  // in Pi) that invoke select_tests with NO arguments: rather than erroring,
+  // a bare call answers the most common intent — "which tests cover my current
+  // uncommitted changes?". The result flags that it defaulted, so it's never
+  // mysterious.
+  const hasSymbols = !!(input.changedSymbols && input.changedSymbols.length > 0);
+  if (hasSymbols && input.changedSymbols!.length > MAX_CHANGED_SYMBOLS) {
+    return {
+      error:
+        `changedSymbols too long: ${input.changedSymbols!.length} symbols (max ${MAX_CHANGED_SYMBOLS}). ` +
+        'Pass diffRef to select tests for a whole diff instead of enumerating symbols.',
+    };
+  }
+  if (hasSymbols && input.changedSymbols!.some(symbol => symbol.trim().length === 0)) {
+    return { error: 'changedSymbols must contain non-empty symbol names.' };
+  }
+  const baseRef = input.diffRef && input.diffRef.length > 0 ? input.diffRef : 'HEAD';
+  const defaultedToHead = !hasSymbols && (input.diffRef === undefined || input.diffRef === '');
+
+  let seeds: FunctionNode[];
+  let widenedSymbolResolutions: SymbolSeedResolution['widened'] = [];
+  let changedFiles: string[] = [];
+  /** Test files the diff touched, by tier, relative to the analyzed directory (change: add-test-selection-safeguard-tiers). */
+  const tierFiles: Array<{ file: string; reason: string }> = [];
+  /** `false` when untracked files could not be listed, so a brand-new untracked test may be missing. */
+  let untrackedAssessed = true;
+  /** Untracked test files past {@link MAX_UNTRACKED_TIER_FILES}, disclosed rather than dropped silently. */
+  let untrackedOmitted = 0;
+  /** How precise the diff's changed-set was (change: add-symbol-content-hashes). Diff path only. */
+  let changeGranularity: ChangeGranularityReceipt | undefined;
+  /** Production symbols in the changed files before narrowing to the ones that changed. */
+  let fileSeedCount = 0;
+  /** Seeds kept for a reason other than their own change (naming one, or a dynamic-dispatch site). */
+  let seededUnchanged = 0;
+  if (hasSymbols) {
+    const resolution = resolveSymbolSeeds(cg, input.changedSymbols!);
+    seeds = resolution.seeds;
+    widenedSymbolResolutions = resolution.widened;
+  } else {
+    try {
+      const { getChangedFiles } = await import('../../drift/git-diff.js');
+      const diff = await getChangedFiles({ rootPath: absDir, baseRef, includeUnstaged: true });
+      changedFiles = diff.files.map(f => f.path);
+      const fileSeeds = seedsFromFiles(cg, changedFiles);
+      fileSeedCount = fileSeeds.length;
+      const narrowed = await narrowToChangedSymbols(absDir, baseRef, diff.files, cg, fileSeeds, precomputed?.changedSet);
+      seeds = narrowed.seeds;
+      changeGranularity = narrowed.receipt;
+      seededUnchanged = narrowed.seededUnchanged ?? 0;
+      // A test file the diff touched, or a new untracked one, is selected on its own standing — not
+      // only if reachability happens to reach it. Only a file the analyzer's own rule calls a test, inside
+      // the analyzed directory, and still on disk: a fixture under `test/`, another package's test, or a
+      // test deleted in the working tree has nothing to run here.
+      const prefix = await gitPrefix(absDir);
+      const tierFileSet = new Set<string>();
+      for (const f of diff.files) {
+        if (f.status === 'deleted') continue;
+        // The test rule is applied in the analyzed directory's frame, as the analyzer applies it: under
+        // an analyzed `tests/app/`, `src/util.ts` is production code.
+        const local = localPath(f.path, prefix);
+        if (!local || !isTestFile(local) || tierFileSet.has(local) || !existsSync(join(absDir, local))) continue;
+        tierFileSet.add(local);
+        tierFiles.push({ file: local, reason: f.status === 'added' ? SELECTION_REASON.newTest : SELECTION_REASON.changedTest });
+      }
+      const untracked = await untrackedTestFiles(absDir);
+      if (untracked === null) untrackedAssessed = false;
+      // A path with control characters is not a test anyone wrote on purpose, and one that is not on
+      // disk under the analyzed directory (a planted `core.worktree`) is not this repository's.
+      const untrackedTests = (untracked ?? []).filter(file =>
+        !tierFileSet.has(file) && !hasControlCharacter(file) && existsSync(join(absDir, file)));
+      untrackedOmitted = Math.max(0, untrackedTests.length - MAX_UNTRACKED_TIER_FILES);
+      for (const file of untrackedTests.slice(0, MAX_UNTRACKED_TIER_FILES)) {
+        tierFileSet.add(file);
+        changedFiles.push((prefix ?? '') + file);
+        tierFiles.push({ file, reason: SELECTION_REASON.newTest });
+      }
+    } catch (err) {
+      return { error: `git diff failed (base ${baseRef}): ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (seeds.length === 0 && tierFiles.length === 0) {
+    // Honesty: if federation was opted into, say why no cross-repo selection ran
+    // rather than silently omitting the federation block an active scope implies.
+    const federationRequested = input.federation === true || (input.federationRepos?.length ?? 0) > 0;
+    return {
+      changed: changedFiles,
+      selectedTests: [],
+      message: hasSymbols
+        ? 'No matching production functions found for the given symbols.'
+        : noSymbolChangedMessage(baseRef, defaultedToHead, fileSeedCount, changeGranularity),
+      ...(changeGranularity ? { changeGranularity } : {}),
+      ...(defaultedToHead ? { note: 'Called without changedSymbols/diffRef — diffed the working tree against HEAD. Pass changedSymbols or diffRef to target a specific change.' } : {}),
+      ...(federationRequested ? { federationNote: 'Federation scope was requested, but no changed production symbol resolved in the home repo — cross-repo test selection keys off the home repo\'s changed published symbols, so nothing was propagated. Pass changedSymbols (or a diffRef with code changes) to select across the fleet.' } : {}),
+      soundness: {
+        posture: 'over-approximate',
+        caveats: ['No seeds resolved — nothing to select.', ...(untrackedAssessed ? [] : [UNTRACKED_NOT_ASSESSED])],
+      },
+      coverage: { languages: [], testDetection: 'none' as const },
+      flakiness: FLAKINESS_NOT_ASSESSED,
+      confidenceBoundary: assembleBoundary({ staleness: await computeStaleness(absDir), integrity: ctx?.integrity }),
+    };
+  }
+
+  // ── Backward reachability with path tracking (calls + inheritance) ──────────
+  // Served from the precomputed traversal structure for this artifact generation
+  // rather than a per-call adjacency rebuild (change: optimize-reachability-precompute).
+  // `sortNeighbors` preserves the ascending-caller-id expansion order the `viaPath`
+  // chains below are reconstructed from, so the payload is unchanged.
+  const nodeMap = new Map(cg.nodes.map(n => [n.id, n]));
+  const traversal = await loadTraversalIndex(absDir, cg);
+  const seedIds = new Set(seeds.map(s => s.id));
+  const { depth: depthOf, parent } = traversal.bfsWithParents(
+    seeds.map(s => s.id),
+    'backward',
+    maxDepth,
+    { directResolvedOnly: input.directResolvedOnly },
+    { sortNeighbors: true },
+  );
+  const traversalFilter = { directResolvedOnly: input.directResolvedOnly };
+  const truncatedAtDepth = [...depthOf].some(([id, depth]) =>
+    depth === maxDepth && traversal.neighborIds(id, 'backward', traversalFilter).some(neighbor => !depthOf.has(neighbor)),
+  ) ? maxDepth : undefined;
+
+  // Id path from a reached node down to its seed: [node, …, changedFn].
+  const idPathToSeed = (id: string): string[] => {
+    const ids: string[] = [];
+    let cur: string | undefined = id;
+    const guard = new Set<string>();
+    while (cur !== undefined && !guard.has(cur)) {
+      guard.add(cur);
+      ids.push(cur);
+      if (depthOf.get(cur) === 0) break;
+      cur = parent.get(cur);
+    }
+    return ids;
+  };
+
+  // Path from a reached node down to its seed: [node, …, changedFn].
+  const pathToSeed = (id: string): string[] => {
+    const names: string[] = [];
+    let cur: string | undefined = id;
+    const guard = new Set<string>();
+    while (cur !== undefined && !guard.has(cur)) {
+      guard.add(cur);
+      names.push(nodeMap.get(cur)?.name ?? cur);
+      if (depthOf.get(cur) === 0) break;
+      cur = parent.get(cur);
+    }
+    return names;
+  };
+
+  const byTest = new Map<string, SelectedTest>();
+  const reasonsByTest = new Map<string, Set<string>>();
+  const pairEdges = buildPairEdgeIndex(cg.edges);
+  // The backward walk also crosses `tested_by` associations (production → test), so a reached id path
+  // can run through a test that is not a caller at all. Such a path is not a reaching path.
+  const testedByOnlyPairs = new Set<string>();
+  for (const e of cg.edges) if (e.kind === 'tested_by') testedByOnlyPairs.add(e.callerId + '\x00' + e.calleeId);
+  for (const e of cg.edges) if (e.kind !== 'tested_by') testedByOnlyPairs.delete(e.callerId + '\x00' + e.calleeId);
+  const crossesTestedBy = (ids: string[]): boolean =>
+    testedByOnlyPairs.size > 0 && ids.some((id, i) => i + 1 < ids.length && testedByOnlyPairs.has(id + '\x00' + ids[i + 1]));
+  /** The synthesized edges on a reaching id path `[caller, …, seed]`, by the pair index (direct wins). */
+  const basisOfPath = (ids: string[]): SelectedTest['structuralBasis'] => {
+    let synthesizedEdges = 0;
+    const rules = new Set<string>();
+    for (let i = 0; i + 1 < ids.length; i++) {
+      const edge = pairEdges.get(ids[i] + '\x00' + ids[i + 1]);
+      if (edge?.confidence !== 'synthesized') continue;
+      synthesizedEdges++;
+      rules.add(edge.synthesizedBy ?? 'synthesized');
+    }
+    return synthesizedEdges > 0 ? { synthesizedEdges, synthesizedBy: [...rules].sort() } : undefined;
+  };
+  /** A path basis extended by one more hop that is not on the id path (the `tested_by` edge itself). */
+  const withEdgeBasis = (basis: SelectedTest['structuralBasis'], edge: SerializedCallGraph['edges'][number]): SelectedTest['structuralBasis'] => {
+    if (edge.confidence !== 'synthesized') return basis;
+    const rules = new Set(basis?.synthesizedBy ?? []);
+    rules.add(edge.synthesizedBy ?? 'synthesized');
+    return { synthesizedEdges: (basis?.synthesizedEdges ?? 0) + 1, synthesizedBy: [...rules].sort() };
+  };
+  const add = (
+    file: string,
+    name: string,
+    viaPath: string[],
+    confidence: Confidence,
+    reason: string,
+    structuralBasis?: SelectedTest['structuralBasis'],
+  ) => {
+    const key = testKey(file, name);
+    (reasonsByTest.get(key) ?? reasonsByTest.set(key, new Set()).get(key)!).add(reason);
+    const existing = byTest.get(key);
+    if (!existing || CONF_RANK[confidence] > CONF_RANK[existing.confidence] ||
+        (CONF_RANK[confidence] === CONF_RANK[existing.confidence] && viaPath.length < existing.viaPath.length)) {
+      byTest.set(key, {
+        test: name, file, viaPath, confidence, reason,
+        ...(structuralBasis ? { structuralBasis } : {}),
+      });
+    }
+  };
+
+  // Tiers 1 and 2 — the test files the diff itself touched. Every indexed test in such a file is
+  // selected; a file with none indexed yet (typically brand-new) is selected whole.
+  // Exact path: the loose suffix match seeds use would promote a same-named test in another folder
+  // to an always-select entry.
+  const testsByFile = new Map<string, FunctionNode[]>();
+  if (tierFiles.length > 0) {
+    for (const n of cg.nodes) {
+      if (!n.isTest || n.isExternal) continue;
+      const file = normalizeRelative(n.filePath);
+      (testsByFile.get(file) ?? testsByFile.set(file, []).get(file)!).push(n);
+    }
+  }
+  for (const { file, reason } of tierFiles) {
+    const tests = testsByFile.get(file) ?? [];
+    if (tests.length === 0) add(file, WHOLE_FILE_TEST, [], 'high', reason);
+    for (const t of tests) add(t.filePath, t.name, [t.name], 'high', reason);
+  }
+
+  // Source 1 — test nodes reached by the backward call-walk.
+  for (const [id, depth] of depthOf) {
+    if (depth === 0) continue;
+    const n = nodeMap.get(id);
+    if (!n?.isTest || n.isExternal) continue;
+    const idPath = idPathToSeed(id);
+    if (crossesTestedBy(idPath)) continue;
+    const confidence: Confidence = depth === 1 ? 'high' : depth <= 3 ? 'medium' : 'low';
+    add(n.filePath, n.name, pathToSeed(id), confidence, SELECTION_REASON.reaches(depth), basisOfPath(idPath));
+  }
+
+  // Source 2 — `tested_by` edges on any reached production node (catches import-
+  // based associations whose test node isn't a real call-graph caller).
+  for (const e of cg.edges) {
+    if (e.kind !== 'tested_by') continue;
+    if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
+    if (!depthOf.has(e.callerId)) continue; // production node not in the impacted set
+    const idPath = idPathToSeed(e.callerId);
+    // The backward walk crosses `tested_by` edges too, so a production node can be reached THROUGH
+    // this very test; selecting the test again via that node would serve a cyclic path.
+    if (idPath.includes(e.calleeId) || crossesTestedBy(idPath)) continue;
+    const testFile = e.calleeId.includes('::') ? e.calleeId.split('::')[0] : e.calleeId;
+    const onSeed = seedIds.has(e.callerId);
+    const confidence: Confidence = onSeed ? 'high' : 'medium';
+    add(
+      testFile, e.calleeName, [e.calleeName, ...pathToSeed(e.callerId)], confidence,
+      SELECTION_REASON.reaches((depthOf.get(e.callerId) ?? 0) + 1),
+      withEdgeBasis(basisOfPath(idPath), e),
+    );
+  }
+
+  // Fallback — seeds with no reaching test at all: associate tests of sibling
+  // functions in the same file (newly-added / untested functions), low confidence.
+  // Compute coverage in the inverse direction from every concrete test source.
+  // This preserves seed identity even when same-named symbols or multi-seed paths
+  // collide in the display-only `viaPath` parent tree.
+  let usedFileFallback = false;
+  const testSources = new Set(
+    cg.nodes.filter(n => n.isTest && !n.isExternal && depthOf.has(n.id)).map(n => n.id),
+  );
+  for (const e of cg.edges) {
+    if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
+    if (e.kind === 'tested_by' && e.callerId && depthOf.has(e.callerId)) testSources.add(e.callerId);
+  }
+  const coveredByTest = new Map<string, number>();
+  const coverageQueue = [...testSources];
+  for (const id of coverageQueue) coveredByTest.set(id, 0);
+  for (let head = 0; head < coverageQueue.length; head++) {
+    const id = coverageQueue[head];
+    const depth = coveredByTest.get(id)!;
+    if (depth >= maxDepth) continue;
+    for (const neighbor of traversal.neighborIds(id, 'forward', traversalFilter)) {
+      if (!depthOf.has(neighbor) || coveredByTest.has(neighbor)) continue;
+      coveredByTest.set(neighbor, depth + 1);
+      coverageQueue.push(neighbor);
+    }
+  }
+  for (const s of seeds) {
+    if (coveredByTest.has(s.id)) continue;
+    for (const e of cg.edges) {
+      if (e.kind !== 'tested_by') continue;
+      if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
+      const prod = nodeMap.get(e.callerId);
+      if (!prod || prod.filePath !== s.filePath) continue;
+      const testFile = e.calleeId.includes('::') ? e.calleeId.split('::')[0] : e.calleeId;
+      add(testFile, e.calleeName, [e.calleeName, `(same file as ${s.name})`], 'low', SELECTION_REASON.sameFile);
+      usedFileFallback = true;
+    }
+  }
+
+  // The served `reason` is the one behind the kept entry, so it always agrees with that entry's
+  // `viaPath` and `confidence`; a tier entry is always the kept one (high, one-step path).
+  for (const [key, entry] of byTest) {
+    const others = [...(reasonsByTest.get(key) ?? [])].filter(r => r !== entry.reason).sort(compareReasons);
+    if (others.length > 0) entry.alsoIncludedBecause = others;
+  }
+  const selectedTests = [...byTest.values()].sort(
+    (a, b) => CONF_RANK[b.confidence] - CONF_RANK[a.confidence] ||
+      a.file.localeCompare(b.file) || a.test.localeCompare(b.test),
+  );
+
+  // ── Coverage & soundness (honest, never falsely confident) ──────────────────
+  const seedLangs = [...new Set(seeds.map(s => s.language))].sort();
+  const graphHasTests = cg.nodes.some(n => n.isTest) || cg.edges.some(e => e.kind === 'tested_by');
+  const langsWithTests = new Set(cg.nodes.filter(n => n.isTest).map(n => n.language));
+  // With no changed production symbol (only test files changed) there is no language whose test
+  // detection the selection depends on.
+  const testDetection: 'full' | 'partial' | 'none' | 'not-applicable' =
+    seeds.length === 0 ? 'not-applicable'
+    : !graphHasTests ? 'none'
+    : seedLangs.every(l => langsWithTests.has(l)) ? 'full'
+    : 'partial';
+
+  const caveats: string[] = [
+    'Static call-graph selection is an over-approximate prioritizer, not a sound replacement for the full suite.',
+    'Dynamic dispatch, reflection, and dependency injection can under-select (a relevant test may be missed).',
+  ];
+  if (testDetection === 'none' && selectedTests.length > 0) {
+    caveats.push('No tests were detected in this graph, so reachability selected nothing; only changed or new test files were selected. Verify test-file detection for your languages.');
+  } else if (testDetection === 'none') {
+    caveats.push('No tests were detected in this graph — the selection is empty, not "no tests needed". Verify test-file detection for your languages.');
+  } else if (testDetection === 'partial') {
+    caveats.push(`Test detection is incomplete for some changed languages (${seedLangs.join(', ')}); tests in undetected languages are missing.`);
+  }
+  if (usedFileFallback) {
+    caveats.push('Some seeds had no reaching test; sibling-file tests were included at low confidence (likely newly-added or untested functions).');
+  }
+  if (!untrackedAssessed) caveats.push(UNTRACKED_NOT_ASSESSED);
+  const granularityNote = changeGranularity && granularityCaveat(changeGranularity);
+  if (granularityNote) caveats.push(granularityNote);
+  const importsNote = changeGranularity && importsAddedCaveat(changeGranularity);
+  if (importsNote) caveats.push(importsNote);
+  const seededNote = seededUnchangedCaveat(seededUnchanged);
+  if (seededNote) caveats.push(seededNote);
+  if (untrackedOmitted > 0) {
+    caveats.push(`${untrackedOmitted} more untracked test file(s) beyond the first ${MAX_UNTRACKED_TIER_FILES} were not selected; commit or ignore generated test files, or run the full suite.`);
+  }
+  if (truncatedAtDepth !== undefined) {
+    caveats.push(`Backward reachability was truncated at depth ${truncatedAtDepth}; deeper tests may exist — raise maxDepth or consult report_coverage_gaps.`);
+  }
+  for (const resolution of widenedSymbolResolutions) {
+    const examples = resolution.examples.map(n => `${n.name} (${n.file})`).join(', ');
+    const omitted = resolution.count - resolution.examples.length;
+    caveats.push(
+      `Symbol scope for "${resolution.query}" resolved by substring fallback and may have widened to ${resolution.count} symbol(s): ${examples}` +
+      `${omitted > 0 ? `, and ${omitted} more listed in seeds` : ''}.`,
+    );
+  }
+  if (selectedTests.length === 0 && testDetection !== 'none' && testDetection !== 'not-applicable') {
+    caveats.push(truncatedAtDepth === undefined
+      ? 'No test transitively reaches the change. It may be genuinely untested, or reached only via dynamic dispatch this static analysis cannot see.'
+      : `No test was found within depth ${truncatedAtDepth}; deeper tests may exist beyond the disclosed traversal cap, or the change may be reached only via dynamic dispatch this static analysis cannot see.`);
+  }
+
+  // Confidence boundary: the selection rests on the backward call-walk over the
+  // impacted set; synthesized edges among those nodes mean a test reached the
+  // change through heuristic dispatch. (spec: add-confidence-boundary-disclosure)
+  const impactedIds = new Set(depthOf.keys());
+  const selectBasis = edgeBasisWithinSet(cg.edges, impactedIds);
+  // Federation (opt-in): select tests in consumer repos that reach a call site of
+  // a changed published symbol — the cross-repo blast radius of the change.
+  // (change: add-multi-repo-federation)
+  let federationBlock: Record<string, unknown> | undefined;
+  const fedScope = resolveFederationScope(absDir, { federation: input.federation, federationRepos: input.federationRepos });
+  if (fedScope.active && seeds.length === 0) {
+    federationBlock = {
+      federationNote: 'Federation scope was requested, but no changed production symbol resolved in the home repo — only changed test files were selected, and cross-repo test selection keys off changed published symbols, so nothing was propagated.',
+    };
+  } else if (fedScope.active) {
+    const { tests: crossRepoTests, coverage } = await findCrossRepoTests(fedScope, seeds.map(s => s.name), { maxDepth, directResolvedOnly: input.directResolvedOnly });
+    federationBlock = {
+      crossRepoTests: crossRepoTests.map(t => ({ repo: t.repo, test: t.test.name, file: t.test.file, viaSymbol: t.viaSymbol, confidence: t.depth <= 1 ? 'high' : t.depth <= 3 ? 'medium' : 'low' })),
+      crossRepoTestCount: crossRepoTests.length,
+      reposConsulted: coverage.reposConsulted.map(r => r.name),
+      reposSkipped: coverage.reposSkipped.map(r => ({ name: r.name, state: r.state, reason: r.reason })),
+      caveats: coverage.caveats,
+    };
+  }
+
+  const dynamicCrossing = dynamicBoundaryCrossing(
+    await loadDynamicBoundaryReport(absDir, undefined, { directResolvedOnly: input.directResolvedOnly }),
+    [...seeds.map(s => s.filePath), ...selectedTests.map(t => t.file)],
+  );
+
+  return {
+    changed: hasSymbols ? seeds.map(s => s.name) : changedFiles,
+    seeds: seeds.map(s => ({ name: s.name, file: s.filePath })),
+    ...(changeGranularity ? { changeGranularity } : {}),
+    selectedTests,
+    ...(truncatedAtDepth !== undefined ? { truncatedAtDepth } : {}),
+    ...(defaultedToHead ? { note: 'No changedSymbols/diffRef given — selected tests for your current working-tree changes vs HEAD.' } : {}),
+    ...(federationBlock ? { federation: federationBlock } : {}),
+    soundness: { posture: 'over-approximate' as const, caveats },
+    coverage: { languages: seedLangs, testDetection },
+    // No test-outcome history is read, so no test is labeled flaky — and that absence is stated
+    // rather than implied (change: add-test-selection-safeguard-tiers).
+    flakiness: FLAKINESS_NOT_ASSESSED,
+    // Selection is an over-approximation of what MUST run, but the backward reachability it rests
+    // on is a lower bound: a test that only reaches a seed reflectively is not selected. Name the
+    // sites that make it one (change: disclose-dynamic-boundary-regions).
+    confidenceBoundary: assembleBoundary({
+      basis: selectBasis,
+      staleness: await computeStaleness(absDir),
+      integrity: ctx?.integrity,
+      ...(dynamicCrossing ? { extraCrossings: [dynamicCrossing] } : {}),
+    }),
+  };
+}
+
+/**
+ * The message for a diff that seeded no symbol. It must never claim more than was assessed: the
+ * hashes cover the files that were hashed, the working tree is what was read (a staged edit already
+ * reverted in the working tree reads as no difference), and any file kept whole is named.
+ */
+function noSymbolChangedMessage(
+  baseRef: string,
+  defaultedToHead: boolean,
+  fileSeedCount: number,
+  receipt: ChangeGranularityReceipt | undefined,
+): string {
+  const base = `vs ${baseRef}${defaultedToHead ? ' (defaulted — no changedSymbols or diffRef was given)' : ''}`;
+  if (!receipt || (fileSeedCount === 0 && receipt.changedSymbolsFound === 0)) {
+    return `No changed production functions ${base}. Nothing has changed, the diff touches only non-code files, or analyze_codebase is stale.`;
+  }
+  const claim = noChangeClaim(receipt);
+  return claim.kind === 'unchanged'
+    ? `No production symbol differs from the base ${base}: ${claim.text[0].toLowerCase()}${claim.text.slice(1)}`
+    : `No test was selected ${base}: ${claim.text}`;
+}
+
+/**
+ * Narrow a diff's file-level seeds to the production symbols that changed (change:
+ * add-symbol-content-hashes). Shared by `select_tests`, `blast_radius` and `briefing_since` so they
+ * agree on the changed-set. Fail-soft: a file the changed-set could not assess keeps all its seeds and
+ * is named in the receipt as `not-assessed`.
+ */
+export async function narrowToChangedSymbols(
+  absDir: string,
+  baseRef: string,
+  diff: readonly DiffEntry[],
+  cg: SerializedCallGraph,
+  fileSeeds: FunctionNode[],
+  /** A changed-set a composing caller already computed for this base ref and diff. */
+  precomputedSet?: SymbolChangedSet,
+): Promise<{
+  seeds: FunctionNode[];
+  receipt?: ChangeGranularityReceipt;
+  set?: SymbolChangedSet;
+  seededUnchanged?: number;
+  /** Seed ids that did not themselves change (they name a changed symbol, or hold a dispatch site). */
+  unchangedSeedIds?: ReadonlySet<string>;
+}> {
+  // No file-level seed does NOT mean nothing to say: a moved file's symbols carry ids the index has
+  // never seen, and so does a file added since the last analyze. Computing the set anyway is what
+  // lets the receipt name those files and the claim say "not indexed" instead of "nothing changed".
+  let set: SymbolChangedSet;
+  try {
+    // A reused set is only the same answer when it was computed against the same base; a mismatch
+    // re-computes rather than narrowing against the wrong revision.
+    const reusable = precomputedSet && (precomputedSet.baseRef === undefined || precomputedSet.baseRef === baseRef)
+      ? precomputedSet : undefined;
+    set = reusable ?? await computeSymbolChangedSet({ absDir, baseRef, diff, callGraph: cg });
+  } catch {
+    set = { byFile: new Map(), carried: [] };
+  }
+  set = coverSeedFiles(set, fileSeeds);
+  const seeds = narrowSeedsToChangedSymbols(fileSeeds, set);
+  const indexed = new Set(cg.nodes.map(n => n.id));
+  const unchangedSeedIds = new Set<string>();
+  for (const seed of seeds) {
+    const change = set.byFile.get(seed.filePath);
+    if (change?.granularity === 'symbol'
+        && (change.referencing.includes(seed.id) || change.dynamicDispatch.includes(seed.id))) {
+      unchangedSeedIds.add(seed.id);
+    }
+  }
+  return {
+    seeds,
+    receipt: granularityReceipt(set, id => indexed.has(id)),
+    set,
+    seededUnchanged: unchangedSeedIds.size,
+    unchangedSeedIds,
+  };
+}
+
+/**
+ * Untracked, non-ignored test files: brand-new tests that `git diff` never lists
+ * (change: add-test-selection-safeguard-tiers). Fail-soft — a repository git cannot list yields none.
+ */
+async function untrackedTestFiles(rootPath: string): Promise<string[] | null> {
+  try {
+    const { stdout } = await execFileGit(
+      'git', gitPathArgs('ls-files', '--others', '--exclude-standard', '-z'),
+      { cwd: rootPath, maxBuffer: UNTRACKED_LISTING_MAX_BYTES, timeout: GIT_LISTING_TIMEOUT_MS },
+    );
+    return String(stdout).split('\0').filter(path => path.length > 0 && isTestFile(path)).sort();
+  } catch {
+    // A listing that cannot be taken is disclosed by the caller, never reported as "no new tests".
+    return null;
+  }
+}
+
+/** Bytes of `git ls-files --others` output accepted before the listing is treated as not taken. */
+const UNTRACKED_LISTING_MAX_BYTES = 64 * 1024 * 1024;
+
+/** A git listing that has not returned by then (a held lock, a slow network mount) is treated as not taken. */
+const GIT_LISTING_TIMEOUT_MS = 30_000;
+
+/** Untracked test files selected whole, at most; the rest are disclosed (generated, un-ignored fixtures). */
+const MAX_UNTRACKED_TIER_FILES = 200;
+
+/** Stated rather than implied: no test-outcome history is read, so no test is labeled flaky. */
+const FLAKINESS_NOT_ASSESSED = {
+  assessed: false as const,
+  reason: 'No test-outcome history is read: flakiness at identical inputs is not assessed, and no test is labeled flaky.',
+};
+
+const UNTRACKED_NOT_ASSESSED =
+  'Untracked files could not be listed, so a brand-new untracked test may be missing from this selection.';
+
+/**
+ * The analyzed directory's path inside its git work tree (`pkgs/a/`), `''` at the root, or `undefined`
+ * outside a work tree. Diff paths are repository-relative; call-graph paths are relative to the
+ * analyzed directory.
+ */
+async function gitPrefix(rootPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileGit('git', gitPathArgs('rev-parse', '--show-prefix'), { cwd: rootPath, timeout: GIT_LISTING_TIMEOUT_MS });
+    return String(stdout).trim().replace(/\\/g, '/');
+  } catch {
+    return undefined;
+  }
+}
+
+function hasControlCharacter(path: string): boolean {
+  for (let i = 0; i < path.length; i++) {
+    const code = path.charCodeAt(i);
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+/** A repository-relative diff path in the analyzed directory's frame, or `undefined` outside it. */
+function localPath(repoPath: string, prefix: string | undefined): string | undefined {
+  const path = normalizeRelative(repoPath);
+  if (!prefix) return path;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : undefined;
+}
+
+function normalizeRelative(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+}

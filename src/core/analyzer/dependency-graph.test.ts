@@ -72,6 +72,35 @@ describe('DependencyGraphBuilder', () => {
   });
 
   describe('Basic Graph Construction', () => {
+    it('excludes tooling files and gives root config clusters a stable honest name', async () => {
+      const dotfile = await createFile(tempDir, '.mcp.json', '{}');
+      const packageJson = await createFile(tempDir, 'package.json', '{}');
+      const gitignore = await createFile(tempDir, '.gitignore', 'node_modules');
+      const tooling = createScoredFile({ absolutePath: dotfile, name: '.mcp.json', extension: '.json' });
+      tooling.tooling = true;
+
+      const result = await buildDependencyGraph([
+        tooling,
+        createScoredFile({ absolutePath: packageJson, name: 'package.json', extension: '.json', isConfig: true }),
+        createScoredFile({ absolutePath: gitignore, name: '.gitignore', extension: '', isConfig: true }),
+      ], { rootDir: tempDir });
+
+      expect(result.nodes.map(node => node.file.name)).not.toContain('.mcp.json');
+      expect(result.clusters).toHaveLength(1);
+      expect(result.clusters[0].suggestedDomain).toBe('(root config)');
+      expect(result.clusters[0].suggestedDomain).toMatch(/^\([^)]*\)$|^[a-z0-9]/i);
+    });
+
+    it('does not label unrelated root source files as configuration', async () => {
+      const main = await createFile(tempDir, 'main.py', 'def main(): pass');
+      const report = await createFile(tempDir, 'report.py', 'def report(): pass');
+      const result = await buildDependencyGraph([
+        createScoredFile({ absolutePath: main, name: 'main.py', extension: '.py' }),
+        createScoredFile({ absolutePath: report, name: 'report.py', extension: '.py' }),
+      ], { rootDir: tempDir });
+      expect(result.clusters[0].suggestedDomain).toBe('main');
+    });
+
     it('should create nodes for all files', async () => {
       const fileA = await createFile(tempDir, 'a.ts', 'export const a = 1;');
       const fileB = await createFile(tempDir, 'b.ts', 'export const b = 2;');
@@ -135,6 +164,26 @@ describe('DependencyGraphBuilder', () => {
       const result = await buildDependencyGraph(files, { rootDir: tempDir });
 
       expect(result.edges).toHaveLength(0);
+    });
+
+    it('surfaces modifier-prefixed exports on the node (parity with the shared parser)', async () => {
+      // Regression for fix-export-parser-fidelity: the dep-graph node's `exports`
+      // come straight from the shared parseJSExports, so `export async function`
+      // must appear here — not only in the public-surface consumer that used to
+      // recover it locally.
+      const fileA = await createFile(
+        tempDir,
+        'a.ts',
+        'export async function loadData() {}\nexport abstract class Store {}',
+      );
+      const files: ScoredFile[] = [createScoredFile({ absolutePath: fileA, name: 'a.ts' })];
+
+      const result = await buildDependencyGraph(files, { rootDir: tempDir });
+      const node = result.nodes.find((n) => n.file.name === 'a.ts');
+      const exportNames = node?.exports.map((e) => e.name) ?? [];
+
+      expect(exportNames).toContain('loadData');
+      expect(exportNames).toContain('Store');
     });
 
     it('should handle type-only imports with lower weight', async () => {
@@ -476,6 +525,41 @@ describe('DependencyGraphBuilder', () => {
 
       const apiCluster = result.clusters.find(c => c.name === 'src/api');
       expect(apiCluster?.suggestedDomain).toBe('api');
+    });
+
+    it('derives a business domain from a Java Maven package path (not build noise)', async () => {
+      const dir = 'src/main/java/com/example/inventory';
+      await mkdir(join(tempDir, dir), { recursive: true });
+      const fileA = await createFile(tempDir, `${dir}/StockLevel.java`, 'class StockLevel {}');
+      const fileB = await createFile(tempDir, `${dir}/Warehouse.java`, 'class Warehouse {}');
+
+      const files: ScoredFile[] = [
+        createScoredFile({ absolutePath: fileA, name: 'StockLevel.java', extension: '.java', directory: dir }),
+        createScoredFile({ absolutePath: fileB, name: 'Warehouse.java', extension: '.java', directory: dir }),
+      ];
+
+      const result = await buildDependencyGraph(files, { rootDir: tempDir });
+
+      const cluster = result.clusters.find(c => c.name === dir);
+      // Must be the leaf package "inventory" — not "main", "java", or "com".
+      expect(cluster?.suggestedDomain).toBe('inventory');
+    });
+
+    it('maps a Java services package to the canonical "services" domain', async () => {
+      const dir = 'src/main/java/com/acme/service';
+      await mkdir(join(tempDir, dir), { recursive: true });
+      const fileA = await createFile(tempDir, `${dir}/OrderService.java`, 'class OrderService {}');
+      const fileB = await createFile(tempDir, `${dir}/UserService.java`, 'class UserService {}');
+
+      const files: ScoredFile[] = [
+        createScoredFile({ absolutePath: fileA, name: 'OrderService.java', extension: '.java', directory: dir }),
+        createScoredFile({ absolutePath: fileB, name: 'UserService.java', extension: '.java', directory: dir }),
+      ];
+
+      const result = await buildDependencyGraph(files, { rootDir: tempDir });
+
+      const cluster = result.clusters.find(c => c.name === dir);
+      expect(cluster?.suggestedDomain).toBe('services');
     });
 
     it('should calculate cluster cohesion and coupling', async () => {
@@ -1005,7 +1089,7 @@ export function d() {}
       const barId = `${fileB}::bar`;
       injectCallGraphEdges(
         depGraph,
-        [{ callerId: fooId, calleeId: barId }],
+        [{ callerId: fooId, calleeId: barId, confidence: 'name_only' }],
         id => (id === fooId ? fileA : id === barId ? fileB : undefined),
       );
 
@@ -1013,7 +1097,38 @@ export function d() {}
       expect(depGraph.edges).toHaveLength(1);
       expect(depGraph.edges[0].source).toBe(fileA);
       expect(depGraph.edges[0].target).toBe(fileB);
+      expect(depGraph.edges[0].resolutionConfidence).toBe('name_only');
       expect(depGraph.statistics.avgDegree).toBeGreaterThan(0);
+    });
+
+    it('injectCallGraphEdges does not duplicate a file pair that already has an import edge (#138)', async () => {
+      // Java/Kotlin keep cross-package imports AND same-package call refs, so
+      // injection runs even when import edges exist — it must not double-count.
+      const fileA = await createFile(tempDir, 'src/main/java/com/acme/A.java', '');
+      const fileB = await createFile(tempDir, 'src/main/java/com/acme/B.java', '');
+      const files = [
+        createScoredFile({ absolutePath: fileA, name: 'A.java', extension: '.java', directory: 'src/main/java/com/acme' }),
+        createScoredFile({ absolutePath: fileB, name: 'B.java', extension: '.java', directory: 'src/main/java/com/acme' }),
+      ];
+      const depGraph = await buildDependencyGraph(files, { rootDir: tempDir });
+      // Simulate a pre-existing import edge A→B.
+      depGraph.edges.push({ source: fileA, target: fileB, importedNames: ['B'], isTypeOnly: false, weight: 1 });
+
+      injectCallGraphEdges(
+        depGraph,
+        [
+          { callerId: `${fileA}::a`, calleeId: `${fileB}::b` }, // A→B: already an import edge
+          { callerId: `${fileB}::b`, calleeId: `${fileA}::a` }, // B→A: new same-package edge
+        ],
+        (nodeId) => (nodeId.startsWith(fileA) ? fileA : nodeId.startsWith(fileB) ? fileB : undefined),
+      );
+
+      // A→B not duplicated; B→A added as a fresh call edge.
+      const ab = depGraph.edges.filter(e => e.source === fileA && e.target === fileB);
+      const ba = depGraph.edges.filter(e => e.source === fileB && e.target === fileA);
+      expect(ab).toHaveLength(1);
+      expect(ba).toHaveLength(1);
+      expect(ba[0].isCallEdge).toBe(true);
     });
 
     it('injectCallGraphEdges deduplicates multiple calls between the same two files', async () => {

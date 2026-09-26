@@ -1,5 +1,14 @@
 name: CI
 
+# Every action is pinned to an immutable commit SHA with the human-readable version
+# in a trailing comment. A tag like `@v6` is a moving pointer: whoever controls the
+# action repo can re-point it at new code, and it runs here with this workflow's
+# token. Dependabot's `github-actions` ecosystem proposes the SHA bumps.
+#
+# `persist-credentials: false` on checkout: by default it writes the job token into
+# `.git/config`, leaving it readable by every later step (including anything a
+# dependency's install script does). No job here pushes, so none of them need it.
+
 on:
   push:
     branches: [main]
@@ -9,22 +18,56 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull-request runs are cancelled; runs on main are not, so a push to the
+  # default branch always ends up with a completed run rather than a cancelled one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
           cache: 'npm'
+
+      # Runs BEFORE `npm ci`: it only reads package-lock.json, so it is the cheapest
+      # possible failure, and it names its own remedy.
+      #
+      # A dependency that ships its own npm-shrinkwrap.json can pin nested tarballs with
+      # no `integrity` field (@earendil-works/pi-* does, in every release so far). npm
+      # copies those entries verbatim, and `npm ci` then installs bytes it cannot verify.
+      # `src/workflow-security.test.ts` catches the result, but it catches it three jobs
+      # and ten minutes later, in a Unit Tests failure that does not look like a lockfile
+      # problem. This step is the same assertion, said in the place where it is actionable.
+      - name: Check lockfile integrity digests
+        run: npm run lock:integrity:check
 
       - run: npm ci
 
       - name: Audit dependencies
-        run: npm audit --audit-level=high
+        # Gate ALL dependencies (prod + dev) at high severity. Most transitive
+        # advisories are pinned to patched versions via `overrides`; the few with no
+        # applicable fix are listed, with a reason and a clearing condition, in the
+        # gate's ALLOWLIST. The gate also fails on a stale allowlist entry, so an
+        # exception cannot outlive its cause.
+        run: npm run audit:gate
+
+      # `prepublishOnly` lists this check, but nothing ever runs that script: the
+      # release packs with `npm pack` and publishes with `--ignore-scripts`. Without
+      # this step the unreferenced-dependency guard runs in zero automated places.
+      - name: Audit for unreferenced dependencies
+        run: npm run audit:deps
 
       - name: Run ESLint
         run: npm run lint
@@ -35,28 +78,59 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
           cache: 'npm'
 
       - run: npm ci
 
-      - name: Run tests
-        run: npm run test:run
+      # Hook-installation tests pin the same built, external OpenLore launcher
+      # that production installs. Build it before exercising those tests.
+      - name: Build trusted hook launcher
+        run: npm run build
+
+      - name: Certify derived-artifact answer equivalence
+        run: npm run test:equivalence
+        timeout-minutes: 3
+
+      # The extractor budget tests assert WALL-CLOCK ceilings on hostile inputs, so they
+      # are CPU-bound for seconds at a time. Run in their own step without file
+      # parallelism: sharing a runner with the rest of the suite made both sides flaky —
+      # these tripped their own ceilings under contention, and their load pushed the
+      # genuinely time-dependent tests elsewhere (serve's idle-shutdown timers) over
+      # theirs. Excluded from `test:unit` below so the work is not paid for twice.
+      - name: Certify extractor cost budgets
+        run: npm run test:budgets
+        timeout-minutes: 10
+
+      # Equivalence files run in the bounded gate above; exclude them here so the
+      # the same certification assertions are not paid for twice in this job.
+      - name: Run remaining unit tests
+        run: npm run test:unit
 
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
           cache: 'npm'
 
       - run: npm ci
@@ -64,24 +138,489 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Verify API analysis and dry-run parity
+        run: npx vitest run --config vitest.integration.config.ts src/api/analyze-parity.integration.test.ts src/api/run-dry-run.integration.test.ts
+
+      - name: Verify published API consumer contract
+        run: npm run test:api-consumer
+
+      - name: Verify MCP preset dispatch boundary
+        run: npx vitest run --config vitest.integration.config.ts src/cli/commands/mcp.conformance.integration.test.ts
+
+      - name: Verify the published tarball contents
+        # Runs here rather than in `lint` because it asserts the built entrypoints are
+        # present, which needs `dist/`. `files` is an allowlist, so a stray new
+        # directory is excluded by default — but widening `files` itself is a one-line
+        # diff, and this checks the real `npm pack` manifest rather than the intent.
+        run: npm run audit:packlist
+
+      # The Pass-1 extraction worker is loaded by runtime path resolution, and under vitest
+      # the .ts entry is always the one resolved — so the COMPILED entry that the npm package
+      # actually ships is exercised by no other job. A compile or packaging regression there
+      # degrades every installed user to the serial lane silently, so it is checked here,
+      # where dist/ exists (change: optimize-parallel-extraction-pool).
+      - name: Verify the compiled extraction worker
+        run: npx vitest run src/core/analyzer/extraction-pool-threads.test.ts
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
           retention-days: 7
 
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Build compiled integration fixtures
+        run: npm run build
+
+      - name: Run deterministic integration tests
+        run: npm run test:integration:ci
+
+  node-floor:
+    name: Node 22.19 Compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.19.0'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Type check at the supported Node floor
+        run: npm run typecheck
+
+      - name: Build at the supported Node floor
+        run: npm run build
+
+      - name: Verify the public API consumer contract
+        run: npm run test:api-consumer
+
+      - name: Run deterministic integration tests
+        run: npm run test:integration:ci
+
+  windows-unit:
+    name: Windows Unit Tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # Same prerequisite as the Linux unit job: the hook-installation tests pin the same
+      # built, external OpenLore launcher that production installs, so `dist/` must exist
+      # before they run. Without it `resolveTrustedHookLauncher()` returns null, the
+      # installer refuses to pin a launcher, and every hook test fails on ANY platform.
+      - name: Build trusted hook launcher
+        run: npm run build
+
+      # Before this job, exactly ONE test file ran on Windows in CI, so every path, filesystem and
+      # subprocess suite — where a Windows-only defect actually lives — went unexercised on the
+      # platform (issue #434).
+      #
+      # The WHOLE suite runs here; nothing is filtered. The known-failing files are judged against
+      # .github/windows-unit-exclusions.json in the next step instead of being skipped, so one run
+      # answers both "did anything new break?" and "has anything on the list been fixed?". Running
+      # them costs about a minute, and it is the only way the two answers cannot contradict
+      # each other.
+      #
+      # --retry=2: a Windows runner is slower than the Linux one, and a handful of fixture-heavy
+      # suites sit close to the 30s timeout there. Retries absorb that without weakening the gate —
+      # a deterministic failure still fails all three attempts. The Linux job runs with no retries.
+      - name: Unit suite
+        shell: pwsh
+        run: |
+          npx vitest run src examples --retry=2 --reporter=json --outputFile=windows-unit.json
+          # The suite is EXPECTED to exit non-zero while the deny-list is non-empty; the report,
+          # not the exit code, is the verdict.
+          exit 0
+
+      - name: Judge the run against the tracked backlog
+        shell: pwsh
+        run: node scripts/windows-unit-report.mjs windows-unit.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-unit-report
+          path: windows-unit.json
+
+  windows-smoke:
+    name: Windows Smoke
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Build and install the packed CLI
+        shell: pwsh
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx vitest run src/cli/install/pi-surface.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = (npm pack --silent | Select-Object -Last 1).Trim()
+          if (-not (Test-Path $package)) { throw 'npm pack did not produce a tarball' }
+          npm install --global "./$package"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Exercise install, version, and analyze
+        shell: pwsh
+        working-directory: src/core/scip/fixtures/tiny-repo
+        run: |
+          openlore --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          openlore install --agent claude-code --no-analyze
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $mcp = Get-Content .mcp.json -Raw | ConvertFrom-Json
+          if (-not $mcp.mcpServers.openlore.command.EndsWith('\node.exe')) {
+            throw 'Windows install did not emit a launchable MCP command'
+          }
+          # fix-windows-console-flash-from-npx-shim: the wired command must be OUR OWN CLI
+          # entry, never `npx openlore`. npx resolves the target bin to openlore.cmd, and a
+          # .cmd can only start through cmd.exe - one visible console window per invocation,
+          # i.e. one per agent turn for the UserPromptSubmit hook.
+          if (-not $mcp.mcpServers.openlore.args[0].EndsWith('\dist\cli\index.js')) {
+            throw 'Windows install did not emit OpenLore''s own CLI entry'
+          }
+          if (($mcp.mcpServers.openlore.args -join ' ') -match 'npx') {
+            throw 'Windows install routed the MCP server through npx (cmd.exe shim)'
+          }
+          $settings = Get-Content .claude/settings.json -Raw | ConvertFrom-Json
+          foreach ($key in 'SessionStart', 'UserPromptSubmit') {
+            $hook = $settings.hooks.$key[0].hooks[0].command
+            if ($hook -match 'npx') {
+              throw "Windows install routed the $key hook through npx (cmd.exe shim)"
+            }
+          }
+          # harden-windows-hook-quoting (#483): Claude Code runs a hook command through GIT
+          # BASH, where a bare backslash is an escape that is dropped. Nothing above can see
+          # that - the MCP launcher is spawned with an argv and never meets a shell - so the
+          # unquoted entry path shipped green and every hook died with `Cannot find module`.
+          # This runs the hook STRING through the real Git Bash on a real Windows host, which
+          # is the only place in CI where that interpretation is the genuine article.
+          $bash = (Get-Command bash -ErrorAction SilentlyContinue).Source
+          if (-not $bash) { throw 'Git Bash is absent from the runner; the hook shell cannot be verified' }
+          foreach ($key in 'SessionStart', 'UserPromptSubmit') {
+            # Swap the subcommand for `--version`, so the probe proves the SHELL resolved the
+            # path and Node ran it, without depending on an index being built yet.
+            $probe = $settings.hooks.$key[0].hooks[0].command -replace 'orient (--json|--inject)$', '--version'
+            # Written to a file, not passed as an argument: the hook string carries its own
+            # double quotes, and PowerShell's native-argument quoting would rewrite them.
+            # utf8NoBOM, not ascii: an ascii write would silently mangle a non-ASCII path
+            # (`C:\Users\Müller\…`) before bash ever saw it, and a BOM would break the first
+            # token. The runner's own paths are ASCII, so this is about not lying if that changes.
+            Set-Content -Path hook-probe.sh -Value $probe -Encoding utf8NoBOM
+            $out = (& $bash hook-probe.sh 2>&1) | Out-String
+            if ($out -match 'Cannot find module') {
+              throw "#483 regression: Git Bash could not resolve the $key hook path. $out"
+            }
+            if ($out -notmatch '\d+\.\d+\.\d+') {
+              throw "The $key hook command did not run under Git Bash. $out"
+            }
+          }
+          Remove-Item hook-probe.sh
+          # A hostile npx.cmd in the working directory must now be irrelevant: the launcher
+          # never reaches npx at all. Kept as a regression probe on exactly that property.
+          Set-Content -Path npx.cmd -Value '@exit /b 91'
+          $command = $mcp.mcpServers.openlore.command
+          & $command $mcp.mcpServers.openlore.args[0] '--version'
+          if ($LASTEXITCODE -ne 0) { throw 'Generated Windows launcher did not execute successfully' }
+          openlore init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          openlore analyze --no-embed --max-files 20
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path .openlore/analysis/llm-context.json)) {
+            throw 'Windows analyze did not produce llm-context.json'
+          }
+
+      - name: Exercise a real branch switch, and --watch-auto, on Windows
+        shell: pwsh
+        run: |
+          # Real git + real chokidar + real filesystem. This is the only place the chain
+          # `git checkout` -> .git/HEAD -> rebuild lane runs on any platform in CI: the
+          # existing unit test injects the trigger instead of performing it.
+          #
+          # watch-auto.integration.test.ts joins it because the mechanism it covers - the
+          # first tool call arming a watcher - is the one an agent on Windows depends on for
+          # a fresh index, and every Windows defect in this area so far (the npx console
+          # shim, the libuv 8.3 abort) surfaced only on the platform.
+          #
+          # The watcher's UNIT files are not run here: the `windows-unit` job (#450) already
+          # runs the whole unit suite on windows-latest. Integration files are not - the
+          # default vitest config excludes `**/*.integration.test.ts` - so this step covers
+          # exactly the gap that job leaves.
+          $ErrorActionPreference = 'Stop'
+          npx vitest run --config vitest.integration.config.ts `
+            src/core/services/mcp-watcher.integration.test.ts `
+            src/cli/commands/watch-auto.integration.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows watcher integration tests failed' }
+
+      - name: Exercise the MCP transport and the serve daemon
+        shell: pwsh
+        working-directory: src/core/scip/fixtures/tiny-repo
+        run: |
+          # The paths an agent takes to reach OpenLore on Windows: the stdio
+          # JSON-RPC transport, and the daemon spawn branch in serve-client
+          # (log-redirected, non-detached). Nothing else in CI runs either on
+          # Windows, so a "the agents cannot connect any more" regression lands
+          # here or nowhere.
+          $ErrorActionPreference = 'Stop'
+          $entry = Join-Path (npm root -g) 'openlore/dist/cli/index.js'
+          if (-not (Test-Path $entry)) { throw "Global openlore entry not found: $entry" }
+
+          # The server closes on stdin EOF WITHOUT draining in-flight requests,
+          # so stdin is held open until every expected id has answered.
+          function Invoke-McpSession {
+            param(
+              [string[]]$ExtraArgs = @(),
+              [Parameter(Mandatory)][string[]]$Requests,
+              [Parameter(Mandatory)][int[]]$ExpectIds,
+              [int]$TimeoutSec = 240
+            )
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = 'node'
+            foreach ($a in @($script:entry) + $ExtraArgs) { $psi.ArgumentList.Add($a) }
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            # stderr is left attached to the job log: it is the crash diagnostic,
+            # and draining it here after the process runs risks a full-pipe stall.
+            $psi.UseShellExecute = $false
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            foreach ($r in $Requests) { $proc.StandardInput.WriteLine($r) }
+            $proc.StandardInput.Flush()
+
+            $seen = @{}
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+            while ($true) {
+              $remaining = [int](($deadline - (Get-Date)).TotalMilliseconds)
+              if ($remaining -le 0) { break }
+              $read = $proc.StandardOutput.ReadLineAsync()
+              if (-not $read.Wait($remaining)) { break }
+              $line = $read.Result
+              if ($null -eq $line) { break }
+              if (-not $line.Trim()) { continue }
+              try { $obj = $line | ConvertFrom-Json } catch { continue }
+              if ($null -ne $obj.id) { $seen[[int]$obj.id] = $obj }
+              if (@($ExpectIds | Where-Object { -not $seen.ContainsKey($_) }).Count -eq 0) { break }
+            }
+            $proc.StandardInput.Close()
+            if (-not $proc.WaitForExit(60000)) { $proc.Kill(); throw 'MCP server did not exit after stdin closed' }
+            foreach ($id in $ExpectIds) {
+              if (-not $seen.ContainsKey($id)) { throw "MCP request id $id got no response within ${TimeoutSec}s" }
+            }
+            return $seen
+          }
+
+          $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"windows-smoke","version":"1.0.0"}}}'
+          $ready = '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+          $list = '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+          $call = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"orient","arguments":{"task":"windows smoke"}}}'
+
+          # 1. stdio transport, no daemon: handshake, tool surface, in-process dispatch.
+          $r = Invoke-McpSession -ExtraArgs @('mcp','--preset','full') `
+                 -Requests @($init, $ready, $list, $call) -ExpectIds @(1, 2, 3)
+          if ($r[1].result.serverInfo.name -ne 'openlore') {
+            throw "MCP initialize did not return the openlore serverInfo: $($r[1] | ConvertTo-Json -Depth 6)"
+          }
+          if ($r[2].result.tools.name -notcontains 'orient') { throw 'MCP tools/list did not advertise orient' }
+          if (-not $r[3].result) { throw "MCP tools/call orient returned no result: $($r[3] | ConvertTo-Json -Depth 6)" }
+
+          # 2. daemon spawn: --daemon starts a shared `openlore serve` and delegates.
+          Remove-Item .openlore/serve.json,.openlore/serve.log -ErrorAction SilentlyContinue
+          $r = Invoke-McpSession -ExtraArgs @('mcp','--preset','full','--daemon') `
+                 -Requests @($init, $ready, $call) -ExpectIds @(1, 3)
+          if (-not $r[3].result) { throw "MCP --daemon tools/call returned no result: $($r[3] | ConvertTo-Json -Depth 6)" }
+          if (-not (Test-Path .openlore/serve.json)) {
+            throw 'MCP --daemon never spawned a serve daemon on Windows (no .openlore/serve.json)'
+          }
+          if (-not (Test-Path .openlore/serve.log)) {
+            throw 'Windows daemon spawn did not redirect the child output to .openlore/serve.log'
+          }
+
+          # 3. the daemon must OUTLIVE the agent that spawned it — that is the whole
+          #    point of a shared warm process, and the Windows spawn is not detached.
+          $desc = Get-Content .openlore/serve.json -Raw | ConvertFrom-Json
+          $headers = @{}
+          if ($desc.token) { $headers['x-openlore-token'] = $desc.token }
+          $base = "http://$($desc.host):$($desc.port)"
+          try {
+            $health = Invoke-RestMethod -Uri "$base/health" -Headers $headers -TimeoutSec 30
+          } catch {
+            Get-Content .openlore/serve.log -ErrorAction SilentlyContinue
+            throw "Windows serve daemon did not survive the MCP session that spawned it ($base): $_"
+          }
+          if (-not $health.ok) {
+            Get-Content .openlore/serve.log -ErrorAction SilentlyContinue
+            throw "Windows serve daemon /health was not ok: $($health | ConvertTo-Json -Depth 6)"
+          }
+
+          # 4. tool dispatch over HTTP — the transport a second agent reuses.
+          $body = @{ directory = (Get-Location).Path; args = @{ task = 'windows smoke' } } | ConvertTo-Json -Depth 6
+          try {
+            $tool = Invoke-RestMethod -Uri "$base/tool/orient" -Method Post `
+              -Body $body -ContentType 'application/json' -Headers $headers -TimeoutSec 120
+          } catch {
+            Get-Content .openlore/serve.log -ErrorAction SilentlyContinue
+            throw "Windows serve daemon rejected a tool dispatch: $_"
+          }
+          if ($null -eq $tool) { throw 'Windows serve daemon returned no body for orient' }
+
+          # 3. a SECOND client kind reuses that daemon instead of starting its own.
+          #    Plain `mcp` (no --daemon) only ever discovers a running one.
+          $before = (Get-Content .openlore/serve.json -Raw | ConvertFrom-Json).pid
+          $r = Invoke-McpSession -ExtraArgs @('mcp','--preset','full') `
+                 -Requests @($init, $ready, $call) -ExpectIds @(1, 3)
+          if (-not $r[3].result) { throw 'The reusing MCP client got no result from the shared daemon' }
+          $after = (Get-Content .openlore/serve.json -Raw | ConvertFrom-Json).pid
+          if ($after -ne $before) {
+            throw "A second client displaced the shared daemon (pid $before -> $after)"
+          }
+
+          # 4. the Pi extension brings up its own daemon on Windows. Pi has no in-process
+          #    fallback, so this path failing is a hard outage for it - and nothing else
+          #    in CI runs Pi's spawn on Windows.
+          node $entry serve --stop --directory .
+          Remove-Item .openlore/serve.json,.openlore/serve.log -ErrorAction SilentlyContinue
+          $piPackaged = Join-Path (npm root -g) 'openlore/dist/pi/extension.js'
+          if (-not (Test-Path $piPackaged)) { throw "Pi entry missing from the packaged install: $piPackaged" }
+          # Import the checkout's own build, not the global install: the Pi host
+          # supplies @earendil-works/* at runtime, so they are devDependencies here
+          # and resolve only from the checkout's node_modules. Same build either
+          # way - the global install was packed from this dist a few steps up.
+          $piEntry = Join-Path $env:GITHUB_WORKSPACE 'dist/pi/extension.js'
+          if (-not (Test-Path $piEntry)) { throw "Built Pi extension not found: $piEntry" }
+          $driver = @'
+          import { pathToFileURL } from 'node:url';
+
+          const [entry, cwd, label] = process.argv.slice(2);
+          const pi = await import(pathToFileURL(entry).href);
+
+          // Generous: a cold daemon boot on a Windows runner outruns Pi's 8s default.
+          const result = await pi.ensureDaemonResult(cwd, { timeoutMs: 120000 });
+          if (!result.daemon) {
+            console.error(`${label}: no daemon (${result.failureKind}) - ${result.failure}`);
+            process.exit(1);
+          }
+          if (!pi.isUsableDaemon(result.daemon)) {
+            console.error(`${label}: daemon unusable - ${result.daemon.incompatibility}`);
+            process.exit(1);
+          }
+          const out = await pi.callTool(result.daemon, 'orient', { task: 'windows smoke' }, cwd);
+          if (out === null || out === undefined || out.error) {
+            console.error(`${label}: orient failed - ${JSON.stringify(out)}`);
+            process.exit(1);
+          }
+          console.log(`${label}: ${result.daemon.baseUrl}`);
+          '@
+          Set-Content -Path pi-daemon-probe.mjs -Value $driver
+          node pi-daemon-probe.mjs $piEntry (Get-Location).Path first
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content .openlore/serve.log -ErrorAction SilentlyContinue
+            throw 'The Pi extension could not bring up a daemon on Windows'
+          }
+          if (-not (Test-Path .openlore/serve.json)) { throw 'Pi announced no daemon descriptor' }
+          if (-not (Test-Path .openlore/serve.log)) {
+            throw 'Pi did not redirect its Windows daemon output to .openlore/serve.log'
+          }
+          $piPid = (Get-Content .openlore/serve.json -Raw | ConvertFrom-Json).pid
+
+          # 5. a second Pi client reuses the first one's daemon. This is the shared warm
+          #    process the design promises, and it only holds if the daemon outlived the
+          #    process that launched it.
+          node pi-daemon-probe.mjs $piEntry (Get-Location).Path second
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content .openlore/serve.log -ErrorAction SilentlyContinue
+            throw 'A second Pi client could not reach the daemon the first one launched'
+          }
+          $piPidAgain = (Get-Content .openlore/serve.json -Raw | ConvertFrom-Json).pid
+          if ($piPidAgain -ne $piPid) {
+            throw "The second Pi client started its own daemon instead of reusing (pid $piPid -> $piPidAgain)"
+          }
+
+          # 6. `serve --stop` must kill the actual OS process, not just remove the
+          #    descriptor file. The daemon's own /shutdown HTTP handler used to fire
+          #    teardown() and return without ever calling process.exit(): teardown
+          #    completed (descriptor gone, watcher closed) but the process itself
+          #    stayed alive on Windows, because nothing forced the event loop to
+          #    drain. A client that only checks the descriptor sees success and
+          #    reports a clean stop while a zombie node.exe lingers. Assert on the
+          #    OS process, not the client's own claim of success.
+          $stopPid = (Get-Content .openlore/serve.json -Raw | ConvertFrom-Json).pid
+          node $entry serve --stop --directory .
+          if ($LASTEXITCODE -ne 0) { throw "serve --stop exited non-zero ($LASTEXITCODE)" }
+          $deadline = (Get-Date).AddSeconds(15)
+          $stillAlive = $true
+          while ((Get-Date) -lt $deadline) {
+            if (-not (Get-Process -Id $stopPid -ErrorAction SilentlyContinue)) { $stillAlive = $false; break }
+            Start-Sleep -Milliseconds 200
+          }
+          if ($stillAlive) {
+            throw "serve --stop reported success but the daemon OS process (pid $stopPid) is still running 15s later"
+          }
+
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [lint, test, build]
+    needs: [lint, test, build, integration, node-floor, windows-smoke, windows-unit]
     if: always()
+    permissions:
+      contents: read
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.lint.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
-             [[ "${{ needs.build.result }}" != "success" ]]; then
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.integration.result }}" != "success" ]] || \
+             [[ "${{ needs.node-floor.result }}" != "success" ]] || \
+             [[ "${{ needs.windows-smoke.result }}" != "success" ]] || \
+             [[ "${{ needs.windows-unit.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi

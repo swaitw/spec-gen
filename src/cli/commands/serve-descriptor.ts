@@ -1,0 +1,238 @@
+/**
+ * serve-descriptor — the ONE validator for the untrusted daemon-discovery
+ * artifact `.openlore/serve.json`.
+ *
+ * The descriptor is a repo-local, attacker-writable file that OpenLore reads at
+ * three sites — the `serve` CLI, the serve-client the stdio MCP server delegates
+ * through, and the Pi extension. Each reader then FETCHES the host/port the file
+ * names for a liveness probe and, on a healthy answer, POSTs the project
+ * directory and full tool arguments to it. A poisoned descriptor is therefore an
+ * SSRF / egress vector, a leak of the directory + tool args, and a result-
+ * poisoning channel into the agent's context (mcp-security: Untrusted Artifact
+ * Deserialization). One threat model must not have three postures.
+ *
+ * This module is the one lock, extracted verbatim from `serve.ts`'s existing
+ * reader: loopback-only host, integer port 1–65535, integer pid > 0, token
+ * absent-or-string. No check is invented here beyond the ones `serve` already
+ * applied. A descriptor that fails any check is treated exactly as ABSENT — the
+ * reader returns null and the caller takes its existing no-daemon path (spawn a
+ * fresh daemon or fall back to in-process dispatch). No field of an invalid
+ * descriptor ever becomes a fetch target or request header.
+ *
+ * Dependency-light by contract (mcp-security ServeDescriptorValidatedAtEveryReader
+ * + the MCP↔Pi parity doctrine): it imports only node builtins and the loopback
+ * predicate it shares with the HTTP guard, so the Pi host can import it without
+ * pulling in the analyzer.
+ */
+
+import { readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { isLoopbackHost } from './local-http-guard.js';
+
+/** Increment only when the daemon HTTP tool/health contract becomes incompatible. */
+export const SERVE_PROTOCOL_VERSION = 1;
+
+/**
+ * The validated daemon-discovery descriptor. `startedAt` / `version` are
+ * advisory metadata (normalized to '' when absent or ill-typed); the other four
+ * fields are security-critical and are only present on a descriptor that passed
+ * {@link validateServeDescriptor}.
+ */
+export interface ServeDescriptor {
+  port: number;
+  pid: number;
+  host: string;
+  token?: string;
+  protocolVersion: typeof SERVE_PROTOCOL_VERSION;
+  startedAt: string;
+  version: string;
+  state?: 'ready' | 'draining';
+}
+
+export interface ServeHealth {
+  ok: true;
+  protocolVersion: typeof SERVE_PROTOCOL_VERSION;
+  presetDispatchEnforced: true;
+  root: string;
+  pid: number;
+  preset: string;
+  tools: string[];
+  tokenProtected: boolean;
+  tokenAuthenticated: boolean;
+  draining: boolean;
+  /**
+   * Freshness-watcher state, when the daemon reports it (change:
+   * extend-api-for-supervising-hosts). OPTIONAL on purpose: a daemon from an older release omits
+   * it, and a reader must then say 'unknown' rather than assume either value — which is why this
+   * addition needs no `SERVE_PROTOCOL_VERSION` bump.
+   */
+  watcher?: 'healthy' | 'stopped';
+}
+
+export type ServeDescriptorRead =
+  | { kind: 'compatible'; descriptor: ServeDescriptor }
+  | { kind: 'incompatible'; descriptor: { port: number; pid: number; host: string; token?: string } }
+  | { kind: 'absent' };
+
+/** Build the loopback HTTP origin, including the brackets required by IPv6 URLs. */
+export function serveHttpBaseUrl(host: string, port: number): string {
+  const normalized = host.replace(/^\[|\]$/g, '');
+  return `http://${normalized.includes(':') ? `[${normalized}]` : normalized}:${port}`;
+}
+
+/** Resolve aliases to the stable filesystem identity used in health proofs. */
+export function canonicalServeRoot(root: string): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync.native(resolve(root));
+  } catch {
+    canonical = resolve(root);
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+/** Validate the semantic compatibility and identity fields returned by `/health`. */
+export function validateServeHealth(
+  parsed: unknown,
+  expectedRoot: string,
+  descriptor?: Pick<ServeDescriptor, 'pid' | 'token' | 'protocolVersion'>,
+): ServeHealth | null {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const h = parsed as Record<string, unknown>;
+  if (
+    h.ok !== true
+    || h.protocolVersion !== SERVE_PROTOCOL_VERSION
+    || h.presetDispatchEnforced !== true
+    || typeof h.root !== 'string'
+    || canonicalServeRoot(h.root) !== canonicalServeRoot(expectedRoot)
+    || typeof h.pid !== 'number'
+    || !Number.isInteger(h.pid)
+    || h.pid <= 0
+    || typeof h.preset !== 'string'
+    || !Array.isArray(h.tools)
+    || !h.tools.every((tool) => typeof tool === 'string')
+    || typeof h.tokenProtected !== 'boolean'
+    || h.tokenAuthenticated !== true
+    || typeof h.draining !== 'boolean'
+    || (descriptor !== undefined && h.pid !== descriptor.pid)
+    || (descriptor !== undefined && descriptor.protocolVersion !== h.protocolVersion)
+    || (descriptor !== undefined && h.tokenProtected !== Boolean(descriptor.token))
+  ) return null;
+  // Projected, not passed through: an ill-typed or unknown value is dropped, exactly as every
+  // other field here is allowlisted. Absent stays absent so the caller can distinguish
+  // "watcher stopped" from "this daemon does not report a watcher".
+  const watcher = h.watcher === 'healthy' || h.watcher === 'stopped' ? h.watcher : undefined;
+  return {
+    ok: true,
+    protocolVersion: SERVE_PROTOCOL_VERSION,
+    presetDispatchEnforced: true,
+    root: canonicalServeRoot(h.root),
+    pid: h.pid,
+    preset: h.preset,
+    tools: h.tools as string[],
+    tokenProtected: h.tokenProtected,
+    tokenAuthenticated: true,
+    draining: h.draining,
+    ...(watcher !== undefined ? { watcher } : {}),
+  };
+}
+
+/**
+ * Validate an already-parsed value as a {@link ServeDescriptor}. Returns the
+ * normalized descriptor, or null if ANY security-critical field is
+ * missing / ill-typed / out of range, or the host is not a loopback form.
+ */
+export function validateServeDescriptor(parsed: unknown): ServeDescriptor | null {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const d = parsed as Record<string, unknown>;
+  const portOk =
+    typeof d.port === 'number' && Number.isInteger(d.port) && d.port >= 1 && d.port <= 65535;
+  const pidOk = typeof d.pid === 'number' && Number.isInteger(d.pid) && d.pid > 0;
+  // Confine host to loopback: a recorded non-loopback host must never become an
+  // outbound fetch target during liveness probing (egress / SSRF).
+  const hostOk = typeof d.host === 'string' && isLoopbackHost(d.host);
+  const tokenOk = d.token === undefined || typeof d.token === 'string';
+  const protocolOk = d.protocolVersion === SERVE_PROTOCOL_VERSION;
+  const stateOk = d.state === undefined || d.state === 'ready' || d.state === 'draining';
+  if (!portOk || !pidOk || !hostOk || !tokenOk || !protocolOk || !stateOk) return null;
+  const state = d.state === 'ready' || d.state === 'draining' ? d.state : undefined;
+  return {
+    port: d.port as number,
+    pid: d.pid as number,
+    host: d.host as string,
+    token: d.token as string | undefined,
+    protocolVersion: SERVE_PROTOCOL_VERSION,
+    startedAt: typeof d.startedAt === 'string' ? d.startedAt : '',
+    version: typeof d.version === 'string' ? d.version : '',
+    ...(state === undefined ? {} : { state }),
+  };
+}
+
+/**
+ * Read + validate a serve.json at `descriptorPath`. Any failure — missing file,
+ * malformed JSON, or a descriptor that fails {@link validateServeDescriptor} —
+ * resolves to null, so a poisoned descriptor is indistinguishable from an absent
+ * one and no field of it ever reaches a fetch target or request header.
+ */
+export async function readServeDescriptor(
+  descriptorPath: string,
+  options: { includeDraining?: boolean } = {},
+): Promise<ServeDescriptor | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(descriptorPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  const descriptor = validateServeDescriptor(parsed);
+  return descriptor?.state === 'draining' && !options.includeDraining ? null : descriptor;
+}
+
+/** Distinguish a narrowly safe legacy/incompatible announcement from absence. */
+export async function readServeDescriptorState(
+  descriptorPath: string,
+  options: { includeDraining?: boolean } = {},
+): Promise<ServeDescriptorRead> {
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(descriptorPath, 'utf-8')); } catch { return { kind: 'absent' }; }
+  const descriptor = validateServeDescriptor(parsed);
+  if (descriptor) {
+    if (descriptor.state === 'draining' && !options.includeDraining) return { kind: 'absent' };
+    return { kind: 'compatible', descriptor };
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const d = parsed as Record<string, unknown>;
+    const safe = typeof d.port === 'number' && Number.isInteger(d.port) && d.port >= 1 && d.port <= 65535
+      && typeof d.pid === 'number' && Number.isInteger(d.pid) && d.pid > 0
+      && typeof d.host === 'string' && isLoopbackHost(d.host)
+      && (d.token === undefined || typeof d.token === 'string');
+    if (safe && d.protocolVersion !== SERVE_PROTOCOL_VERSION) return {
+      kind: 'incompatible',
+      descriptor: { port: d.port as number, pid: d.pid as number, host: d.host as string, ...(typeof d.token === 'string' ? { token: d.token } : {}) },
+    };
+  }
+  return { kind: 'absent' };
+}
+
+/** A stale legacy file must not become a permanent repository-local denial of service. */
+export async function incompatibleServeDescriptorIsLive(
+  descriptor: { port: number; pid: number; host: string; token?: string },
+  expectedRoot: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(`${serveHttpBaseUrl(descriptor.host, descriptor.port)}/health`, {
+      headers: descriptor.token ? { 'x-openlore-token': descriptor.token } : undefined,
+      signal: AbortSignal.timeout(500),
+      redirect: 'error',
+    });
+    if (!response.ok) return false;
+    const health = await response.json().catch(() => null) as Record<string, unknown> | null;
+    return health?.ok === true
+      && health.pid === descriptor.pid
+      && typeof health.root === 'string'
+      && canonicalServeRoot(health.root) === canonicalServeRoot(expectedRoot);
+  } catch {
+    return false;
+  }
+}

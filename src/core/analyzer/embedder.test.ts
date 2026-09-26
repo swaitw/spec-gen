@@ -1,0 +1,298 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resolveEmbedder, embedderMode, servedRetrievalMode, indexCapabilityAgreement, semanticProviderConfigured } from './embedder.js';
+import {
+  LocalEmbeddingService,
+  DEFAULT_LOCAL_MODEL,
+  LOCAL_MODEL_ENV,
+  resolveTrustedLocalModel,
+} from './local-embedding-service.js';
+import { EmbeddingService, type Embedder } from './embedding-service.js';
+import type { OpenLoreConfig } from '../../types/index.js';
+import { logger } from '../../utils/logger.js';
+import { mineRepositoryVocabulary, persistRepositoryVocabulary } from './repo-vocabulary.js';
+
+const cfg = (embedding?: OpenLoreConfig['embedding']): OpenLoreConfig =>
+  ({ version: '1.0', embedding } as unknown as OpenLoreConfig);
+
+describe('resolveEmbedder — provider selection (lexical default, semantic opt-in)', () => {
+  const saved = { ...process.env };
+  beforeEach(() => {
+    delete process.env.EMBED_BASE_URL;
+    delete process.env.EMBED_MODEL;
+    delete process.env.EMBED_API_KEY;
+  });
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it('returns null (first-class keyword default) when nothing is configured', async () => {
+    expect(await resolveEmbedder(null)).toBeNull();
+    expect(await resolveEmbedder(cfg(undefined))).toBeNull();
+  });
+
+  it('uses the local provider when embedding.provider is "local"', async () => {
+    const e = await resolveEmbedder(cfg({ provider: 'local' }));
+    expect(e).toBeInstanceOf(LocalEmbeddingService);
+    expect(e?.modelName).toBe(`local:${DEFAULT_LOCAL_MODEL}`);
+  });
+
+  it('honours a local model override', async () => {
+    const e = await resolveEmbedder(cfg({ provider: 'local', model: 'Xenova/bge-small-en-v1.5' }));
+    expect(e?.modelName).toBe('local:Xenova/bge-small-en-v1.5');
+  });
+
+  it('uses the remote endpoint when baseUrl + model are set (no provider)', async () => {
+    const e = await resolveEmbedder(cfg({ baseUrl: 'http://localhost:1234/v1', model: 'nomic-embed-text' }));
+    expect(e).toBeInstanceOf(EmbeddingService);
+    expect(e?.modelName).toBe('nomic-embed-text');
+  });
+
+  it('an explicit local provider wins over ambient EMBED_* env (embed --local is not silently overridden)', async () => {
+    process.env.EMBED_BASE_URL = 'http://localhost:9999/v1';
+    process.env.EMBED_MODEL = 'env-model';
+    const e = await resolveEmbedder(cfg({ provider: 'local' }));
+    expect(e).toBeInstanceOf(LocalEmbeddingService);
+    expect(e?.modelName).toBe(`local:${DEFAULT_LOCAL_MODEL}`);
+  });
+
+  it('still uses EMBED_* env when no local provider is set', async () => {
+    process.env.EMBED_BASE_URL = 'http://localhost:9999/v1';
+    process.env.EMBED_MODEL = 'env-model';
+    const e = await resolveEmbedder(cfg({ baseUrl: 'http://other/v1', model: 'cfg-model' }));
+    expect(e).toBeInstanceOf(EmbeddingService);
+    expect(e?.modelName).toBe('env-model'); // env precedence preserved for remote
+  });
+});
+
+describe('embedderMode — honest mode reporting', () => {
+  it('maps no embedder to the keyword default', () => {
+    expect(embedderMode(null)).toBe('keyword');
+    expect(embedderMode(undefined)).toBe('keyword');
+  });
+
+  it('maps a local-prefixed model to local-semantic', () => {
+    expect(embedderMode({ modelName: 'local:Xenova/all-MiniLM-L6-v2', embed: async () => [] })).toBe('local-semantic');
+  });
+
+  it('maps a plain model name to remote-semantic', () => {
+    expect(embedderMode({ modelName: 'text-embedding-3-small', embed: async () => [] })).toBe('remote-semantic');
+  });
+});
+
+describe('servedRetrievalMode — honest about what the index actually serves', () => {
+  let dir: string;
+  const remote: Embedder = { modelName: 'text-embedding-3-small', embed: async () => [] };
+  const local: Embedder = { modelName: 'local:Xenova/all-MiniLM-L6-v2', embed: async () => [] };
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'openlore-served-mode-'));
+  });
+
+  it('reports keyword when no embedder is resolved', () => {
+    expect(servedRetrievalMode(null, dir, 'code')).toBe('keyword');
+  });
+
+  it('reports keyword when the verified repository vocabulary is empty', async () => {
+    const stamp = 'e'.repeat(64);
+    const vocabulary = mineRepositoryVocabulary([], new Map(), stamp);
+    await mkdir(join(dir, 'vector-index'));
+    await persistRepositoryVocabulary(
+      join(dir, 'vector-index'),
+      vocabulary,
+    );
+    await writeFile(join(dir, 'vector-index-meta.json'), JSON.stringify({
+      hasEmbeddings: false,
+      vocabularyContentStamp: vocabulary.contentStamp,
+    }));
+
+    expect(servedRetrievalMode(null, dir, 'code')).toBe('keyword');
+  });
+
+  it('reports keyword when an embedder is configured but the index has no vectors', async () => {
+    await writeFile(join(dir, 'vector-index-meta.json'), JSON.stringify({ hasEmbeddings: false }));
+    expect(servedRetrievalMode(local, dir, 'code')).toBe('keyword');
+    expect(servedRetrievalMode(remote, dir, 'code')).toBe('keyword');
+  });
+
+  it('reports the embedder mode when the index has vectors', async () => {
+    await writeFile(join(dir, 'vector-index-meta.json'), JSON.stringify({ hasEmbeddings: true }));
+    expect(servedRetrievalMode(local, dir, 'code')).toBe('local-semantic');
+    expect(servedRetrievalMode(remote, dir, 'code')).toBe('remote-semantic');
+  });
+
+  it('trusts the embedder when no sidecar exists (legacy index)', () => {
+    expect(servedRetrievalMode(remote, dir, 'code')).toBe('remote-semantic');
+  });
+
+  it('consults the spec sidecar for kind=spec', async () => {
+    await writeFile(join(dir, 'spec-index-meta.json'), JSON.stringify({ hasEmbeddings: false }));
+    expect(servedRetrievalMode(local, dir, 'spec')).toBe('keyword');
+  });
+});
+
+describe('LocalEmbeddingService', () => {
+  it('records a local: prefixed model name for sidecar mode detection', () => {
+    expect(new LocalEmbeddingService().modelName).toBe(`local:${DEFAULT_LOCAL_MODEL}`);
+    // The constructor is the operator-driven path and takes any id; fromConfig reads the
+    // repository's config, so it applies the trust check below.
+    expect(new LocalEmbeddingService('m').modelName).toBe('local:m');
+  });
+
+  it('returns [] for an empty input without loading the model', async () => {
+    expect(await new LocalEmbeddingService().embed([])).toEqual([]);
+  });
+});
+
+/**
+ * A half-configured environment is an operator mistake, not a preference. Silently
+ * degrading to BM25 left the operator staring at an EMBED_BASE_URL they had
+ * demonstrably set, with nothing in the output explaining why it did nothing.
+ */
+describe('resolveEmbedder — half-configured environment is disclosed', () => {
+  const saved = { ...process.env };
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.EMBED_BASE_URL;
+    delete process.env.EMBED_MODEL;
+  });
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it('warns and falls back to BM25 when EMBED_BASE_URL is set without EMBED_MODEL', async () => {
+    const warn = vi.spyOn(logger, 'warning').mockImplementation(() => {});
+    process.env.EMBED_BASE_URL = 'https://embeddings.internal:8443/v1';
+    expect(await resolveEmbedder(null)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/EMBED_MODEL/);
+  });
+
+  it('warns and falls back to BM25 when EMBED_MODEL is set without EMBED_BASE_URL', async () => {
+    // The mirrored half-configured case: `fromEnv` throws on the missing base URL, so the
+    // disclosure must not be keyed on the base URL being present.
+    const warn = vi.spyOn(logger, 'warning').mockImplementation(() => {});
+    process.env.EMBED_MODEL = 'nomic-embed-text';
+    expect(await resolveEmbedder(null)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/EMBED_BASE_URL/);
+  });
+
+  it('does not frame the keyword index as a degraded fallback', async () => {
+    // `config` / KeywordIndexIsAFirstClassDefaultNotADegradedFallback forbids that framing.
+    const warn = vi.spyOn(logger, 'warning').mockImplementation(() => {});
+    process.env.EMBED_BASE_URL = 'https://embeddings.internal:8443/v1';
+    await resolveEmbedder(null);
+    expect(warn.mock.calls[0][0]).not.toMatch(/fall(ing|s)? back|degraded/i);
+  });
+
+  it('stays silent when nothing at all is configured (the ordinary default)', async () => {
+    const warn = vi.spyOn(logger, 'warning').mockImplementation(() => {});
+    expect(await resolveEmbedder(null)).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `embedding.model` under `provider: 'local'` is a HuggingFace repo id that Transformers.js
+ * downloads and loads into onnxruntime IN-PROCESS — on the read path (orient/search_code),
+ * not just analyze. `embedding.baseUrl` is refused when it is not loopback; this string
+ * reached the network and a native parser with no check at all.
+ */
+describe('resolveTrustedLocalModel — a repo may not choose which weights are executed', () => {
+  const saved = { ...process.env };
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env[LOCAL_MODEL_ENV];
+  });
+  afterEach(() => { process.env = { ...saved }; });
+
+  it('ignores an arbitrary repo-supplied model and says so', async () => {
+    const warn = vi.spyOn(logger, 'warning').mockImplementation(() => {});
+    const e = await resolveEmbedder(cfg({ provider: 'local', model: 'attacker/backdoored-onnx' }));
+    expect(e?.modelName).toBe(`local:${DEFAULT_LOCAL_MODEL}`);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/embedding\.model/);
+  });
+
+  it('accepts an allowlisted small sentence embedder', () => {
+    expect(resolveTrustedLocalModel('Xenova/bge-small-en-v1.5')).toBe('Xenova/bge-small-en-v1.5');
+  });
+
+  it('accepts any model the OPERATOR names in the environment', () => {
+    process.env[LOCAL_MODEL_ENV] = 'my-org/custom-embedder';
+    expect(resolveTrustedLocalModel('attacker/backdoored-onnx')).toBe('my-org/custom-embedder');
+  });
+
+  it('falls back to the pinned default when the field is absent', () => {
+    expect(resolveTrustedLocalModel(undefined)).toBe(DEFAULT_LOCAL_MODEL);
+  });
+});
+
+/**
+ * "What was asked for" vs. "what was produced". On 2026-09-20 two repositories named a
+ * reachable embedding endpoint and served keyword results for days, because nothing ever
+ * compared the two (spec `analyzer` IndexReuseRequiresCapabilityAgreement).
+ */
+describe('indexCapabilityAgreement — configured provider vs. realized index', () => {
+  let dir: string;
+  const savedBaseUrl = process.env.EMBED_BASE_URL;
+  const savedModel = process.env.EMBED_MODEL;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'openlore-capability-'));
+    delete process.env.EMBED_BASE_URL;
+    delete process.env.EMBED_MODEL;
+  });
+
+  afterEach(() => {
+    if (savedBaseUrl === undefined) delete process.env.EMBED_BASE_URL; else process.env.EMBED_BASE_URL = savedBaseUrl;
+    if (savedModel === undefined) delete process.env.EMBED_MODEL; else process.env.EMBED_MODEL = savedModel;
+  });
+
+  const withMeta = async (hasEmbeddings: boolean): Promise<void> => {
+    await writeFile(join(dir, 'vector-index-meta.json'), JSON.stringify({ hasEmbeddings }), 'utf-8');
+  };
+  const remoteConfig = { embedding: { baseUrl: 'http://127.0.0.1:8765/v1', model: 'all-MiniLM-L6-v2' } } as OpenLoreConfig;
+
+  it('reports a configured provider whose vectors are absent', async () => {
+    await withMeta(false);
+    expect(indexCapabilityAgreement(remoteConfig, dir)).toEqual({ agrees: false, mismatch: 'configured-but-unrealized' });
+  });
+
+  it('agrees when the configured provider is realized', async () => {
+    await withMeta(true);
+    expect(indexCapabilityAgreement(remoteConfig, dir)).toEqual({ agrees: true });
+  });
+
+  it('agrees on the unconfigured keyword default', async () => {
+    await withMeta(false);
+    expect(indexCapabilityAgreement(null, dir)).toEqual({ agrees: true });
+  });
+
+  it('reports vectors carried with no configured provider', async () => {
+    await withMeta(true);
+    expect(indexCapabilityAgreement(null, dir)).toEqual({ agrees: false, mismatch: 'vectors-without-provider' });
+  });
+
+  it('counts the local provider and a complete EMBED_* pair as configured', () => {
+    expect(semanticProviderConfigured({ embedding: { provider: 'local' } } as OpenLoreConfig)).toBe(true);
+    process.env.EMBED_BASE_URL = 'http://127.0.0.1:8765/v1';
+    process.env.EMBED_MODEL = 'all-MiniLM-L6-v2';
+    expect(semanticProviderConfigured(null)).toBe(true);
+  });
+
+  it('does not count a half-configured environment or a half-written config block', () => {
+    process.env.EMBED_BASE_URL = 'http://127.0.0.1:8765/v1';
+    expect(semanticProviderConfigured(null)).toBe(false);
+    expect(semanticProviderConfigured({ embedding: { baseUrl: 'http://127.0.0.1:8765/v1' } } as OpenLoreConfig)).toBe(false);
+  });
+
+  it('constructs no service and opens no socket — it reads configuration only', () => {
+    // An unreachable endpoint still answers "configured": the predicate is safe on the
+    // index-reuse hot path precisely because it never probes.
+    expect(semanticProviderConfigured({ embedding: { baseUrl: 'http://127.0.0.1:1/v1', model: 'm' } } as OpenLoreConfig)).toBe(true);
+  });
+});

@@ -1,37 +1,41 @@
 /**
- * spec-gen decisions — programmatic API
+ * openlore decisions — programmatic API
  *
  * Record, consolidate, and sync architectural decisions.
- * No side effects (no process.exit, no console.log).
+ * Never controls the process and is console-silent by default.
  */
 
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
-  SPEC_GEN_DIR,
-  SPEC_GEN_LOGS_SUBDIR,
-  OPENSPEC_DIR,
-  OPENSPEC_SPECS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_LOGS_SUBDIR,
   DECISIONS_EXTRACTION_MAX_FILES,
   DECISIONS_DIFF_MAX_CHARS,
 } from '../constants.js';
-import { fileExists } from '../utils/command-helpers.js';
-import { readSpecGenConfig } from '../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import { createLLMService } from '../core/services/llm-service.js';
-import { isGitRepository, getChangedFiles, getFileDiff, getCommitMessages, resolveBaseRef, buildSpecMap } from '../core/drift/index.js';
+import { isLlmLoggingEnabled } from '../core/services/llm-logging-policy.js';
+import { isGitRepositoryRoot, getChangedFiles, getFileDiff, getCommitMessages, resolveBaseRef, buildSpecMap, matchFileToDomains } from '../core/drift/index.js';
 import {
   loadDecisionStore,
-  saveDecisionStore,
+  updateDecisionStore,
   upsertDecisions,
-  patchDecision,
   makeDecisionId,
+  illegalPromotionToApproved,
 } from '../core/decisions/store.js';
 import { consolidateDrafts } from '../core/decisions/consolidator.js';
-import type { ProviderName } from '../utils/command-helpers.js';
-import { verifyDecisions } from '../core/decisions/verifier.js';
+import { applyConsolidationOutcome, withVerificationOutcome } from '../core/decisions/disposition.js';
+import { markVerificationEvidenceAbsent, verifyDecisions } from '../core/decisions/verifier.js';
 import { syncApprovedDecisions } from '../core/decisions/syncer.js';
-import type { PendingDecision, DecisionStore } from '../types/index.js';
+import type { DecisionConstraintBlock, DecisionScope, PendingDecision, DecisionStore } from '../types/index.js';
 import type { SyncResult } from '../core/decisions/syncer.js';
 import type { BaseOptions, ProgressCallback } from './types.js';
+import { resolveOpenspecDir } from '../utils/openspec-dir.js';
+import { resolveTrustedApiBase, resolveTrustedSslVerify } from '../core/services/repo-config-trust.js';
+import { errors, isOpenLoreError } from '../utils/errors.js';
+import { withLoggerOptions } from '../utils/logger.js';
+import { resolveGenerationProvider, type ProviderName } from '../core/runtime/generation-core.js';
+import { validateDecisionConstraintBlock } from '../core/decisions/constraint-ledger.js';
 
 function progress(cb: ProgressCallback | undefined, step: string, status: 'start' | 'complete' | 'skip', detail?: string): void {
   cb?.({ phase: 'decisions', step, status, detail });
@@ -48,13 +52,17 @@ export interface RecordDecisionOptions {
   consequences?: string;
   affectedFiles?: string[];
   supersedes?: string;
+  scope?: DecisionScope;
+  constraints?: DecisionConstraintBlock;
 }
 
 export interface ConsolidateOptions extends BaseOptions {
   provider?: string;
   model?: string;
   apiBase?: string;
+  openaiCompatBaseUrl?: string;
   sslVerify?: boolean;
+  timeout?: number;
   baseRef?: string;
 }
 
@@ -66,6 +74,7 @@ export interface SyncDecisionsOptions extends BaseOptions {
 export interface ConsolidateResult {
   verified: PendingDecision[];
   phantom: PendingDecision[];
+  unassessed: PendingDecision[];
   missing: Array<{ file: string; description: string }>;
   store: DecisionStore;
 }
@@ -79,33 +88,84 @@ export interface ConsolidateResult {
  * Called by agents during development (via MCP or directly).
  * Returns the ID of the recorded decision.
  */
-export async function specGenRecordDecision(options: RecordDecisionOptions): Promise<{ id: string }> {
-  const rootPath = options.rootPath ?? process.cwd();
+async function recordDecision(options: RecordDecisionOptions): Promise<{ id: string }> {
+  const rootPath = resolve(options.rootPath ?? process.cwd());
   const store = await loadDecisionStore(rootPath);
+  const title = options.title.trim();
+  const rationale = options.rationale.trim();
+  if (!title) throw new Error('title is required and must not be empty');
+  if (!rationale) throw new Error('rationale is required and must not be empty');
 
-  const domain = 'unknown';
-  const id = makeDecisionId(store.sessionId, domain, options.title);
+  const config = await readOpenLoreConfig(rootPath);
+  const openspecPath = resolveOpenspecDir(rootPath, config?.openspecPath);
+  let affectedDomains: string[] = [];
+  if (options.affectedFiles?.length) {
+    try {
+      const specMap = await buildSpecMap({ rootPath, openspecPath });
+      affectedDomains = [...new Set(options.affectedFiles.flatMap((file) => matchFileToDomains(file, specMap)))];
+    } catch {
+      // Recording remains available before a spec corpus exists.
+    }
+  }
+  const domain = affectedDomains[0] ?? 'unknown';
+  let resolvedScope: DecisionScope = options.scope ?? 'component';
+  if (!options.scope) {
+    const topLevelDirs = new Set((options.affectedFiles ?? []).map((file) => file.split('/').slice(0, 2).join('/')));
+    const lowerRationale = rationale.toLowerCase();
+    const semanticCrossDomain = affectedDomains.length >= 2
+      && !/\b(refactor|rename|extract|util|helper|constant|config|logging|test)\b/.test(lowerRationale)
+      && /\b(api|schema|contract|interface|protocol|auth|database|event|migration)\b/.test(lowerRationale);
+    if (topLevelDirs.size >= 2 || semanticCrossDomain) resolvedScope = 'cross-domain';
+  }
+  const id = makeDecisionId(store.sessionId, domain, title);
+  if (options.constraints) {
+    const findings = validateDecisionConstraintBlock(
+      { id, title, rationale },
+      options.constraints,
+    );
+    if (findings.length > 0) throw new Error(findings.map((finding) => finding.message).join('; '));
+  }
 
   const decision: PendingDecision = {
     id,
     status: 'draft',
-    title: options.title,
-    rationale: options.rationale,
+    scope: resolvedScope,
+    ...(options.scope ? { authorScope: options.scope } : {}),
+    title,
+    rationale,
     consequences: options.consequences ?? '',
     proposedRequirement: null,
-    affectedDomains: [],
+    affectedDomains,
     affectedFiles: options.affectedFiles ?? [],
     supersedes: options.supersedes,
+    constraints: options.constraints,
     sessionId: store.sessionId,
     recordedAt: new Date().toISOString(),
+    contentOrigin: 'agent-recorded',
     confidence: 'medium',
     syncedToSpecs: [],
   };
 
-  const updated = upsertDecisions(store, [decision]);
-  await saveDecisionStore(rootPath, updated);
+  // CAS upsert so concurrent writers never lose a draft; derive the id from the
+  // committed store's sessionId so repeated records in a session dedupe correctly.
+  let recordedId = id;
+  await updateDecisionStore(rootPath, (s) => {
+    recordedId = makeDecisionId(s.sessionId, domain, options.title);
+    return upsertDecisions(s, [{ ...decision, id: recordedId, sessionId: s.sessionId }]);
+  });
 
-  return { id };
+  return { id: recordedId };
+}
+
+export function openloreRecordDecision(options: RecordDecisionOptions): Promise<{ id: string }> {
+  return withLoggerOptions({ quiet: true }, async () => {
+    try {
+      return await recordDecision(options);
+    } catch (error) {
+      if (isOpenLoreError(error)) throw error;
+      throw errors.pipelineFailed(`Decision recording failed: ${(error as Error).message}`, error);
+    }
+  });
 }
 
 // ============================================================================
@@ -116,50 +176,75 @@ export async function specGenRecordDecision(options: RecordDecisionOptions): Pro
  * Consolidate draft decisions via LLM, then cross-verify against git diff.
  * Returns verified, phantom, and missing decision sets.
  */
-export async function specGenConsolidateDecisions(
+async function consolidateDecisions(
   options: ConsolidateOptions = {},
 ): Promise<ConsolidateResult> {
-  const rootPath = options.rootPath ?? process.cwd();
+  const rootPath = resolve(options.rootPath ?? process.cwd());
   const { onProgress } = options;
 
-  const specGenConfig = await readSpecGenConfig(rootPath);
-  if (!specGenConfig) throw new Error('No spec-gen configuration found. Run specGenInit() first.');
+  const openloreConfig = await readOpenLoreConfig(rootPath, options.configPath);
+  if (!openloreConfig) throw errors.noConfig(options.configPath);
 
-  const providerEnv =
-    process.env.ANTHROPIC_API_KEY ? 'anthropic' :
-    process.env.GEMINI_API_KEY ? 'gemini' :
-    process.env.OPENAI_COMPAT_API_KEY ? 'openai-compat' :
-    process.env.OPENAI_API_KEY ? 'openai' : null;
-
-  const provider = (options.provider ?? specGenConfig.generation?.provider ?? providerEnv) as string | undefined;
-  if (!provider) throw new Error('No LLM provider configured. Set an API key or configure generation.provider.');
+  const resolved = resolveGenerationProvider(openloreConfig, {
+    provider: options.provider as ProviderName | undefined,
+    model: options.model,
+    openaiCompatBaseUrl: options.openaiCompatBaseUrl,
+  });
+  if (!resolved) throw errors.apiNoApiKey();
 
   const llm = createLLMService({
-    provider: provider as ProviderName,
-    model: options.model ?? specGenConfig.generation?.model,
-    apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
-    sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
-    enableLogging: true,
-    logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
+    provider: resolved.provider,
+    model: resolved.model,
+    apiBase: resolveTrustedApiBase(options.apiBase, openloreConfig.llm?.apiBase),
+    openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
+    sslVerify: resolveTrustedSslVerify(
+        options.sslVerify === undefined ? undefined : !options.sslVerify,
+        openloreConfig.llm?.sslVerify,
+      ),
+    timeout: options.timeout ?? openloreConfig.generation?.timeout,
+    disableResponseFormat: openloreConfig.generation?.disableResponseFormat,
+    enableLogging: isLlmLoggingEnabled(),
+    logDir: join(rootPath, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR),
+    logRoot: rootPath,
   });
 
   const store = await loadDecisionStore(rootPath);
+  const originalDrafts = store.decisions.filter((decision) => decision.status === 'draft');
+  const originalDraftIds = new Set(originalDrafts.map((decision) => decision.id));
 
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
   const specMap = await buildSpecMap({ rootPath, openspecPath }).catch(() => undefined);
 
   progress(onProgress, 'Consolidating drafts', 'start');
-  const { decisions: consolidated, supersededIds } = await consolidateDrafts(store, llm, specMap);
+  const { decisions: consolidated, supersededIds, dispositions } = await consolidateDrafts(store, llm, specMap);
   progress(onProgress, 'Consolidating drafts', 'complete', `${consolidated.length} decisions`);
 
   if (consolidated.length === 0) {
-    return { verified: [], phantom: [], missing: [], store };
+    await llm.saveLogs().catch(() => {});
+    // Without a persisted replacement, omission cannot become rejection.
+    const withVerdicts = dispositions.length
+      ? await updateDecisionStore(rootPath, (s) => applyConsolidationOutcome(s, {
+          originalDraftIds,
+          originalDrafts,
+          capturedDecisions: store.decisions,
+          verified: [],
+          phantom: [],
+          supersededIds,
+          dispositions,
+        }))
+      : store;
+    const persistedUnassessed = originalDrafts.map((decision) =>
+      withVerdicts.decisions.find((stored) => stored.id === decision.id) ?? decision);
+    return { verified: [], phantom: [], unassessed: persistedUnassessed, missing: [], store: withVerdicts };
   }
 
   // Build combined diff + commit messages for verification
   let combinedDiff = '';
   let commitMessages = '';
-  if (await isGitRepository(rootPath)) {
+  // Root-only: getFileDiff below the repo root receives repo-root-relative paths as
+  // cwd-relative pathspecs and returns empty diffs, which would misclassify real
+  // decisions as phantom. Gate on the root to preserve the prior "skip git" behavior.
+  if (await isGitRepositoryRoot(rootPath)) {
     progress(onProgress, 'Building git diff', 'start');
     try {
       const baseRef = await resolveBaseRef(rootPath, options.baseRef ?? 'auto');
@@ -177,19 +262,63 @@ export async function specGenConsolidateDecisions(
   }
 
   progress(onProgress, 'Verifying decisions', 'start');
-  const { verified, phantom, missing } = combinedDiff
+  const { verified, phantom, unassessed, missing } = combinedDiff
     ? await verifyDecisions(consolidated, combinedDiff, llm, commitMessages)
-    : { verified: consolidated.map((d) => ({ ...d, status: 'verified' as const, confidence: 'medium' as const })), phantom: [], missing: [] };
+    : { verified: markVerificationEvidenceAbsent(consolidated), phantom: [], unassessed: [], missing: [] };
+  await llm.saveLogs().catch(() => {});
   progress(onProgress, 'Verifying decisions', 'complete', `${verified.length} verified`);
 
-  let updatedStore = { ...store };
-  for (const id of supersededIds) {
-    updatedStore = patchDecision(updatedStore, id, { status: 'rejected' });
-  }
-  updatedStore = upsertDecisions(updatedStore, [...verified, ...phantom]);
-  await saveDecisionStore(rootPath, updatedStore);
+  // CAS persist onto the freshest store so a concurrently-recorded draft is kept.
+  // replaceDecisions (via applyConsolidationOutcome), NOT upsert: consolidated decisions
+  // reuse their drafts' deterministic ids, so an upsert would silently drop the verified
+  // status. Matches the CLI consolidation path.
+  const unassessedIds = new Set(unassessed.map((decision) => decision.id));
+  const unassessedForPersist = unassessed.map((decision) => ({
+    ...decision,
+    status: 'draft' as const,
+    recordedAt: store.decisions.find((original) => original.id === decision.id)?.recordedAt
+      ?? decision.recordedAt,
+  }));
+  const finalDispositions = withVerificationOutcome(
+    dispositions.filter((disposition) => !unassessedIds.has(disposition.id)),
+    new Set(phantom.map((d) => d.id)),
+  );
+  const updatedStore = await updateDecisionStore(rootPath, (s) =>
+    applyConsolidationOutcome(s, {
+      originalDraftIds,
+      originalDrafts,
+      capturedDecisions: store.decisions,
+      verified,
+      phantom,
+      unassessed: unassessedForPersist,
+      supersededIds,
+      dispositions: finalDispositions,
+    }),
+  );
+  const fromCommittedStore = (decisions: readonly PendingDecision[]): PendingDecision[] =>
+    decisions.map((decision) =>
+      updatedStore.decisions.find((stored) => stored.id === decision.id) ?? decision);
 
-  return { verified, phantom, missing, store: updatedStore };
+  return {
+    verified: fromCommittedStore(verified),
+    phantom: fromCommittedStore(phantom),
+    unassessed: fromCommittedStore(unassessedForPersist),
+    missing,
+    store: updatedStore,
+  };
+}
+
+export function openloreConsolidateDecisions(
+  options: ConsolidateOptions = {},
+): Promise<ConsolidateResult> {
+  return withLoggerOptions({ quiet: options.quiet ?? true }, async () => {
+    try {
+      return await consolidateDecisions(options);
+    } catch (error) {
+      if (isOpenLoreError(error)) throw error;
+      throw errors.pipelineFailed(`Decision consolidation failed: ${(error as Error).message}`, error);
+    }
+  });
 }
 
 // ============================================================================
@@ -199,32 +328,44 @@ export async function specGenConsolidateDecisions(
 /**
  * Sync all approved decisions into spec.md files and create ADRs.
  */
-export async function specGenSyncDecisions(
+async function syncDecisions(
   options: SyncDecisionsOptions = {},
 ): Promise<SyncResult> {
-  const rootPath = options.rootPath ?? process.cwd();
+  const rootPath = resolve(options.rootPath ?? process.cwd());
   const { onProgress } = options;
 
-  const specGenConfig = await readSpecGenConfig(rootPath);
-  if (!specGenConfig) throw new Error('No spec-gen configuration found.');
+  const openloreConfig = await readOpenLoreConfig(rootPath, options.configPath);
+  if (!openloreConfig) throw errors.noConfig(options.configPath);
 
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
-  const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
-  if (!(await fileExists(specsPath))) throw new Error('No specs found. Run specGenGenerate() first.');
-
+  const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
   const specMap = await buildSpecMap({ rootPath, openspecPath });
   let store = await loadDecisionStore(rootPath);
 
   // Optionally filter to specific IDs
   if (options.ids?.length) {
-    store = {
-      ...store,
-      decisions: store.decisions.map((d) =>
-        options.ids!.includes(d.id) && d.status !== 'approved'
-          ? { ...d, status: 'approved' as const }
-          : d,
-      ),
+    const promote = (current: DecisionStore): DecisionStore => {
+      for (const reqId of options.ids!) {
+        const d = current.decisions.find((x) => x.id === reqId);
+        if (!d) continue;
+        const illegal = illegalPromotionToApproved(reqId, d.status, d.reviewNote);
+        if (illegal) throw new Error(illegal);
+      }
+      return {
+        ...current,
+        decisions: current.decisions.map((d) =>
+          options.ids!.includes(d.id) && d.status !== 'approved'
+            ? { ...d, status: 'approved' as const }
+            : d,
+        ),
+      };
     };
+    // Commit the promotion against the freshest CAS snapshot before any spec write.
+    // A rejection that lands after the initial read is therefore observed by the
+    // transition guard instead of being overwritten by the stale approved copy.
+    store = options.dryRun ? promote(store) : await updateDecisionStore(rootPath, promote);
+  } else {
+    // Do not hand the syncer a snapshot older than spec-map construction.
+    store = await loadDecisionStore(rootPath);
   }
 
   progress(onProgress, 'Syncing decisions', 'start');
@@ -237,4 +378,17 @@ export async function specGenSyncDecisions(
   progress(onProgress, 'Syncing decisions', 'complete', `${result.synced.length} synced`);
 
   return result;
+}
+
+export function openloreSyncDecisions(
+  options: SyncDecisionsOptions = {},
+): Promise<SyncResult> {
+  return withLoggerOptions({ quiet: options.quiet ?? true }, async () => {
+    try {
+      return await syncDecisions(options);
+    } catch (error) {
+      if (isOpenLoreError(error)) throw error;
+      throw errors.pipelineFailed(`Decision sync failed: ${(error as Error).message}`, error);
+    }
+  });
 }

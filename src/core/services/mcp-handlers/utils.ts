@@ -3,15 +3,189 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { extname, join, relative, resolve, sep } from 'node:path';
+import { constants } from 'node:fs';
+import { descriptorIsThePathEntry, readArtifactBytesBounded } from '../../../utils/bounded-artifact-read.js';
+import { lstat, open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import type { LLMContext } from '../../analyzer/artifact-generator.js';
 import { EdgeStore } from '../edge-store.js';
-import { ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_FINGERPRINT, ARTIFACT_LLM_CONTEXT, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_DIR } from '../../../constants.js';
+import {
+  REQUIRED_ANALYSIS_ARTIFACTS,
+  artifactMatchesGeneration,
+  generationPublishInProgress,
+  readCurrentGeneration,
+} from '../../runtime/analysis-generation.js';
+import { isAnalysisLockHeld } from '../../runtime/advisory-lock.js';
+import { readAttestation, reconcile, type IndexIntegrity } from '../../analyzer/index-attestation.js';
+import { recordGraphDigest } from './traversal.js';
+import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
+import { ANALYSIS_AGE_WARNING_HOURS, ANALYSIS_STALE_THRESHOLD_MS, ARTIFACT_CALL_GRAPH_DB, ARTIFACT_FINGERPRINT, ARTIFACT_INDEX_ATTESTATION, ARTIFACT_LLM_CONTEXT, DEFAULT_MAX_FILES, FINGERPRINT_BUDGET_OFFENDER_MIN_SHARE, FINGERPRINT_BUDGET_TOP_OFFENDERS, MAX_QUERY_LENGTH, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_DIR, STALE_REGION_REPAIR_THRESHOLD } from '../../../constants.js';
+import { repairInBackground, type RepairReason } from '../cold-start-bootstrap.js';
+import { isConfinedPath } from '../../../utils/path-confinement.js';
+import { sanitizeForTerminal } from '../../../utils/misc.js';
+import { readPartialArtifact, readPartialIndexStamp } from '../../runtime/partial-index.js';
+import { notePartialIndexServed } from './partial-request.js';
+import { FileWalker } from '../../analyzer/file-walker.js';
+import { formatBytes } from '../../analyzer/memory-strategy.js';
+import type { FileMetadata } from '../../../types/index.js';
+import { artifactStamp, readJsonArtifactCached, _resetJsonArtifactCacheForTesting } from './artifact-cache.js';
 
-/** LLMContext with optional SQLite edge store attached (present when call-graph.db exists). */
-export type CachedContext = LLMContext & { edgeStore?: EdgeStore };
+/**
+ * LLMContext with optional SQLite edge store attached (present when call-graph.db
+ * exists) and the index integrity verdict (present when an attestation was written and
+ * could be reconciled against the store — change: add-index-integrity-attestation).
+ */
+export type CachedContext = LLMContext & {
+  edgeStore?: EdgeStore;
+  integrity?: IndexIntegrity;
+  /**
+   * Mtime of the exact llm-context generation represented by this object.
+   * Non-enumerable at runtime so watcher persistence never writes cache metadata
+   * back into the analysis artifact.
+   */
+  artifactMtimeMs?: number;
+};
+
+let _startLineByContext = new WeakMap<CachedContext, ReadonlyMap<string, number>>();
+
+function isCanonicalNodeId(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const separator = value.indexOf('::');
+  return separator > 0 && separator < value.length - 2;
+}
+
+/**
+ * Return a node's stored declaration line without rebuilding a full graph index
+ * for every handler invocation. Cached contexts are generation-scoped objects,
+ * so replacing a context naturally invalidates this lookup.
+ */
+export function getCachedNodeStartLine(
+  context: CachedContext | null | undefined,
+  nodeId: unknown,
+): number | undefined {
+  if (!context || !isCanonicalNodeId(nodeId)) return undefined;
+
+  let startLines = _startLineByContext.get(context);
+  if (!startLines) {
+    const next = new Map<string, number>();
+    const ambiguous = new Set<string>();
+    for (const rawNode of context.callGraph?.nodes ?? []) {
+      if (!rawNode || typeof rawNode !== 'object') continue;
+      const node = rawNode as { id?: unknown; startLine?: unknown };
+      if (!isCanonicalNodeId(node.id)) continue;
+      if (typeof node.startLine !== 'number' || !Number.isSafeInteger(node.startLine) || node.startLine <= 0) continue;
+      if (next.has(node.id) || ambiguous.has(node.id)) {
+        next.delete(node.id);
+        ambiguous.add(node.id);
+        continue;
+      }
+      next.set(node.id, node.startLine);
+    }
+    startLines = next;
+    _startLineByContext.set(context, startLines);
+  }
+
+  return startLines.get(nodeId);
+}
+
+function bindArtifactMtime(ctx: CachedContext, mtime: number): void {
+  Object.defineProperty(ctx, 'artifactMtimeMs', {
+    value: mtime,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+}
+
+/**
+ * Reconcile the on-disk edge store against its build-time attestation, returning the
+ * integrity verdict (`healthy | degraded | mismatched`) or undefined when the index is
+ * unverifiable (legacy index with no attestation, or a read fault). Pure-ish: a few
+ * COUNT(*) queries + a JSON read. A first-pass `degraded` triggers a WAL checkpoint and
+ * one recount to rule out a WAL-lag false positive before the verdict is committed.
+ *
+ * MUST be called while the store handle is open and BEFORE any wasReset/empty guard
+ * may close it, so a schema-bumped (now-empty) store still yields a `mismatched`
+ * verdict instead of a silent unverifiable.
+ */
+async function computeIndexIntegrity(es: EdgeStore, analysisDir: string): Promise<IndexIntegrity | undefined> {
+  const attestation = await readAttestation(analysisDir);
+  if (!attestation) return undefined; // unverifiable — never fabricate a healthy verdict
+  const read = (): IndexIntegrity => reconcile(attestation, {
+    schemaVersion: es.getSchemaVersion(),
+    files: es.countFiles(),
+    functions: es.countNodes(),
+    edges: es.countEdges(),
+    classes: es.countClasses(),
+  });
+  let verdict = read();
+  if (verdict.verdict === 'degraded') {
+    es.checkpoint();
+    verdict = read();
+  }
+  return verdict;
+}
 import { logger } from '../../../utils/logger.js';
+import { emit } from '../telemetry.js';
+import { redactSecretString } from '../secret-redaction.js';
+
+const ANALYSIS_AGE_WARNING_MS = ANALYSIS_AGE_WARNING_HOURS * 60 * 60 * 1000;
+
+async function readUtf8Bounded(handle: FileHandle, maxBytes: number): Promise<string | null> {
+  const buffer = Buffer.allocUnsafe(maxBytes + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return offset > maxBytes ? null : buffer.toString('utf8', 0, offset);
+}
+
+/**
+ * Which read-path staleness signal (if any) should heal — a pure, testable
+ * decision. Priority is worst-first: `mismatched` (materially wrong index) →
+ * schema reset → an explicit stale region → an aged analysis. `degraded` is
+ * deliberately NOT a trigger (it already gets a WAL-checkpoint retry and may be a
+ * transient WAL-lag artifact). Returns undefined when the index looks current.
+ */
+export function computeRepairReason(
+  integrityVerdict: string | undefined,
+  schemaFault: boolean,
+  staleCount: number,
+  artifactMtimeMs: number,
+  now: number = Date.now(),
+): RepairReason | undefined {
+  if (integrityVerdict === 'mismatched') return 'integrity-mismatched';
+  // A read-path schema mismatch or a quarantined (corrupt) store both need a rebuild.
+  if (schemaFault) return 'schema-reset';
+  if (staleCount >= STALE_REGION_REPAIR_THRESHOLD) return 'stale-region';
+  if (now - artifactMtimeMs > ANALYSIS_AGE_WARNING_MS) return 'analysis-age';
+  return undefined;
+}
+
+/**
+ * Fire the shared at-most-once background repair for the strongest read-path
+ * staleness signal, if any. Fires only when a repair builder is registered (the
+ * MCP server); a no-op otherwise, so CLI/tests keep today's detection-only
+ * behavior. Never throws, never blocks the read.
+ */
+function maybeTriggerBackgroundRepair(
+  directory: string,
+  integrityVerdict: string | undefined,
+  schemaFault: boolean,
+  staleCount: number,
+  artifactMtimeMs: number,
+): void {
+  const reason = computeRepairReason(integrityVerdict, schemaFault, staleCount, artifactMtimeMs);
+  if (!reason) return;
+  try {
+    repairInBackground(directory, reason);
+  } catch {
+    // repairInBackground is fail-soft by contract; this guard is belt-and-braces
+    // so the read path can never be perturbed by the repair trigger.
+  }
+}
 
 /**
  * Resolve and validate a user-supplied directory path.
@@ -77,13 +251,10 @@ export function validateDirectoryDepth(absDir: string, maxDepth: number): void {
  */
 export function sanitizeMcpError(err: unknown, format: 'string' | 'json' = 'string'): string | { message: string; code: number } {
   const rawMessage = err instanceof Error ? err.message : String(err);
-  const sanitized = rawMessage
-    .replace(/sk-ant-[A-Za-z0-9\-_]{10,}/g, '[REDACTED]')
-    .replace(/sk-[A-Za-z0-9\-_]{20,}/g, '[REDACTED]')
-    .replace(/Bearer\s+\S{10,}/g, 'Bearer [REDACTED]')
-    .replace(/Authorization:\s*\S+/gi, 'Authorization: [REDACTED]')
-    .replace(/api[_-]?key[=:]\s*\S{8,}/gi, 'api_key=[REDACTED]');
-  
+  // Shared credential-redaction patterns (see secret-redaction.ts) so error text
+  // and every other output channel scrub the same set.
+  const sanitized = redactSecretString(rawMessage);
+
   if (format === 'json') {
     const errCode = err instanceof Error ? (err as Error & { code?: unknown }).code : undefined;
     const code = typeof errCode === 'number' ? errCode : 500;
@@ -93,32 +264,575 @@ export function sanitizeMcpError(err: unknown, format: 'string' | 'json' = 'stri
   return sanitized;
 }
 
+// Path confinement lives in `src/utils/path-confinement.ts` — a leaf module, so the
+// CLI, the decision syncer and the analyzer can share this one guard rather than
+// re-deriving it (they previously had no guard at all). Re-exported here because
+// these names are part of the handlers' established surface.
+export { safeJoin, safeOpenspecDir, isConfinedPath } from '../../../utils/path-confinement.js';
+
 /**
- * Resolve a user-supplied relative file path against a validated project root
- * and ensure the result stays within that root. Prevents path traversal via
- * `../` sequences.
+ * Bound a free-text query/description argument before it drives an embedding call
+ * or BM25 tokenization (mcp-security: Bounded Computation — a hostile caller could
+ * otherwise send a multi-megabyte string and force unbounded work or a huge
+ * provider request). Returns an `{ error }` object to return verbatim when the
+ * input exceeds MAX_QUERY_LENGTH, or null when it is within bounds.
  */
-export function safeJoin(absDir: string, filePath: string): string {
-  const resolved = resolve(absDir, filePath);
-  if (!resolved.startsWith(absDir + sep) && resolved !== absDir) {
-    throw new Error(`Path traversal blocked: "${filePath}" resolves outside project directory`);
+export function queryTooLongError(query: unknown, field = 'query'): { error: string } | null {
+  if (typeof query === 'string' && query.length > MAX_QUERY_LENGTH) {
+    return { error: `${field} too long: ${query.length} characters (max ${MAX_QUERY_LENGTH}). Shorten the ${field}.` };
   }
-  return resolved;
+  return null;
+}
+
+/**
+ * Why a graph-dependent tool cannot answer yet (change: refine-happy-path-and-defaults
+ * / ReadyOrHonestFirstUse):
+ *  - `index-absent`     — no analysis artifact exists at all (never built).
+ *  - `graph-unavailable`— an analysis exists but its call-graph/edge index is missing,
+ *                         typically because a version upgrade reset the graph index
+ *                         until the next `analyze`.
+ *
+ * The remaining reasons name an index that EXISTS and could not be served — the cases
+ * every caller used to flatten into "No analysis found", which is the one sentence that
+ * is wrong for all of them (change: name-the-reason-an-index-is-unservable). They are
+ * reasons of the SAME taxonomy deliberately: an agent branches on one `reason` field,
+ * never on two parallel vocabularies.
+ *  - `index-publish-in-progress`   — a writer is mid-publish RIGHT NOW. Expected and
+ *                                    transient; the remedy is to retry, not to rebuild.
+ *  - `index-generation-unavailable`— the generation manifest is present and was REFUSED
+ *                                    (malformed, oversized, not a regular file).
+ *  - `index-generation-mismatch`   — the artifacts no longer hash to their published
+ *                                    generation and NO writer was observed. A publish was
+ *                                    lost; serving would serve unverified bytes.
+ *  - `index-unreadable`            — present and coherent, and still not loadable (a
+ *                                    symlinked/irregular artifact, or a malformed one).
+ */
+export type NotReadyReason =
+  | 'index-absent'
+  | 'graph-unavailable'
+  | 'index-publish-in-progress'
+  | 'index-generation-unavailable'
+  | 'index-generation-mismatch'
+  | 'index-unreadable';
+
+/** A structured "not ready" conclusion — see {@link notReadyResult}. */
+export interface NotReadyResult {
+  error: string;
+  /** Machine-readable flag so an agent can branch without parsing the message. */
+  notReady: true;
+  reason: NotReadyReason;
+  /** The single command that makes the tool ready. */
+  remedy: string;
+}
+
+/**
+ * Build a structured, ready-or-honest "not ready" result. A graph-dependent tool
+ * invoked before a usable index exists SHALL return one of these — never a
+ * silently-degraded empty result. The human-readable `error` is preserved verbatim
+ * (so existing callers/tests that read `.error` keep working); the `notReady` flag,
+ * `reason` discriminator, and exact `remedy` command are added so an agent can act
+ * on the cause deterministically and consistently across every tool.
+ */
+export function notReadyResult(
+  error: string,
+  reason: NotReadyReason,
+  remedy = 'openlore analyze',
+): NotReadyResult {
+  return { error, notReady: true, reason, remedy };
+}
+
+interface ContextCacheEntry {
+  ctx: CachedContext;
+  mtime: number;
+  /** Committed analysis generation this entry was read under, when one exists. */
+  generation: string | null;
+}
+
+/**
+ * One entry per project directory. Invalidated when EITHER the artifact mtime or
+ * the committed analysis generation changes, so an external analyze cannot leave
+ * a daemon serving the previous generation's paths.
+ */
+const _contextCache = new Map<string, ContextCacheEntry>();
+
+/**
+ * Normalize a directory string before using it as a `_contextCache` key.
+ *
+ * Callers reach this cache with independently-derived path strings:
+ * `validateDirectory` (every MCP handler's read path) preserves whatever casing
+ * the caller passed, while `serve.ts`'s `canonicalServeRoot` (the daemon's own
+ * `root`, used by `releaseContextCache` at teardown) lowercases on `win32`. On a
+ * case-sensitive filesystem those never differ; on Windows a mixed-case populate
+ * key and a lowercased evict key are different Map keys for the SAME directory —
+ * `releaseContextCache` would silently no-op, leaking the entry's open
+ * EdgeStore/SQLite handle for the life of the process instead of releasing it on
+ * `serve --stop`. Lowercasing here on win32 (a no-op everywhere else) makes every
+ * caller agree on one key regardless of the casing it happened to arrive with.
+ */
+function contextCacheKey(directory: string): string {
+  return process.platform === 'win32' ? directory.toLowerCase() : directory;
+}
+
+/** Grace period before closing an evicted EdgeStore so concurrent in-flight
+ * requests holding the old handle across an await can drain first. */
+const STALE_STORE_CLOSE_DELAY_MS = 30_000;
+
+/** Hard ceiling on the analysis artifact (.openlore/analysis/llm-context.json)
+ * before we deserialize it. Real contexts are single-digit MB; this generous cap
+ * exists only to fail closed on a poisoned/oversized artifact rather than OOM. */
+const ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
+
+/** Test-only: clear in-memory context cache to force cold path. */
+export function _resetContextCacheForTesting(): void {
+  // Swallow a double-close: a test may already have closed a cached store by hand
+  // (as releaseContextCache does on the production path).
+  for (const entry of _contextCache.values()) {
+    try { entry.ctx.edgeStore?.close(); } catch { /* already closed */ }
+  }
+  _contextCache.clear();
+  _startLineByContext = new WeakMap();
+}
+
+/** Release the parsed context and EdgeStore owned by one long-lived host. */
+export function releaseContextCache(directory: string): void {
+  const key = contextCacheKey(directory);
+  const entry = _contextCache.get(key);
+  if (!entry) return;
+  _contextCache.delete(key);
+  _startLineByContext.delete(entry.ctx);
+  try { entry.ctx.edgeStore?.close(); } catch { /* already closed by an in-process consumer */ }
+}
+
+/** Test seam for lifecycle assertions; production code uses {@link releaseContextCache}. */
+export function _contextCacheSizeForTesting(): number {
+  return _contextCache.size;
+}
+
+/**
+ * Watch-mode handoff (Spec 13.1). Push an updated context into the in-memory
+ * read cache so the next tool call is a cache HIT — no 2.1 MB disk re-parse —
+ * even though the watcher only patched a few signatures. Keyed identically to
+ * {@link readCachedContext} (resolved project directory).
+ *
+ * The cached `mtime` is set to the current on-disk `llm-context.json` mtime so
+ * the entry stays valid until the file genuinely changes on disk again:
+ *   • watcher patches in memory but defers the disk write → disk mtime is
+ *     unchanged → this entry matches → hit returns the patched context;
+ *   • watcher writes the file then primes → disk mtime is the just-written one
+ *     → this entry matches → hit, no cold re-parse of what we just wrote;
+ *   • some other process (e.g. `openlore analyze`) rewrites the file → its mtime
+ *     differs from this entry → next read MISSes and re-reads disk → correct.
+ */
+export async function primeContextCache(directory: string, ctx: CachedContext): Promise<void> {
+  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
+  let mtime: number;
+  try {
+    mtime = (await stat(filePath)).mtimeMs;
+  } catch {
+    return; // no artifact on disk yet — nothing to stay fresh against
+  }
+  const key = contextCacheKey(directory);
+  const existing = _contextCache.get(key);
+  // Preserve an already-open EdgeStore handle if the new ctx doesn't carry one.
+  if (existing?.ctx.edgeStore && !ctx.edgeStore) {
+    ctx.edgeStore = existing.ctx.edgeStore;
+  }
+  bindArtifactMtime(ctx, mtime);
+  const generation = (await readCurrentGeneration(analysisDir, [...REQUIRED_ANALYSIS_ARTIFACTS]))?.generationId ?? null;
+  _contextCache.set(key, { ctx, mtime, generation });
+}
+
+/**
+ * Name why {@link readCachedContext} returned null.
+ *
+ * `readCachedContext` already DISTINGUISHES these cases — it emits a different telemetry
+ * `reason` for each — and then returns a bare `null`, so every caller collapses them into
+ * "No analysis found. Run analyze_codebase first." That message is right for exactly one of
+ * them, and actively misleading for the rest: it reports a FAILED INTEGRITY CHECK as an
+ * absent index, which is the quiet downgrade `loadPartialFirstRun`'s docstring says this lane
+ * exists to prevent. It also hides the incident — a user reads "no analysis", runs analyze,
+ * it works, and the lost publish is never reported.
+ *
+ * The verdict is a {@link NotReadyResult}, the SAME shape and the same `reason` taxonomy every
+ * other not-ready conclusion already uses, so an agent branches on one field rather than on a
+ * parallel vocabulary.
+ *
+ * Called ONLY on the null path, so the ordinary read pays nothing for it. It re-derives
+ * rather than threading state through 56 call sites: the cost is a stat and a hash on a path
+ * that is already returning an error.
+ */
+export async function diagnoseIndexUnservable(directory: string): Promise<NotReadyResult> {
+  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const contextPath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
+
+  try {
+    // `lstat`, not `stat`. The production reader opens `O_NOFOLLOW` and verifies the
+    // descriptor against the path entry, so it refuses a SYMLINK outright
+    // (`artifact_not_a_regular_file`). A path-following `stat` here would report a
+    // symlink-to-a-regular-file as an ordinary artifact and then diagnose the read failure as
+    // a lost publish, and a DANGLING symlink as an absent index — restating, as a diagnosis,
+    // the exact lie this function exists to remove. `lstat` describes the entry the reader
+    // actually refused. (It does not open the file, so the FIFO-blocking concern that forces
+    // the reader's `O_NONBLOCK` does not arise here.)
+    const entry = await lstat(contextPath);
+    if (!entry.isFile()) {
+      return notReadyResult(
+        `The analysis artifact at ${ARTIFACT_LLM_CONTEXT} is not a regular file `
+        + `(it is a ${describeEntryKind(entry)}) and was refused. Run analyze to rebuild it.`,
+        'index-unreadable',
+      );
+    }
+  } catch {
+    return notReadyResult('No analysis found. Run analyze_codebase first.', 'index-absent');
+  }
+
+  // Ask BEFORE concluding damage. `markGenerationUnavailable` deliberately writes a
+  // well-formed `{version, state:'publishing'}` manifest before the first artifact
+  // replacement of a NORMAL, healthy publish, and `readCurrentGeneration` answers null for it
+  // by design. Reporting that as a damaged publish would call the commit protocol working
+  // exactly as specified a fault.
+  if (await generationPublishInProgress(analysisDir)) {
+    return notReadyResult(
+      'An analysis exists but a publish is in progress: the writer has marked the previous '
+      + 'generation unavailable and has not yet published the new one, so no generation can '
+      + 'currently be vouched for. This is the normal commit protocol, not damage — retry '
+      + 'shortly. If it persists, a writer died mid-publish and `openlore analyze` republishes.',
+      'index-publish-in-progress',
+      'retry shortly',
+    );
+  }
+
+  const manifest = await readCurrentGeneration(analysisDir, [...REQUIRED_ANALYSIS_ARTIFACTS]);
+  if (!manifest) {
+    return notReadyResult(
+      // Deliberately NOT "missing": an absent manifest is a legitimate legacy analysis and is
+      // synthesized, so it never reaches here. Nor "in progress": the sentinel is answered
+      // above. Reaching here means the manifest is PRESENT, is not the sentinel, and was
+      // REFUSED — a symlink, a FIFO, an oversized or malformed file — which
+      // `readCurrentGeneration` fails closed on rather than synthesizing around.
+      'An analysis exists but its generation manifest is present and was refused (it is '
+      + 'malformed, oversized, or not a regular file — an in-flight publish is reported '
+      + 'separately), so the artifacts cannot be vouched for and are not served. Re-run '
+      + 'analyze to republish.',
+      'index-generation-unavailable',
+    );
+  }
+
+  if (!await artifactMatchesGeneration(analysisDir, manifest, ARTIFACT_LLM_CONTEXT)) {
+    // A mismatch alone proves nothing. A writer updates artifacts IN PLACE and publishes the
+    // manifest LAST, so this is the EXPECTED state throughout any concurrent `analyze` or
+    // watcher persist — the very window `readCachedContext`'s own guard comment describes.
+    // Only the absence of a writer makes it an incident, so ask the writer lock instead of
+    // asserting one and hedging with "if this recurs".
+    if (await isAnalysisLockHeld(analysisDir)) {
+      return notReadyResult(
+        'An analysis exists but does not currently match its published generation '
+        + `(${manifest.generationId}) because a writer holds the analysis lock: a publish is `
+        + 'in progress and the manifest is published last. This is the expected mid-write '
+        + 'window, not damage — retry shortly.',
+        'index-publish-in-progress',
+        'retry shortly',
+      );
+    }
+    return notReadyResult(
+      'An analysis exists but does NOT match its published generation '
+      + `(${manifest.generationId}): the artifacts were rewritten and the manifest was not `
+      + 'republished, so serving them would serve unverified bytes. No writer holds the '
+      + 'analysis lock, so this is not an ordinary mid-write window — a publish was lost. '
+      + 'Re-run analyze to republish, and a recurrence without a crash is worth reporting.',
+      'index-generation-mismatch',
+    );
+  }
+
+  return notReadyResult(
+    'An analysis exists and matches its generation, but could not be read into a usable '
+    + 'context. Re-run analyze; if it recurs, the artifact is likely malformed.',
+    'index-unreadable',
+  );
+}
+
+/** Name the entry kind a refused artifact actually is, without guessing beyond what stat saw. */
+function describeEntryKind(entry: { isSymbolicLink(): boolean; isDirectory(): boolean; isFIFO(): boolean }): string {
+  if (entry.isSymbolicLink()) return 'symbolic link';
+  if (entry.isDirectory()) return 'directory';
+  if (entry.isFIFO()) return 'named pipe';
+  return 'special file';
 }
 
 export async function readCachedContext(directory: string, timeout?: number): Promise<CachedContext | null> {
-  const analysisDir = join(directory, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const analysisDir = join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const filePath = join(analysisDir, ARTIFACT_LLM_CONTEXT);
+
+  /**
+   * The fallback for an index-ABSENT repository whose first build is still running
+   * (change: refine-first-run-partial-serving).
+   *
+   * Reached only when there is NO published analysis artifact at all. A published
+   * artifact that failed an integrity gate above must keep failing: masking a corrupt
+   * or mid-rewrite index with a partial one would turn a loud problem into a quiet
+   * downgrade, which is the opposite of what this lane is for.
+   *
+   * The returned context carries no `edgeStore` and no `callGraph`, so graph tools go on
+   * answering `graph-unavailable` — an honest "not yet", not a fabricated empty graph.
+   * What it does carry is `partial`, the receipt every disclosure and every
+   * negative-conclusion guard keys on.
+   */
+  async function loadPartialFirstRun(): Promise<CachedContext | null> {
+    try {
+      await stat(filePath);
+      return null;
+    } catch {
+      // No published artifact — the one situation a partial index may answer in.
+    }
+    const stamp = await readPartialIndexStamp(analysisDir);
+    if (!stamp) return null;
+    // Read through the bounded, symlink-refusing, regular-files-only descriptor path: this
+    // file is untrusted repository content, and a partial index is served precisely when the
+    // repository shipped one and no analysis exists.
+    const raw = await readPartialArtifact(analysisDir, ARTIFACT_LLM_CONTEXT);
+    if (raw === null) return null;
+    try {
+      const parsed = JSON.parse(raw) as CachedContext;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      if (parsed.partial?.partial !== true) return null;
+      // Fail closed on the graph-shaped fields. A partial index carries none of them BY
+      // DEFINITION, so anything present here came from a file this process did not write — and
+      // a handler doing `cg.nodes.map(...)` over an attacker-chosen shape is the failure mode
+      // the published path's normalization exists to prevent. Deleting them is stricter than
+      // normalizing and needs no schema to stay correct.
+      delete parsed.callGraph;
+      delete parsed.signatures;
+      delete parsed.cfgs;
+      delete parsed.graphDigest;
+      // The live receipt wins over the copy frozen into the artifact: the artifact was
+      // committed at a phase boundary, the receipt is re-stamped while the build runs.
+      parsed.partial = stamp;
+      notePartialIndexServed(stamp);
+      emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'partial_first_run_index' });
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
 
   async function load(): Promise<CachedContext | null> {
+    return (await loadPublished()) ?? await loadPartialFirstRun();
+  }
+
+  async function loadPublished(): Promise<CachedContext | null> {
     try {
-      const raw = await readFile(join(analysisDir, ARTIFACT_LLM_CONTEXT), 'utf-8');
-      const ctx = JSON.parse(raw) as CachedContext;
-      // Attach EdgeStore when call-graph.db is present (incremental edge updates)
-      if (EdgeStore.exists(analysisDir)) {
-        ctx.edgeStore = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+      // Keep one descriptor from metadata check through read. A path-based stat
+      // followed by a path-based read lets an untrusted repository swap the file
+      // between those operations and bypass the size check.
+      // O_NOFOLLOW|O_NONBLOCK, not a bare 'r'. This is the reader almost every tool reaches, and
+      // `.openlore/analysis/llm-context.json` is repository-controlled: a symlink there
+      // redirected the read, and a named pipe blocked inside `open()` until a writer appeared —
+      // on a libuv worker, which `process.exit` cannot interrupt, so the server could not shut
+      // down either. `isFile()` below is what then refuses the pipe; O_NONBLOCK is what lets the
+      // open return so that check can run. (`O_NONBLOCK` is absent on Windows, where these flags
+      // are emulated; `?? 0` keeps the open unchanged there and `isFile()` still refuses.)
+      const handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0));
+      try {
+      const st = await handle.stat();
+      // `O_NOFOLLOW` above is the race-free refusal, and it is what POSIX honours — but libuv
+      // does NOT implement it on Windows, where the flag is silently ignored and the link is
+      // followed. So the open is VERIFIED too: the descriptor's identity is compared against the
+      // path entry's, and a path that is a link (or resolves to a different inode) is refused.
+      // Checking after the open rather than before it is what makes this sound — the bytes come
+      // from the descriptor, so an entry swapped afterwards cannot redirect the read.
+      if (!st.isFile() || !await descriptorIsThePathEntry(handle, filePath)) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_not_a_regular_file' });
+        return null;
       }
+      const mtime = st.mtimeMs;
+      // Key on the committed generation as well as the artifact mtime. An mtime
+      // alone cannot distinguish "same file" from "republished with identical
+      // timestamp granularity", which is how a daemon could keep serving paths
+      // that only existed in the previous generation (change
+      // `harden-spec-workflow-lifecycle`, decision 64e6eb87).
+      const generationManifest = await readCurrentGeneration(analysisDir, [...REQUIRED_ANALYSIS_ARTIFACTS]);
+      if (!generationManifest) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'analysis_generation_unavailable' });
+        return null;
+      }
+      const generation = generationManifest?.generationId ?? null;
+      // A writer updates artifacts in place and publishes the manifest last. During
+      // that interval the old generation id is still visible, so id+mtime alone can
+      // bless uncommitted bytes. Bind this read to the manifest's content digest.
+      if (generationManifest
+        && !await artifactMatchesGeneration(analysisDir, generationManifest, ARTIFACT_LLM_CONTEXT)) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'analysis_generation_changed' });
+        return null;
+      }
+      const cached = _contextCache.get(contextCacheKey(directory));
+      if (cached && cached.mtime === mtime && cached.generation === generation) {
+        emit(directory, 'cache', { event: 'cache_read', hit: true });
+        return cached.ctx;
+      }
+      // mcp-security (Untrusted Artifact Deserialization): the analysis artifact
+      // lives under .openlore/ and is treated as untrusted input. Bound its size
+      // before reading so a poisoned/oversized file can't OOM the server; legit
+      // contexts are single-digit MB, far below this ceiling.
+      if (st.size > ARTIFACT_MAX_BYTES) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_too_large', size: st.size });
+        return null;
+      }
+      // Cache miss — read 3.7MB JSON and open EdgeStore connection
+      const raw = await readUtf8Bounded(handle, ARTIFACT_MAX_BYTES);
+      if (raw === null) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_too_large' });
+        return null;
+      }
+      const afterGeneration = await readCurrentGeneration(analysisDir, [...REQUIRED_ANALYSIS_ARTIFACTS]);
+      const expectedContext = afterGeneration?.artifacts.find(record => record.path === ARTIFACT_LLM_CONTEXT);
+      const rawMatches = afterGeneration?.compatibility === 'legacy'
+        || (expectedContext !== undefined
+          && Buffer.byteLength(raw) === expectedContext.bytes
+          && createHash('sha256').update(raw).digest('hex') === expectedContext.sha256);
+      if (afterGeneration?.generationId !== generation
+        || !rawMatches
+        || (afterGeneration
+          && !await artifactMatchesGeneration(analysisDir, afterGeneration, ARTIFACT_LLM_CONTEXT))) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'analysis_generation_changed' });
+        return null;
+      }
+      const parsed: unknown = JSON.parse(raw);
+      // Validate top-level shape before use: a valid context is a non-null,
+      // non-array object. Fail closed on null/scalar/array so a malformed or
+      // schema-mismatched artifact yields a clean "re-run analyze" result
+      // downstream instead of propagating attacker-shaped values.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'artifact_shape_invalid' });
+        return null;
+      }
+      const ctx = parsed as CachedContext;
+      // Bind freshness fallbacks to THIS parsed generation. A later analyze may
+      // replace the artifact while a handler is still composing its response;
+      // re-statting at response time could otherwise bless stale cached data with
+      // the newer generation's timestamp.
+      bindArtifactMtime(ctx, mtime);
+      // Normalize a present callGraph so `nodes`/`edges` are always arrays. A truncated
+      // or hand-edited artifact (`{"callGraph": {}}`) — or a minimal one carrying only
+      // entryPoints/hubFunctions — would otherwise throw when a handler does
+      // `cg.nodes.map(...)`. Coerce the missing/invalid arrays to [] (graceful empty)
+      // rather than dropping the whole graph: other handlers (architecture overview)
+      // legitimately read entryPoints/hubFunctions without touching nodes/edges. A
+      // callGraph that isn't even an object is unusable, so drop that.
+      if (ctx.callGraph !== undefined) {
+        if (typeof ctx.callGraph === 'object' && ctx.callGraph !== null) {
+          const cg = ctx.callGraph as { nodes?: unknown; edges?: unknown };
+          if (!Array.isArray(cg.nodes)) cg.nodes = [];
+          if (!Array.isArray(cg.edges)) cg.edges = [];
+          // Bind this generation's graph to the persisted traversal structure by the
+          // graph digest `analyze` wrote INTO the context, so the structure is accepted
+          // only when it describes THIS graph (change:
+          // shrink-traversal-index-invalidation-scope). Recorded on the parsed object,
+          // never on the context we might re-serialize.
+          //
+          // No hashing on this path. The previous key was the SHA-256 of the whole
+          // artifact, charged to EVERY cache miss and every tool — `orient`,
+          // `search_code`, `get_spec` — not only the traversal ones (measured at 29 ms
+          // over this repo's 11.7 MB context). The key now rides in the JSON already
+          // parsed, so establishing currency is a field read: O(1), no crypto. A legacy
+          // context that predates this field records no key, so no persisted structure
+          // is consulted and the traversal is built in memory — today's behavior.
+          if (typeof ctx.graphDigest === 'string') {
+            recordGraphDigest(ctx.callGraph as SerializedCallGraph, ctx.graphDigest);
+          }
+        } else {
+          ctx.callGraph = undefined;
+        }
+      }
+      // Read-path staleness signals captured while the store is open, so the
+      // background repair trigger below can fire even when the empty/not-ready guard
+      // closes the store (change: make-index-self-healing).
+      let schemaFault = false;
+      let staleCount = 0;
+      if (EdgeStore.exists(analysisDir)) {
+        const es = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+        if (es.notReady) {
+          // ReadPathsNeverDestroyTheIndex / CorruptGraphStoreQuarantineParity: a
+          // schema-mismatched or quarantined store is left intact on disk (or moved to
+          // *.corrupt-<n>) and reported — never served as an empty graph. Trigger the
+          // shared background repair and disclose via the freshness-note channel below
+          // (change: harden-index-store-lifecycle).
+          schemaFault = true;
+          es.close();
+        } else {
+          // Index integrity attestation (change: add-index-integrity-attestation).
+          // Reconcile the just-opened store against its build-time attestation BEFORE the
+          // empty guard may close it. Best-effort + additive: any fault here leaves the
+          // verdict unset (unverifiable), never blocks the load.
+          try {
+            const verdict = await computeIndexIntegrity(es, analysisDir);
+            if (verdict) {
+              ctx.integrity = verdict;
+              if (verdict.verdict !== 'healthy') {
+                // Recoverable signal: a non-healthy index is reported, never silently
+                // served as complete. Tools disclose it via the confidence boundary.
+                emit(directory, 'cache', { event: 'index_integrity', verdict: verdict.verdict });
+              }
+            }
+          } catch {
+            // Attestation reconciliation is additive; never block the load.
+          }
+          try { staleCount = es.countStaleFiles(); } catch { /* pre-migration store — no stale_files table */ }
+          // Empty-store guard: if the store is empty but the JSON analysis still has
+          // production nodes, the two are out of sync — do NOT serve the empty store.
+          // Edge-store tools then return "Re-run analyze_codebase" instead of silent
+          // empty results; the next analyze repopulates and re-attaches.
+          const jsonProdNodes = Array.isArray(ctx.callGraph?.nodes)
+            ? ctx.callGraph.nodes.filter(n => !n.isExternal && !n.isTest).length
+            : 0;
+          if (es.countNodes() === 0 && jsonProdNodes > 0) {
+            es.close();
+          } else {
+            ctx.edgeStore = es;
+          }
+        }
+      }
+      // Opening and attesting the database happens after the JSON generation check above.
+      // Re-check the commit point now so promotion cannot pair old context with a newly
+      // replaced call-graph.db in one cached object.
+      const finalGeneration = await readCurrentGeneration(analysisDir, [...REQUIRED_ANALYSIS_ARTIFACTS]);
+      const boundGraphArtifactsMatch = !finalGeneration
+        || !finalGeneration.artifacts.some(record => record.path === ARTIFACT_CALL_GRAPH_DB)
+        || (await artifactMatchesGeneration(analysisDir, finalGeneration, ARTIFACT_CALL_GRAPH_DB)
+          && await artifactMatchesGeneration(analysisDir, finalGeneration, ARTIFACT_INDEX_ATTESTATION));
+      if (finalGeneration?.generationId !== generation || !boundGraphArtifactsMatch) {
+        try { ctx.edgeStore?.close(); } catch { /* best-effort close on rejected snapshot */ }
+        emit(directory, 'cache', { event: 'cache_read', hit: false, reason: 'analysis_generation_changed' });
+        return null;
+      }
+      // Self-healing: any read-path staleness signal that today only produces a
+      // verdict also triggers the shared at-most-once background repair — detection
+      // finally closes the loop into repair (change: make-index-self-healing). The
+      // rebuild never blocks this read; the answer is served now and disclosed as
+      // stale-with-refresh-started (see repairStatusFor callers).
+      maybeTriggerBackgroundRepair(directory, ctx.integrity?.verdict, schemaFault, staleCount, mtime);
+      // Evict + close the previous entry's EdgeStore — otherwise each cache miss
+      // (every `analyze` rewrites llm-context.json's mtime) leaks an open SQLite
+      // connection + its WAL fd for the life of a long-lived daemon. The close is
+      // DEFERRED: serve dispatches requests concurrently, and a handler may hold
+      // the old handle across an await (e.g. get_subgraph awaits a vector search
+      // between edgeStore reads). A grace delay lets in-flight requests drain
+      // before release, bounding live handles to ~grace/reanalyze-interval.
+      const cacheKey = contextCacheKey(directory);
+      const prev = _contextCache.get(cacheKey);
+      _contextCache.set(cacheKey, { ctx, mtime, generation });
+      if (prev?.ctx.edgeStore && prev.ctx.edgeStore !== ctx.edgeStore) {
+        const stale = prev.ctx.edgeStore;
+        const t = setTimeout(() => { try { stale.close(); } catch { /* already closed */ } }, STALE_STORE_CLOSE_DELAY_MS);
+        t.unref?.();
+      }
+      emit(directory, 'cache', { event: 'cache_read', hit: true });
       return ctx;
+      } finally {
+        await handle.close();
+      }
     } catch {
+      emit(directory, 'cache', { event: 'cache_read', hit: false });
       return null;
     }
   }
@@ -135,56 +849,259 @@ export async function readCachedContext(directory: string, timeout?: number): Pr
   return load();
 }
 
+/**
+ * Wait for graph rebuild to complete after schema mismatch.
+ *
+ * When a schema version change is detected, EdgeStore resets itself and
+ * McpWatcher spawns a background `openlore analyze --reanalyze`. This helper
+ * polls until the rebuild completes (edgeStore is populated) or timeout.
+ *
+ * Used by graph tools (analyze_impact, trace_execution_path) to auto-heal
+ * after version upgrades instead of failing immediately.
+ *
+ * @returns true if rebuild completed (edgeStore now available), false on timeout
+ */
+export async function waitForGraphRebuild(
+  directory: string,
+  timeoutMs = 60_000
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const pollIntervalMs = 2000;
+
+  while (Date.now() < deadline) {
+    const ctx = await readCachedContext(directory);
+    if (ctx?.edgeStore) {
+      logger.debug(`[waitForGraphRebuild] Graph rebuild completed after ${Date.now() - (deadline - timeoutMs)}ms`);
+      return true;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining > 0) {
+      await new Promise(r => setTimeout(r, Math.min(pollIntervalMs, remaining)));
+    }
+  }
+
+  logger.warning(
+    `[waitForGraphRebuild] Graph rebuild did not complete within ${timeoutMs}ms timeout. ` +
+    'Run "openlore analyze --force" manually to rebuild the call graph.'
+  );
+  return false;
+}
+
 // ============================================================================
 // PROJECT FINGERPRINT — content-hash based cache invalidation
 // ============================================================================
 
-const FINGERPRINT_SKIP_DIRS = new Set([
-  '.git', 'node_modules', 'dist', 'build', '.next', '.spec-gen',
-  'coverage', '.cache', '__pycache__', '.venv', 'venv', 'target',
-  '.dart_tool', '.pub-cache',
-]);
+const DEFAULT_FINGERPRINT_MAX_FILES = 100_000;
+export const DEFAULT_FINGERPRINT_MAX_BYTES = 1024 * 1024 * 1024;
 
-const FINGERPRINT_SOURCE_EXTS = new Set([
-  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.py', '.go', '.rs', '.rb', '.java', '.kt', '.swift',
-  '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cs',
-]);
-
-async function walkForFingerprint(
-  dir: string,
-  root: string,
-  out: Array<{ path: string; mtime: number; size: number }>
-): Promise<void> {
-  let entries;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      if (!FINGERPRINT_SKIP_DIRS.has(entry.name)) {
-        await walkForFingerprint(join(dir, entry.name), root, out);
-      }
-    } else if (entry.isFile() && FINGERPRINT_SOURCE_EXTS.has(extname(entry.name))) {
-      try {
-        const s = await stat(join(dir, entry.name));
-        out.push({ path: relative(root, join(dir, entry.name)), mtime: s.mtimeMs, size: s.size });
-      } catch {
-        // skip unreadable
-      }
+/**
+ * The largest non-overlapping paths in a walked corpus, for the byte-budget error (issue #504).
+ *
+ * Every file's size is rolled into each of its ancestor directories, then the totals are read from
+ * largest down, keeping an entry only when no ancestor or descendant of it has been kept already.
+ * Non-overlapping is the property that makes the list usable: each line can go straight into
+ * `excludePatterns` without two of them claiming the same bytes.
+ *
+ * Files are candidates alongside directories, and ties break toward the deeper path, so the name
+ * that comes back is the most specific one that still accounts for the bytes. A vector store whose
+ * weight sits under `data/vectors` is reported there rather than at `data`, and a single oversized
+ * archive is reported as the file rather than as the directory that happens to hold it.
+ *
+ * The repository root is never a candidate. It is the largest subtree by construction and naming it
+ * tells a user only that their repository is large, which is what they already know. A path holding
+ * less than FINGERPRINT_BUDGET_OFFENDER_MIN_SHARE of the corpus is filler and is not named either.
+ */
+export function largestCorpusPaths(
+  files: readonly Pick<FileMetadata, 'path' | 'size'>[],
+  limit: number
+): Array<{ path: string; bytes: number }> {
+  const totals = new Map<string, number>();
+  let corpusBytes = 0;
+  for (const file of files) {
+    corpusBytes += file.size;
+    totals.set(file.path, (totals.get(file.path) ?? 0) + file.size);
+    const segments = file.path.split('/');
+    segments.pop();
+    let prefix = '';
+    for (const segment of segments) {
+      prefix = prefix === '' ? segment : `${prefix}/${segment}`;
+      totals.set(prefix, (totals.get(prefix) ?? 0) + file.size);
     }
   }
+
+  const ranked = [...totals].sort(([leftPath, leftBytes], [rightPath, rightBytes]) => {
+    if (leftBytes !== rightBytes) return rightBytes - leftBytes;
+    const depth = rightPath.split('/').length - leftPath.split('/').length;
+    if (depth !== 0) return depth;
+    return leftPath.localeCompare(rightPath);
+  });
+
+  const chosen: Array<{ path: string; bytes: number }> = [];
+  const minBytes = corpusBytes * FINGERPRINT_BUDGET_OFFENDER_MIN_SHARE;
+  for (const [path, bytes] of ranked) {
+    if (chosen.length >= limit || bytes < minBytes) break;
+    const overlaps = chosen.some(kept => kept.path === path
+      || path.startsWith(`${kept.path}/`)
+      || kept.path.startsWith(`${path}/`));
+    if (!overlaps) chosen.push({ path, bytes });
+  }
+  return chosen;
 }
 
-/** Compute a SHA-256 fingerprint of all source file mtimes+sizes under rootDir. */
-export async function computeProjectFingerprint(rootDir: string): Promise<string> {
-  const files: Array<{ path: string; mtime: number; size: number }> = [];
-  await walkForFingerprint(rootDir, rootDir, files);
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  const payload = files.map(f => `${f.path}:${f.mtime}:${f.size}`).join('\n');
-  return createHash('sha256').update(payload).digest('hex');
+/**
+ * The byte-budget failure, written so a user can act on it without a filesystem hunt (issue #504).
+ *
+ * The budget aborts partway through reading, so this message is the only account anyone gets of
+ * what filled it. The bare limit that used to be reported named no path, did not say what kind of
+ * limit it was, and left users scanning directories by hand to find the weight. The sizes here come
+ * from the walk, which has already stat'd every admitted file, so the totals cover the whole corpus
+ * and not merely the prefix that had been read when the budget tripped.
+ */
+export function fingerprintBudgetExceededMessage(
+  maxBytes: number,
+  files: readonly Pick<FileMetadata, 'path' | 'size'>[],
+  corpusTruncated = false
+): string {
+  const offenders = largestCorpusPaths(files, FINGERPRINT_BUDGET_TOP_OFFENDERS);
+  const selected = files.reduce((total, file) => total + file.size, 0);
+  const lines = [
+    `Project fingerprint byte budget exceeded: the files selected for indexing total ${formatBytes(selected)}, `
+      + `over the ${formatBytes(maxBytes)} cap on how much one analysis will read (${maxBytes} bytes). `
+      + 'This is a safety cap in openlore, not a limit on your machine.',
+  ];
+  if (offenders.length > 0) {
+    lines.push('', 'Largest contributors:');
+    for (const offender of offenders) {
+      // Repository-controlled: strip control characters so a file name cannot forge a line.
+      lines.push(`  ${formatBytes(offender.bytes).padStart(8)}  ${sanitizeForTerminal(offender.path)}`);
+    }
+  }
+  if (corpusTruncated) {
+    lines.push('', 'The file walk hit its own maxFiles cap first, so these totals cover only the files it admitted.');
+  }
+  lines.push(
+    '',
+    'Add the paths you do not want indexed to analysis.excludePatterns in .openlore/config.json, then re-run.',
+  );
+  return lines.join('\n');
+}
+
+export interface FingerprintLimits {
+  maxFiles?: number;
+  maxBytes?: number;
+  configuration?: unknown;
+  includePatterns?: string[];
+  excludePatterns?: string[];
+  protectedExcludePatterns?: string[];
+  maxDepth?: number;
+  maxEntries?: number;
+}
+
+/**
+ * The corpus the fingerprint reads: the same walk, with the same limits, that
+ * {@link computeProjectFingerprint} hashes. Exposed so `openlore doctor` can size it
+ * without reading a byte (issue #504).
+ */
+export async function walkFingerprintCorpus(
+  canonicalRoot: string,
+  limits: FingerprintLimits = {},
+): Promise<Awaited<ReturnType<FileWalker['walk']>>> {
+  const configured = limits.configuration as { includePatterns?: string[]; excludePatterns?: string[]; protectedExcludePatterns?: string[]; maxFiles?: number } | undefined;
+  const maxFiles = limits.maxFiles ?? configured?.maxFiles ?? DEFAULT_FINGERPRINT_MAX_FILES;
+  return new FileWalker(canonicalRoot, {
+    maxFiles,
+    includePatterns: limits.includePatterns ?? configured?.includePatterns ?? [],
+    excludePatterns: limits.excludePatterns ?? configured?.excludePatterns ?? [],
+    protectedExcludePatterns: limits.protectedExcludePatterns ?? configured?.protectedExcludePatterns ?? [],
+    maxDepth: limits.maxDepth,
+    maxEntries: limits.maxEntries,
+  }).walk();
+}
+
+/** Compute a SHA-256 fingerprint of source paths and bytes under rootDir. */
+export async function computeProjectFingerprint(rootDir: string, limits: FingerprintLimits = {}): Promise<string> {
+  const canonicalRoot = await realpath(rootDir);
+  const walk = await walkFingerprintCorpus(canonicalRoot, limits);
+  const hash = createHash('sha256');
+  hash.update(`configuration:${fingerprintHashOfConfiguration(limits.configuration)}\n`);
+  hash.update(`corpus:${JSON.stringify(walk.summary.truncated ?? null)}\n`);
+  let bytes = 0;
+  for (const file of [...walk.files].sort((left, right) => left.path.localeCompare(right.path))) {
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(file.absolutePath, 'r');
+      const opened = await handle.stat();
+      if (!isConfinedPath(canonicalRoot, await realpath(file.absolutePath))) {
+        throw new Error(`Project fingerprint path escaped repository: ${file.path}`);
+      }
+      const contentHash = createHash('sha256');
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        bytes += bytesRead;
+        if (bytes > (limits.maxBytes ?? DEFAULT_FINGERPRINT_MAX_BYTES)) {
+          throw new Error(fingerprintBudgetExceededMessage(
+            limits.maxBytes ?? DEFAULT_FINGERPRINT_MAX_BYTES,
+            walk.files,
+            walk.summary.truncated !== undefined,
+          ));
+        }
+        contentHash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      const after = await handle.stat();
+      if (position !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
+        throw new Error(`Project source changed while fingerprinting: ${file.path}`);
+      }
+      hash.update(`${file.path}:${opened.size}:${contentHash.digest('hex')}\n`);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+  return hash.digest('hex');
+}
+
+export function fingerprintHashOfConfiguration(configuration: unknown): string {
+  let cacheConfiguration = configuration ?? null;
+  if (configuration && typeof configuration === 'object' && !Array.isArray(configuration)) {
+    const portable = { ...configuration as Record<string, unknown> };
+    delete portable.protectedExcludePatterns;
+    cacheConfiguration = portable;
+  }
+  return createHash('sha256').update(JSON.stringify(cacheConfiguration)).digest('hex');
+}
+
+/** Content-hash freshness for any analysis output directory. */
+export async function isAnalysisCacheFresh(directory: string, analysisDir: string, configuration?: unknown): Promise<boolean> {
+  // Bounded read: the fingerprint is repository-controlled, so a committed FIFO here would block
+  // inside `open()` on a libuv worker forever. `absent` and `refused` are kept apart on purpose —
+  // only a genuinely MISSING fingerprint may fall back to the mtime heuristic; a refused one (FIFO,
+  // symlink, oversized) is not evidence of freshness and fails closed.
+  const read = await readArtifactBytesBounded(join(analysisDir, ARTIFACT_FINGERPRINT));
+  if (read.state === 'refused') return false;
+  if (read.state === 'absent') {
+    try {
+      const s = await stat(join(analysisDir, ARTIFACT_LLM_CONTEXT));
+      return Date.now() - s.mtimeMs < ANALYSIS_STALE_THRESHOLD_MS;
+    } catch {
+      return false;
+    }
+  }
+  const raw = read.bytes.toString('utf8');
+  try {
+    const stored = JSON.parse(raw) as { hash?: unknown; analysisConfigHash?: unknown };
+    if (typeof stored.hash !== 'string') return false;
+    if (stored.analysisConfigHash === undefined) {
+      return await computeProjectFingerprint(directory) === stored.hash;
+    }
+    if (stored.analysisConfigHash !== fingerprintHashOfConfiguration(configuration)) return false;
+    return await computeProjectFingerprint(directory, { configuration }) === stored.hash;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -192,20 +1109,13 @@ export async function computeProjectFingerprint(rootDir: string): Promise<string
  * Uses content-hash fingerprint when available; falls back to TTL check.
  */
 export async function isCacheFresh(directory: string): Promise<boolean> {
-  const fingerprintPath = join(directory, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_FINGERPRINT);
-  try {
-    const stored = JSON.parse(await readFile(fingerprintPath, 'utf-8')) as { hash: string };
-    const current = await computeProjectFingerprint(directory);
-    return current === stored.hash;
-  } catch {
-    // No fingerprint yet — fall back to TTL
-    try {
-      const s = await stat(join(directory, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_LLM_CONTEXT));
-      return Date.now() - s.mtimeMs < ANALYSIS_STALE_THRESHOLD_MS;
-    } catch {
-      return false;
-    }
-  }
+  const config = await import('../config-manager.js').then(module => module.readOpenLoreConfig(directory));
+  const configuration = {
+    includePatterns: [...new Set(config?.analysis?.includePatterns ?? [])],
+    excludePatterns: [...new Set(config?.analysis?.excludePatterns ?? [])],
+    maxFiles: DEFAULT_MAX_FILES,
+  };
+  return isAnalysisCacheFresh(directory, join(directory, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR), configuration);
 }
 
 // ============================================================================
@@ -228,63 +1138,70 @@ export interface MappingIndex {
   entries: MappingEntry[];
 }
 
-/** Cache for mapping indices, keyed by directory path */
-const mappingCache = new Map<string, MappingIndex>();
-
-/** Load and index mapping.json for bidirectional lookup. Returns null if not found. */
-export async function loadMappingIndex(absDir: string, retryCount: number = 1): Promise<MappingIndex | null> {
-  // Check cache first
-  const cacheKey = absDir;
-  const cached = mappingCache.get(cacheKey);
-  if (cached) {
-    return cached;
+/**
+ * Build the bidirectional index for one parsed `mapping.json`, or null when the
+ * artifact is not the shape this reads.
+ *
+ * Untrusted artifact: the top-level shape is validated before use. A malformed
+ * mapping (non-object, or no `mappings` array) fails closed.
+ */
+function buildMappingIndex(parsed: unknown): MappingIndex | null {
+  if (parsed === null || typeof parsed !== 'object' || !Array.isArray((parsed as { mappings?: unknown }).mappings)) {
+    return null;
   }
-  
-  const loadAttempt = async (attempt: number): Promise<MappingIndex | null> => {
-    try {
-      const raw = await readFile(join(absDir, '.spec-gen', 'analysis', 'mapping.json'), 'utf-8');
-      const data = JSON.parse(raw) as { mappings: MappingEntry[] };
-      const entries = data.mappings ?? [];
-      
-      const byFile = new Map<string, MappingEntry[]>();
-      const byDomain = new Map<string, MappingEntry[]>();
-      
-      for (const entry of entries) {
-        // index by domain
-        const domainList = byDomain.get(entry.domain) ?? [];
-        domainList.push(entry);
-        byDomain.set(entry.domain, domainList);
-        
-        // index by each referenced file
-        for (const fn of entry.functions) {
-          if (!fn.file || fn.file === '*') continue;
-          const fileList = byFile.get(fn.file) ?? [];
-          // avoid duplicates (same requirement may appear multiple times per file)
-          if (!fileList.includes(entry)) fileList.push(entry);
-          byFile.set(fn.file, fileList);
-        }
-      }
-      
-      const result = { byFile, byDomain, entries };
-      // Cache the result
-      mappingCache.set(cacheKey, result);
-      return result;
-    } catch (error) {
-      if (attempt < retryCount && error instanceof Error) {
-        const delay = Math.pow(2, attempt) * 100; // Exponential backoff: 200ms, 400ms, 800ms...
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return loadAttempt(attempt + 1);
-      }
-      return null;
+  const entries = (parsed as { mappings: MappingEntry[] }).mappings ?? [];
+
+  const byFile = new Map<string, MappingEntry[]>();
+  const byDomain = new Map<string, MappingEntry[]>();
+
+  for (const entry of entries) {
+    // index by domain
+    const domainList = byDomain.get(entry.domain) ?? [];
+    domainList.push(entry);
+    byDomain.set(entry.domain, domainList);
+
+    // index by each referenced file
+    for (const fn of entry.functions) {
+      if (!fn.file || fn.file === '*') continue;
+      const fileList = byFile.get(fn.file) ?? [];
+      // avoid duplicates (same requirement may appear multiple times per file)
+      if (!fileList.includes(entry)) fileList.push(entry);
+      byFile.set(fn.file, fileList);
     }
-  };
-  
-  return loadAttempt(1);
+  }
+
+  return { byFile, byDomain, entries };
+}
+
+/**
+ * Load and index mapping.json for bidirectional lookup. Returns null if not found.
+ *
+ * Read through the shared stamp-keyed artifact cache. `mapping.json` is rewritten by
+ * an EXTERNAL process (`openlore generate`, `openlore mapping refresh`), so a
+ * directory-keyed cache made a rewrite invisible for the whole process lifetime and a
+ * daemon served the previous generation's spec links forever. The shared reader is
+ * also what bounds and identity-checks the read.
+ * (spec: ServingCachesInvalidateOnExternalAnalyze, change: optimize-serving-hot-path-caches)
+ *
+ * `retryCount` retries a transient read failure; a shape mismatch is not retried,
+ * because re-reading the same bytes cannot fix it.
+ */
+export async function loadMappingIndex(absDir: string, retryCount: number = 1): Promise<MappingIndex | null> {
+  const mappingPath = join(absDir, '.openlore', 'analysis', 'mapping.json');
+  for (let attempt = 1; ; attempt++) {
+    const index = await readJsonArtifactCached(mappingPath, 'mapping-index', buildMappingIndex);
+    if (index !== null) return index;
+    // Absent or malformed — nothing to retry against.
+    if (attempt >= retryCount || (await artifactStamp(mappingPath)) === null) return null;
+    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 100));
+  }
 }
 
 /** Clear the mapping cache. Useful for tests to reset state. */
 export function clearMappingCache(): void {
-  mappingCache.clear();
+  // The mapping index now lives in the shared stamp-keyed artifact cache; clearing that
+  // is what resets it. Kept under its old name so existing callers and tests still work.
+  _resetJsonArtifactCacheForTesting();
 }
 
 /** Summarise which specs cover a given file path (for search_code enrichment). */

@@ -1,0 +1,738 @@
+/**
+ * Spec 14 — MCP tool-preset selection (`--preset` / `--minimal`).
+ *
+ * Guards the navigation preset that flipped the agent benchmark from a loss to a
+ * win: it must expose exactly its graph-traversal tools, every preset name must
+ * resolve to a REAL tool (so a renamed/removed tool can't silently shrink the
+ * surface), and the selector's precedence/error behaviour must hold.
+ */
+import { describe, it, expect } from 'vitest';
+import { selectActiveTools, TOOL_PRESETS, TOOL_DEFINITIONS, STANDING_CONTEXT_BUDGETS, mcpCommand, BREADTH_POINTER, leanDefaultActive, resolvePresetName, renderToolSurfaceByFamily, renderActiveToolSurface, presetMembershipError } from './mcp.js';
+import { LEAN_DEFAULT_PRESET } from '../../constants.js';
+import { capabilityFamily, type CapabilityFamily } from '../../core/services/mcp-handlers/tool-contract.js';
+import { assertStandingContextBudget, buildToolListPayload, measureStandingContextTokens } from '../../core/services/mcp-standing-cost.js';
+
+const NAV = [
+  'orient', 'search_code', 'get_subgraph', 'trace_execution_path',
+  'analyze_impact', 'suggest_insertion_points', 'get_function_skeleton',
+  'get_landmarks', 'get_map', 'find_path',
+];
+const SPEC_WORKFLOWS = ['prepare_spec_generation', 'prepare_spec_repair'];
+
+describe('MCP tool presets', () => {
+  it('keeps every curated preset and the full surface within its declared standing-token budget', () => {
+    const surfaces: Record<string, typeof TOOL_DEFINITIONS> = {
+      ...Object.fromEntries(Object.entries(TOOL_PRESETS).map(([name, active]) => [
+        name,
+        TOOL_DEFINITIONS.filter((tool) => active.has(tool.name)),
+      ])),
+      full: TOOL_DEFINITIONS,
+    };
+    expect(Object.keys(STANDING_CONTEXT_BUDGETS).sort()).toEqual(Object.keys(surfaces).sort());
+    for (const [name, tools] of Object.entries(surfaces)) {
+      const budget = STANDING_CONTEXT_BUDGETS[name];
+      expect(budget.rationale.trim(), `${name} budget must include its review rationale`).not.toBe('');
+      expect(Number.isSafeInteger(budget.maxTokens) && budget.maxTokens > 0, `${name} budget must be a positive safe integer`).toBe(true);
+      const measured = measureStandingContextTokens(buildToolListPayload(tools, toolAnnotations));
+      expect(Number.isSafeInteger(budget.baselineTokens) && budget.baselineTokens > 0, `${name} adoption baseline must be a positive safe integer`).toBe(true);
+      const headroomPercent = (((budget.maxTokens - budget.baselineTokens) / budget.baselineTokens) * 100).toFixed(1);
+      expect(budget.rationale, `${name} rationale must state its ${headroomPercent}% headroom`).toContain(`${headroomPercent}%`);
+      expect(
+        budget.maxTokens,
+        `${name} budget may retain at most 10% headroom over its adoption baseline`,
+      ).toBeLessThanOrEqual(Math.ceil(budget.baselineTokens * 1.1));
+      expect(() => assertStandingContextBudget(
+        name,
+        measured,
+        budget,
+      )).not.toThrow();
+    }
+  });
+
+  it('fails with a named receipt when a description edit inflates a preset past budget', () => {
+    const tools = TOOL_DEFINITIONS.filter((tool) => TOOL_PRESETS.navigation.has(tool.name));
+    const measured = measureStandingContextTokens(buildToolListPayload(tools, toolAnnotations));
+    const inflated = tools.map((tool, index) => index === 0
+      ? { ...tool, description: `${tool.description}${' regression'.repeat(100)}` }
+      : tool);
+    expect(() => assertStandingContextBudget('navigation', measureStandingContextTokens(buildToolListPayload(inflated, toolAnnotations)), {
+      baselineTokens: measured,
+      maxTokens: measured,
+      rationale: 'Mutation-test budget fixed at the measured baseline.',
+    })).toThrow(/navigation.*measured.*budget/i);
+  });
+
+  it('every preset references only real, defined tools (no stale names)', () => {
+    const real = new Set(TOOL_DEFINITIONS.map(t => t.name));
+    for (const [name, set] of Object.entries(TOOL_PRESETS)) {
+      for (const tool of set) {
+        expect(real.has(tool), `preset "${name}" references unknown tool "${tool}"`).toBe(true);
+      }
+    }
+  });
+
+  it('rejects an out-of-surface tool for every curated preset with an actionable error', () => {
+    for (const [preset, active] of Object.entries(TOOL_PRESETS)) {
+      const hidden = TOOL_DEFINITIONS.find((tool) => !active.has(tool.name));
+      expect(hidden, `${preset} must be narrower than full`).toBeDefined();
+      const error = presetMembershipError(hidden!.name, preset, active);
+      expect(error).toContain(hidden!.name);
+      expect(error).toContain(`"${preset}" preset`);
+      expect(error).toContain('full');
+      expect(error).toContain('openlore install --preset <name>');
+    }
+  });
+
+  it('allows every advertised member and every tool on the full surface', () => {
+    for (const [preset, active] of Object.entries(TOOL_PRESETS)) {
+      for (const tool of active) expect(presetMembershipError(tool, preset, active)).toBeUndefined();
+    }
+    const full = new Set(TOOL_DEFINITIONS.map((tool) => tool.name));
+    for (const tool of full) expect(presetMembershipError(tool, 'full', full)).toBeUndefined();
+  });
+
+  it('navigation preset = exactly the 10 graph-traversal tools, no governance tools', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, { preset: 'navigation' }).map(t => t.name);
+    expect(new Set(tools)).toEqual(new Set(NAV));
+    for (const gov of ['record_decision', 'detect_changes', 'check_spec_drift']) {
+      expect(tools).not.toContain(gov);
+    }
+  });
+
+  it('minimal preset keeps its 6-tool contract', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, { minimal: true }).map(t => t.name);
+    expect(new Set(tools)).toEqual(new Set(['orient', 'search_code', 'record_decision', 'detect_changes', 'check_spec_drift', 'get_health_map']));
+  });
+
+  // change: add-parallel-work-plan — plan_parallel_work is opt-in via the `coordination`
+  // preset only; it must NOT leak into the lean/minimal/memory surfaces.
+  it('coordination preset exposes plan_parallel_work; lean/minimal/memory do not', () => {
+    const coord = selectActiveTools(TOOL_DEFINITIONS, { preset: 'coordination' }).map(t => t.name);
+    expect(new Set(coord)).toEqual(new Set(['orient', 'plan_parallel_work', 'map_in_flight_conflicts', 'analyze_impact', 'find_path']));
+    for (const sel of [{}, { minimal: true }, { preset: 'memory' }, { preset: 'navigation' }] as const) {
+      expect(selectActiveTools(TOOL_DEFINITIONS, sel).map(t => t.name)).not.toContain('plan_parallel_work');
+    }
+  });
+
+  // change: add-cross-actor-interference-map — map_in_flight_conflicts is opt-in via the
+  // `coordination` AND `federation` presets; it must NOT leak into lean/minimal/memory.
+  it('map_in_flight_conflicts is in coordination + federation only, never lean/minimal/memory', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { preset: 'coordination' }).map(t => t.name)).toContain('map_in_flight_conflicts');
+    expect(selectActiveTools(TOOL_DEFINITIONS, { preset: 'federation' }).map(t => t.name)).toContain('map_in_flight_conflicts');
+    for (const sel of [{}, { minimal: true }, { preset: 'memory' }, { preset: 'navigation' }, { preset: 'verify' }] as const) {
+      expect(selectActiveTools(TOOL_DEFINITIONS, sel).map(t => t.name)).not.toContain('map_in_flight_conflicts');
+    }
+  });
+
+  // change: add-mcp-spec-workflow-composites — the `substrate` preset spans BOTH
+  // faces: the navigation graph-traversal core, the two read-only spec-workflow
+  // composites, and the three highest-value governance READS. It holds reads only — no remember /
+  // record_decision write, no commit gate. `substrate` is now the no-selector DEFAULT
+  // surface (decision c79ec7ca superseding ADR-0022, after the DefaultSurfaceRevealsAllFaces
+  // benchmark cleared it across two models and both repo tiers with no regression).
+  it('substrate preset = navigation core + spec workflows + governance reads (reads only)', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, { preset: 'substrate' }).map(t => t.name);
+    expect(new Set(tools)).toEqual(
+      new Set([...NAV, ...SPEC_WORKFLOWS, 'recall', 'verify_claim', 'blast_radius'])
+    );
+    // governance WRITES / gate must never be in the both-faces reads preset
+    for (const write of ['remember', 'record_decision', 'approve_decision', 'sync_decisions']) {
+      expect(tools).not.toContain(write);
+    }
+  });
+
+  it('substrate IS the no-selector default surface (the benchmark-cleared flip)', () => {
+    expect(resolvePresetName({})).toBe(LEAN_DEFAULT_PRESET);
+    expect(LEAN_DEFAULT_PRESET).toBe('substrate');
+    // The default now reveals the governance READS that navigation alone hid.
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).toContain('recall');
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).toContain('verify_claim');
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).toContain('blast_radius');
+    // governance WRITES / gate still require an explicit wider preset.
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).not.toContain('record_decision');
+  });
+
+  // DefaultSurfaceRevealsAllFaces (change: refine-happy-path-and-defaults): the default
+  // `substrate` surface is FACE-COMPLETE — it exposes at least one tool from each
+  // high-value face (navigate + remember + verify + change) — whereas the lean
+  // navigate-only `navigation` preset does not. The token-economy + face-coverage
+  // evidence is produced by scripts/bench-preset-surface.ts; the task-completion +
+  // selection evidence by scripts/bench-preset-{completion,selection}.ts.
+  const facesOf = (preset: string): Set<CapabilityFamily> => {
+    const fams = new Set<CapabilityFamily>();
+    for (const t of selectActiveTools(TOOL_DEFINITIONS, { preset })) {
+      const f = capabilityFamily(t.name);
+      if (f) fams.add(f);
+    }
+    return fams;
+  };
+  const HIGH_VALUE_FACES: CapabilityFamily[] = ['navigate', 'remember', 'verify', 'change'];
+
+  it('the default (substrate) surface reveals all high-value faces (navigate + remember + verify + change)', () => {
+    const faces = facesOf(LEAN_DEFAULT_PRESET);
+    for (const face of HIGH_VALUE_FACES) {
+      expect(faces.has(face), `the default surface must expose the "${face}" face`).toBe(true);
+    }
+  });
+
+  it('the lean navigation preset reveals only the navigate face (so the substrate default adds value)', () => {
+    const faces = facesOf('navigation');
+    expect([...faces]).toEqual(['navigate']);
+    // The default is substrate precisely because navigation alone hid the other faces.
+    expect(HIGH_VALUE_FACES.every(f => faces.has(f))).toBe(false);
+  });
+
+  // change: unify-navigation-and-governance-substrate — `--list-tools` renders the active
+  // surface grouped by capability family (the human-facing counterpart to the on-the-wire
+  // annotations.family). It is the production consumer of groupToolsByFamily.
+  it('renderToolSurfaceByFamily groups the substrate surface by family, covering every tool', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, { preset: 'substrate' });
+    const text = renderToolSurfaceByFamily(tools, 'substrate');
+    // Header states the surface, tool count, and family count (navigation + spec workflows + governance reads → 4 families).
+    expect(text).toMatch(/substrate \(15 tools, 4 families\)/);
+    // Family group headers appear, in canonical order; every tool is listed exactly once.
+    expect(text).toContain('Navigate —');
+    expect(text).toContain('Change —');
+    expect(text).toContain('Remember —');
+    expect(text).toContain('Verify —');
+    for (const t of tools) expect(text).toContain(`  - ${t.name}`);
+    const listed = [...text.matchAll(/^ {2}- (.+)$/gm)].map(m => m[1]).sort();
+    expect(listed).toEqual(tools.map(t => t.name).sort());
+  });
+
+  it('renderToolSurfaceByFamily pluralizes a single-family surface correctly', () => {
+    const navTools = selectActiveTools(TOOL_DEFINITIONS, { preset: 'navigation' });
+    const text = renderToolSurfaceByFamily(navTools, 'navigation');
+    expect(text).toMatch(/navigation \(10 tools, 1 family\)/); // "family", not "families"
+  });
+
+  it('renderToolSurfaceByFamily lists all six families for the full surface', () => {
+    const text = renderToolSurfaceByFamily(TOOL_DEFINITIONS, 'full');
+    expect(text).toMatch(/full \(\d+ tools, 6 families\)/);
+    for (const label of ['Navigate —', 'Change —', 'Remember —', 'Verify —', 'Coordinate —', 'Federate —']) {
+      expect(text).toContain(label);
+    }
+  });
+
+  // renderActiveToolSurface is the testable core of `--list-tools`: it composes the
+  // preset selection with the family grouping, so a regression in either is caught in CI
+  // (the CLI short-circuit in startMcpServer is thin glue over it).
+  it('renderActiveToolSurface groups a multi-family preset (minimal spans navigate+change+remember)', () => {
+    const text = renderActiveToolSurface({ minimal: true });
+    expect(text).toMatch(/minimal \(6 tools, 3 families\)/);
+    expect(text).toContain('Navigate —');
+    expect(text).toContain('Change —'); // detect_changes
+    expect(text).toContain('Remember —'); // record_decision
+    // Tool placement follows the capability taxonomy, not the preset name.
+    expect(text).toMatch(/Change —[\s\S]*- detect_changes/);
+    expect(text).toMatch(/Remember —[\s\S]*- record_decision/);
+  });
+
+  it('renderActiveToolSurface throws on an unknown preset (so --list-tools exits 2, never starts the server)', () => {
+    expect(() => renderActiveToolSurface({ preset: 'bogus' })).toThrow(/Unknown --preset/);
+  });
+
+  // Guard the CLI wiring itself: the `--list-tools` option must stay registered, mirroring
+  // the existing --minimal/--preset guards. Without this, dropping the option line ships green.
+  it('mcp command registers the --list-tools option', () => {
+    expect(mcpCommand.options.find(o => o.long === '--list-tools')).toBeDefined();
+  });
+
+  // change: add-declarative-language-support-registry — get_language_support is FULL-surface
+  // only (not in any curated preset); it must never enter the lean/minimal/first-run surface.
+  it('get_language_support is full-surface only, never in any curated preset', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true }).map(t => t.name)).toContain('get_language_support');
+    for (const sel of [{}, { minimal: true }, { preset: 'navigation' }, { preset: 'memory' }, { preset: 'verify' }, { preset: 'federation' }, { preset: 'coordination' }] as const) {
+      expect(selectActiveTools(TOOL_DEFINITIONS, sel).map(t => t.name)).not.toContain('get_language_support');
+    }
+  });
+
+  // change: add-change-significance-briefing — briefing_since is FULL-surface only. The
+  // spec requires it SHALL NOT enter the minimal or first-run (lean) tool surface.
+  it('briefing_since is full-surface only, never in any curated preset', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true }).map(t => t.name)).toContain('briefing_since');
+    for (const sel of [{}, { minimal: true }, { preset: 'navigation' }, { preset: 'memory' }, { preset: 'verify' }, { preset: 'federation' }, { preset: 'coordination' }] as const) {
+      expect(selectActiveTools(TOOL_DEFINITIONS, sel).map(t => t.name)).not.toContain('briefing_since');
+    }
+  });
+
+  it('find_clones is full-surface only, never in any curated preset', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true }).map(t => t.name)).toContain('find_clones');
+    for (const sel of [{}, { minimal: true }, { preset: 'navigation' }, { preset: 'memory' }, { preset: 'verify' }, { preset: 'federation' }, { preset: 'coordination' }] as const) {
+      expect(selectActiveTools(TOOL_DEFINITIONS, sel).map(t => t.name)).not.toContain('find_clones');
+    }
+  });
+
+  // Guard: the user-facing `--minimal` help text must match the actual preset — it
+  // drifted to "5 tools" once after get_health_map was added to the 6-tool set.
+  it('the --minimal help text matches the minimal preset (count + every member named)', () => {
+    const minimal = [...TOOL_PRESETS.minimal];
+    const opt = mcpCommand.options.find(o => o.long === '--minimal');
+    expect(opt, 'the --minimal option is registered').toBeTruthy();
+    const help = opt!.description;
+    expect(help, 'help states the live minimal-preset size').toContain(`core ${minimal.length} tools`);
+    for (const t of minimal) {
+      expect(help, `help names the minimal tool "${t}"`).toContain(t);
+    }
+  });
+
+  // Guard: the `--preset` help text says "instead of all N" where N is the full
+  // surface; it drifted to a stale "58"/"45" while TOOL_DEFINITIONS grew. Tie the
+  // help integer to the live count so a new tool forces the string to move (the
+  // doc-count guard covers README/docs but not this CLI help string).
+  it('the --preset help text states the live full-surface tool count', () => {
+    const opt = mcpCommand.options.find(o => o.long === '--preset');
+    expect(opt, 'the --preset option is registered').toBeTruthy();
+    expect(opt!.description, 'help states the live full-surface count').toContain(`all ${TOOL_DEFINITIONS.length}`);
+  });
+
+  // Guard: the `--preset` help enumerates the navigation preset by name; it drifted to
+  // listing only 7 of the 10 members (missing get_landmarks/get_map/find_path) while the
+  // preset itself grew. Tie the enumeration to the live preset so a new member forces the
+  // help string to move (the count guard above did not cover the enumeration).
+  it('the --preset help names every navigation-preset member', () => {
+    const opt = mcpCommand.options.find(o => o.long === '--preset');
+    const help = opt!.description;
+    for (const t of TOOL_PRESETS.navigation) {
+      expect(help, `--preset help names the navigation tool "${t}"`).toContain(t);
+    }
+  });
+
+  // change: default-to-lean-tool-surface — the default was inverted. No selector
+  // now resolves to the lean default surface (the navigation preset), NOT the full
+  // registry. The full surface is opt-in via --preset full / --all-tools.
+  it('no selector exposes the DEFAULT surface (substrate), not the full set', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name);
+    expect(new Set(tools)).toEqual(
+      new Set([...NAV, ...SPEC_WORKFLOWS, 'recall', 'verify_claim', 'blast_radius'])
+    );
+    expect(tools.length).toBeLessThan(TOOL_DEFINITIONS.length); // strictly smaller than full
+    expect(LEAN_DEFAULT_PRESET).toBe('substrate'); // the default IS the substrate preset
+  });
+
+  it('--preset full / --all-tools / --preset all expose the full TOOL_DEFINITIONS surface', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { preset: 'full' })).toHaveLength(TOOL_DEFINITIONS.length);
+    expect(selectActiveTools(TOOL_DEFINITIONS, { preset: 'all' })).toHaveLength(TOOL_DEFINITIONS.length);
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true })).toHaveLength(TOOL_DEFINITIONS.length);
+    expect(TOOL_DEFINITIONS.length).toBeGreaterThan(NAV.length); // full surface really is larger
+  });
+
+  it('--all-tools / --preset full win over --preset and --minimal (full is the explicit escape hatch)', () => {
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true, preset: 'navigation' })).toHaveLength(TOOL_DEFINITIONS.length);
+    expect(selectActiveTools(TOOL_DEFINITIONS, { allTools: true, minimal: true })).toHaveLength(TOOL_DEFINITIONS.length);
+  });
+
+  it('an unknown preset error now lists "full" as a known selector', () => {
+    expect(() => selectActiveTools(TOOL_DEFINITIONS, { preset: 'nope' })).toThrow(/full/);
+  });
+
+  it('--preset takes precedence over --minimal', () => {
+    const tools = selectActiveTools(TOOL_DEFINITIONS, { minimal: true, preset: 'navigation' }).map(t => t.name);
+    expect(new Set(tools)).toEqual(new Set(NAV));
+  });
+
+  it('an unknown preset throws with the known list, not a silent full surface', () => {
+    expect(() => selectActiveTools(TOOL_DEFINITIONS, { preset: 'nope' })).toThrow(/Unknown --preset "nope".*minimal.*navigation/s);
+  });
+
+  // change: add-multi-repo-federation — FederationScopedConclusions: the
+  // federation capability (federation_status) appears ONLY under the federation
+  // preset; the default and minimal surfaces register no federation capability.
+  // change: add-spec-store-binding — spec_store_status joins the federation preset
+  // (it resolves declared targets against the same registry), kept out of minimal.
+  it('federation_status is gated to the federation preset, never in default/minimal', () => {
+    const fed = selectActiveTools(TOOL_DEFINITIONS, { preset: 'federation' }).map(t => t.name);
+    expect(fed).toContain('federation_status');
+    expect(new Set(fed)).toEqual(new Set(['orient', 'federation_status', 'spec_store_status', 'working_set_context', 'change_impact_certificate', 'analyze_impact', 'find_dead_code', 'select_tests', 'find_path', 'map_in_flight_conflicts']));
+
+    expect(selectActiveTools(TOOL_DEFINITIONS, { minimal: true }).map(t => t.name)).not.toContain('federation_status');
+    // Default surface DOES list the four federation-aware tools, but federation_status
+    // — the registry-backed capability — is the opt-in marker and rides only the preset.
+  });
+
+  // change: add-structural-claim-verification / add-decision-reference-claim-verification —
+  // verify_claim (incl. the decision-current kind) rides the `verify` preset AND the
+  // substrate default (both-faces reads), but NOT the lean navigate-only `navigation` preset.
+  it('verify_claim is in the verify preset and the substrate default, but not the lean navigation preset', () => {
+    const verify = selectActiveTools(TOOL_DEFINITIONS, { preset: 'verify' }).map(t => t.name);
+    expect(new Set(verify)).toEqual(new Set(['orient', 'search_code', 'verify_claim']));
+    expect(selectActiveTools(TOOL_DEFINITIONS, { preset: 'navigation' }).map(t => t.name)).not.toContain('verify_claim');
+    // The default surface is now substrate, which DOES include verify_claim.
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).toContain('verify_claim');
+  });
+
+  // The decision-reference clause: the verify_claim schema must advertise the
+  // `decision-current` kind, so an agent (and the SDK's schema validation) sees it.
+  it('verify_claim advertises the decision-current kind in its schema enum', () => {
+    const vc = TOOL_DEFINITIONS.find(t => t.name === 'verify_claim');
+    expect(vc, 'verify_claim is a defined tool').toBeDefined();
+    const kindEnum = (vc!.inputSchema as { properties?: { kind?: { enum?: string[] } } }).properties?.kind?.enum ?? [];
+    expect(kindEnum).toContain('decision-current');
+    // and the structural kinds remain advertised (additive, not a replacement)
+    for (const k of ['calls', 'reaches', 'dead', 'impacts', 'safe-to-change']) expect(kindEnum).toContain(k);
+  });
+});
+
+// ============================================================================
+// change: default-to-lean-tool-surface — selector → canonical preset resolution.
+// One source of truth (resolvePresetName) drives both the active tool set and the
+// breadth-pointer decision, so they can never disagree.
+// ============================================================================
+describe('resolvePresetName (canonical selector resolution)', () => {
+  it('no selector resolves to the default (substrate)', () => {
+    expect(resolvePresetName({})).toBe('substrate');
+    expect(resolvePresetName({})).toBe(LEAN_DEFAULT_PRESET);
+  });
+  it('full-surface selectors all resolve to "full"', () => {
+    expect(resolvePresetName({ allTools: true })).toBe('full');
+    expect(resolvePresetName({ preset: 'full' })).toBe('full');
+    expect(resolvePresetName({ preset: 'all' })).toBe('full'); // alias normalizes
+  });
+  it('--minimal resolves to "minimal"; a named preset resolves to itself', () => {
+    expect(resolvePresetName({ minimal: true })).toBe('minimal');
+    expect(resolvePresetName({ preset: 'memory' })).toBe('memory');
+    expect(resolvePresetName({ preset: 'navigation' })).toBe('navigation');
+  });
+  it('full-surface selectors win over --preset and --minimal', () => {
+    expect(resolvePresetName({ allTools: true, preset: 'navigation' })).toBe('full');
+    expect(resolvePresetName({ allTools: true, minimal: true })).toBe('full');
+  });
+});
+
+// ============================================================================
+// change: default-to-lean-tool-surface — breadth discoverability. The pointer
+// fires when the ACTIVE surface IS the lean default (navigation) — whether reached
+// by no selector OR by an explicit `--preset navigation` (how `openlore install`
+// wires the default). Any other surface is a deliberate different choice → no
+// pointer. It rides the MCP instructions channel and adds zero tool schemas.
+// ============================================================================
+describe('breadth discoverability on the default surface', () => {
+  it('the pointer fires for the default surface, however it was selected', () => {
+    expect(leanDefaultActive({})).toBe(true);                       // bare `openlore mcp`
+    expect(leanDefaultActive({ preset: 'substrate' })).toBe(true);  // how install wires the default
+  });
+
+  it('the pointer is suppressed on every other (deliberately chosen) surface', () => {
+    expect(leanDefaultActive({ minimal: true })).toBe(false);
+    expect(leanDefaultActive({ preset: 'navigation' })).toBe(false); // the lean core is now a deliberate downgrade
+    expect(leanDefaultActive({ preset: 'memory' })).toBe(false);
+    expect(leanDefaultActive({ preset: 'verify' })).toBe(false);
+    expect(leanDefaultActive({ preset: 'federation' })).toBe(false);
+    expect(leanDefaultActive({ preset: 'full' })).toBe(false);
+    expect(leanDefaultActive({ preset: 'all' })).toBe(false);
+    expect(leanDefaultActive({ allTools: true })).toBe(false);
+  });
+
+  it('the pointer names how to opt into breadth, every option in copy-pasteable --preset form', () => {
+    expect(BREADTH_POINTER).toMatch(/--preset full/);
+    expect(BREADTH_POINTER).toMatch(/--preset federation/);
+    expect(BREADTH_POINTER).toMatch(/--preset navigation/); // the lean navigate-only escape
+    expect(BREADTH_POINTER).toMatch(/openlore install --preset/);
+    // Every `--preset <name>` the pointer advertises must resolve to a real surface.
+    for (const m of BREADTH_POINTER.matchAll(/--preset (\w+)/g)) {
+      expect(() => selectActiveTools(TOOL_DEFINITIONS, { preset: m[1] })).not.toThrow();
+    }
+  });
+
+  it('the pointer adds no tool schemas — the default surface size is unchanged by it', () => {
+    // The pointer rides the instructions channel; the active tool set is exactly
+    // the substrate default preset regardless.
+    expect(selectActiveTools(TOOL_DEFINITIONS, {}).map(t => t.name)).toEqual(
+      selectActiveTools(TOOL_DEFINITIONS, { preset: 'substrate' }).map(t => t.name),
+    );
+  });
+});
+
+// ============================================================================
+// Spec 25 P1 — cache-prefix stability. The Round-1 loss was per-request tool-
+// schema overhead; the fix is a surface the provider KV-cache can hold. That
+// only works if the emitted tool list is byte-identical across requests, so
+// these guard against any per-request variation (reordering, rebuilt schemas).
+// ============================================================================
+describe('MCP surface cache-prefix stability (spec-25 P1)', () => {
+  const serialize = (opts: { minimal?: boolean; preset?: string }) =>
+    JSON.stringify(selectActiveTools(TOOL_DEFINITIONS, opts).map(t => ({ name: t.name, inputSchema: (t as { inputSchema?: unknown }).inputSchema })));
+
+  it('emits a byte-identical tool list across repeated calls (full + each preset)', () => {
+    for (const opts of [{}, { minimal: true }, { preset: 'navigation' }] as const) {
+      expect(serialize(opts)).toBe(serialize(opts)); // same content twice → stable prefix
+    }
+  });
+
+  it('preset filtering preserves TOOL_DEFINITIONS declaration order (filter, not Set order)', () => {
+    const full = TOOL_DEFINITIONS.map(t => t.name);
+    const nav = selectActiveTools(TOOL_DEFINITIONS, { preset: 'navigation' }).map(t => t.name);
+    // nav names appear in the same relative order as in the full declaration.
+    expect(nav).toEqual(full.filter(n => nav.includes(n)));
+  });
+
+  it('tool names are unique (a duplicate would make the cached prefix order ambiguous)', () => {
+    const names = TOOL_DEFINITIONS.map(t => t.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it('every tool carries a static inputSchema object (not rebuilt per request)', () => {
+    for (const t of TOOL_DEFINITIONS) {
+      const a = (t as { inputSchema?: unknown }).inputSchema;
+      const b = (t as { inputSchema?: unknown }).inputSchema;
+      expect(a).toBe(b); // same reference → no per-request reconstruction
+    }
+  });
+});
+
+// ============================================================================
+// Spec 11 — tool annotations: every tool has complete MCP annotations
+// ============================================================================
+import { toolAnnotations } from './mcp.js';
+
+describe('tool annotations (spec-11)', () => {
+  it('every tool has a title, the three read/write hints, and openWorldHint', () => {
+    for (const t of TOOL_DEFINITIONS) {
+      const a = toolAnnotations(t.name);
+      expect(typeof a.title).toBe('string');
+      expect((a.title as string).length).toBeGreaterThan(0);
+      expect(typeof a.readOnlyHint).toBe('boolean');
+      expect(typeof a.destructiveHint).toBe('boolean');
+      expect(typeof a.idempotentHint).toBe('boolean');
+      expect(typeof a.openWorldHint).toBe('boolean');
+    }
+  });
+
+  it('derives a human-readable title from the snake_case name', () => {
+    expect(toolAnnotations('get_change_coupling').title).toBe('Get Change Coupling');
+    expect(toolAnnotations('orient').title).toBe('Orient');
+  });
+
+  it('marks network- and LLM-reaching tools open-world and local analysis tools closed-world', () => {
+    expect(toolAnnotations('map_in_flight_conflicts').openWorldHint).toBe(true);
+    expect(toolAnnotations('record_decision').openWorldHint).toBe(true);
+    expect(toolAnnotations('generate_tests').openWorldHint).toBe(false);
+    expect(toolAnnotations('orient').openWorldHint).toBe(false);
+    expect(toolAnnotations('find_dead_code').openWorldHint).toBe(false);
+  });
+
+  it('read-only analysis tools are marked readOnly + non-destructive', () => {
+    for (const name of ['orient', 'analyze_impact', 'find_dead_code', 'structural_diff', 'get_change_coupling']) {
+      const a = toolAnnotations(name);
+      expect(a.readOnlyHint).toBe(true);
+      expect(a.destructiveHint).toBe(false);
+    }
+  });
+});
+
+// ============================================================================
+// Spec 28 — tools/list payload budget. The full tool surface is a ~91.7 KB
+// schema prefix that an eager (non-deferring) MCP client loads every turn. Spec 25
+// §7 asked whether that prefix could be erased; Spec 28 measured the answer:
+// deferral is client-side (the dominant client already lazy-loads MCP schemas),
+// and the server-side lossless byte-lever is ~1%. These guards lock that in — they
+// fail loudly if the prefix bloats back, so adding a tool is a conscious budget
+// bump, not silent drift. Bytes mirror what the ListTools handler actually emits.
+// ============================================================================
+describe('tools/list payload budget (spec-28)', () => {
+  const toolPayloadBytes = (tools: typeof TOOL_DEFINITIONS): number => Buffer.byteLength(
+    JSON.stringify({ tools: tools.map(t => ({ ...t, annotations: toolAnnotations(t.name) })) }),
+    'utf8',
+  );
+
+  const payloadBytes = (opts: { minimal?: boolean; preset?: string }): number => {
+    return toolPayloadBytes(selectActiveTools(TOOL_DEFINITIONS, opts));
+  };
+
+  // Ceilings sit just above the measured size (full ≈ 91.7 KB, nav ≈ 13.9 KB).
+  // A new tool or untrimmed boilerplate breaches them, forcing a deliberate
+  // budget decision rather than letting the cached prefix creep.
+  // The nav ceiling was bumped 8_500 → 9_800 → 10_700 → 11_800 as the structural-
+  // navigation primitives get_landmarks, get_map, then find_path were added to the
+  // preset — each a conscious budget decision, not silent drift.
+  // Full ceiling bumped 48_000 → 50_000 when the navigation primitives get_landmarks,
+  // get_map, and find_path were added to the surface — a conscious budget decision.
+  // Bumped 50_000 → 52_000 when the opt-in `memory` preset's remember/recall were added
+  // (code-anchored persistent memory) — again a conscious decision, not silent drift. The
+  // two tools stay out of the default/minimal surface; only the full surface widens.
+  // Bumped 52_000 → 53_000 when get_surprising_connections and get_health_map were added
+  // to the full surface — conscious budget decision.
+  // Bumped 53_000 → 54_000 when the `directResolvedOnly` strict-traversal option was added
+  // to find_dead_code/analyze_impact/get_subgraph/find_path/select_tests/trace_execution_path
+  // (one boolean prop per tool) — conscious budget decision, not silent drift.
+  // Nav bumped 11_800 → 12_300 and full kept < 54_000 when the value-level opt-in
+  // (`valueLevel` + `valueParam`) was added to analyze_impact and trace_execution_path
+  // (spec: add-intraprocedural-cfg-dataflow-overlay) — two opt-in props per tool,
+  // a conscious decision, not silent drift.
+  // Nav bumped 12_300 → 12_500 and full 54_000 → 55_000 when the opt-in personalized-
+  // PageRank ranking mode (`rankBy` on orient + `rankBy`/`tokenBudget` on get_minimal_context;
+  // spec: add-personalized-pagerank-context-ranking) was added — a ranking MODE on existing
+  // tools, no new tool, default surface count unchanged. Conscious decision, not silent drift.
+  // Full bumped 55_000 → 57_000 when bitemporal/typed/lifecycle memory ops (spec:
+  // add-bitemporal-typed-memory-operations) added four opt-in params — `type`/`supersedes` on
+  // remember and `asOf`/`changedSince`/`type` on recall — riding existing tools (no new tool,
+  // default/minimal surfaces unchanged). Descriptions were trimmed first; the residual ~650 B is
+  // the genuine cost of the new capability. Conscious decision, not silent drift.
+  // Full bumped 55_000 → 57_000 when the `blast_radius` pre-flight guard tool was added to the
+  // full surface (spec: add-preflight-blast-radius-guard) — a new orchestration tool that briefs a
+  // diff's structural blast radius. It stays OUT of the minimal/navigation/memory presets; only the
+  // full surface widens. Conscious decision, not silent drift.
+  // Bumped to 57_000 — the combined cost of blast_radius + verify_claim + federation_status
+  // and the opt-in params added across PRs #163-#167. (merge reconciliation)
+  // Bumped 61_000 → 62_000 when the `spec_store_status` tool was added to the full surface
+  // (spec: add-spec-store-binding) — a read-only binding-health tool. It stays OUT of the
+  // minimal/navigation/memory presets; only the full surface widens. Conscious decision.
+  // Bumped 62_000 → 63_000 when the `working_set_context` tool was added to the full surface
+  // (spec: add-working-set-context-briefing) — a read-only working-set briefing tool. It joins
+  // the opt-in federation preset only; it stays OUT of minimal/navigation/memory. Conscious decision.
+  // Bumped 63_000 → 64_000 when the `change_impact_certificate` tool was added to the full surface
+  // (spec: add-change-impact-certificate) — a read-only change-impact certificate tool. It joins
+  // the opt-in federation preset only; it stays OUT of minimal/navigation/memory. Conscious decision.
+  // change: default-to-lean-tool-surface — the full surface is now opt-in, so the
+  // full-budget assertion uses the explicit full selector (no-selector `{}` resolves
+  // to the lean navigation default and is asserted separately below).
+  // Bumped 64_000 → 66_000 when the `plan_parallel_work` tool was added to the full surface
+  // (spec: add-parallel-work-plan) — a read-only parallel-work coordination tool whose schema
+  // carries a nested per-task descriptor array. It joins ONLY the new opt-in `coordination`
+  // preset; it stays OUT of minimal/navigation/memory. Description trimmed first; the residual
+  // is the genuine cost of the nested task-list schema. Conscious decision, not silent drift.
+  // Bumped 66_000 → 68_000 when the `map_in_flight_conflicts` tool was added to the full surface
+  // (spec: add-cross-actor-interference-map) — a read-only cross-actor interference map whose
+  // schema carries a nested agent-task array (mirroring plan_parallel_work) plus the federation
+  // opt-in params. It joins ONLY the opt-in `federation` and `coordination` presets; it stays OUT
+  // of minimal/navigation/memory. Description + task-item schema trimmed first; the residual is the
+  // genuine cost of the nested task-list + federation params. Conscious decision, not silent drift.
+  // Bumped 68_000 → 70_000 on the merge of footprint-escape-detection + cross-actor-interference-map
+  // into one surface: the two changes each bumped this budget independently (footprint-escape widened
+  // `structural_diff`'s schema with declaredFootprint/peerFootprints; cross-actor added the new tool),
+  // and the merge stacks both increments. No new tool here — just the realized combined surface cost.
+  // Bumped 70_000 → 72_000 when the `report_coverage_gaps` tool was added to the full
+  // surface (change: add-test-coverage-gap-report) — a read-only structural coverage-gap
+  // conclusion tool. It joins ONLY the opt-in `full` surface; it stays OUT of
+  // minimal/navigation/memory/verify/federation/coordination, so the lean default prefix
+  // is unchanged. The residual is the genuine cost of its schema. Conscious decision, not
+  // silent drift.
+  // Bumped 72_000 → 74_000 when the `certify_public_surface` tool was added to the full
+  // surface (change: add-public-api-surface-contract) — a read-only public-API breaking-change
+  // conclusion tool (surface listing + diff verdict). It joins ONLY the opt-in `full` surface;
+  // it stays OUT of minimal/navigation/memory/verify/federation/coordination, so the lean default
+  // prefix is unchanged. The residual is the genuine cost of its schema. Conscious decision, not
+  // silent drift.
+  // Bumped 74_000 → 76_000 when the `get_style_fingerprint` tool was added to the full surface
+  // (change: add-codebase-style-fingerprint) — a read-only descriptive-idiom conclusion tool. It
+  // joins ONLY the opt-in `full` surface; it stays OUT of the lean navigation default, so the lean
+  // prefix is unchanged. The residual is the genuine cost of its schema. Conscious decision.
+  // Bumped 76_000 → 78_000 when the `briefing_since` tool was added to the full surface
+  // (change: add-change-significance-briefing) — a read-only change-significance catch-up conclusion
+  // tool. It joins ONLY the opt-in `full` surface; it stays OUT of the lean navigation default, so the
+  // lean prefix is unchanged. The residual is the genuine cost of its schema. Conscious decision.
+  // Bumped 78_000 → 81_000 when the `find_clones` tool was added to the full surface
+  // (change: add-clone-query-tool) — a read-only symbol/snippet-scoped clone-query conclusion tool
+  // (the edit-time "does a near-duplicate already exist?" companion to the whole-repo
+  // get_duplicate_report). It joins ONLY the opt-in `full` surface; it stays OUT of the lean
+  // navigation default, so the lean prefix is unchanged. The residual is the genuine cost of its
+  // schema. Conscious decision, not silent drift.
+  // Bumped 81_000 → 82_000 when the `analyze_error_propagation` tool was added to the full surface
+  // (change: add-error-propagation-graph) — a read-only symbol-scoped exception escape/handled
+  // conclusion tool (the error-handling analogue of analyze_impact). It joins ONLY the opt-in `full`
+  // surface; it stays OUT of the lean navigation default, so the lean prefix is unchanged. The
+  // residual is the genuine cost of its schema. Conscious decision, not silent drift.
+  // Bumped 82_000 → 84_000 when the `analyze_env_impact` tool was added to the full surface
+  // (change: add-env-config-impact-graph) — a read-only env-var-scoped impact conclusion tool (the
+  // configuration analogue of analyze_impact: "what breaks if I remove this env var?"). It joins ONLY
+  // the opt-in `full` surface; it stays OUT of the lean navigation default, so the lean prefix is
+  // unchanged. The residual is the genuine cost of its schema. Conscious decision, not silent drift.
+  // Bumped 84_000 → 86_000 when the capability-family taxonomy (change:
+  // unify-navigation-and-governance-substrate) added a `family` annotation to every
+  // tool (~20 B × 72) plus the NoRedundantConclusions sibling cross-references on five
+  // adjacent tools' descriptions. The family key is the machine-readable grouping that
+  // makes the full surface discoverable by family rather than as a flat list — a
+  // conscious budget decision, not silent drift.
+  // Bumped 86_000 → 88_000 when the concise/detailed verbosity contract (change:
+  // refine-happy-path-and-defaults / ConciseByDefaultDetailedOnRequest) added a
+  // `responseFormat` enum property (+ a one-line description) to the five verbose
+  // list tools (get_duplicate_report + the four list inventories). The opt-in
+  // `detailed` escape is what lets the concise default be safe — a conscious
+  // budget decision, not silent drift.
+  // Bumped 88_000 → 90_000 when the `locate_symbol_span` tool was added to the full
+  // surface (change: add-symbol-span-locator) — a read-only conclusion tool that
+  // returns a symbol's byte-exact edit span + a fresh/stale freshness verdict so the
+  // host applies an edit at offsets the substrate can vouch for. It joins ONLY the
+  // opt-in `full` surface; it stays OUT of the lean substrate/navigation default, so
+  // the lean prefix is unchanged. The residual is the genuine cost of its schema — a
+  // conscious budget decision, not silent drift.
+  // Bumped 90_000 → 92_000 when the two bounded, read-only spec-workflow composites
+  // joined the registry (change: add-mcp-spec-workflow-composites). Their schemas expose
+  // pagination, provenance, and honest-degradation controls; this is the measured cost of
+  // that public contract rather than silent description drift.
+  // Bumped 95_500 → 97_000 for the full-only `explain_retrieval_miss` conclusion
+  // (change: add-retrieval-match-evidence). Measured full payload: 96,559 B; the
+  // default and navigation presets are unchanged. This preserves useful search
+  // guidance while accounting explicitly for the target/filter schema.
+  // Bumped 97_000 → 97_500 when `certify_public_surface` gained the shared federation
+  // inputs for its consumer census (change: add-public-surface-acceptance-baseline). Its
+  // description was tightened to absorb the new split and baseline wording; the measured
+  // full payload is 97,059 B, and the default and navigation presets are unchanged.
+  it('full surface stays within its prefix budget', () => {
+    // Strict advertised schemas add one `additionalProperties:false` token per
+    // tool (fix-mcp-argument-contract), plus the typed v1 decision-constraint
+    // block. 97 KB preserves a narrow ratchet around those intentional public
+    // contracts rather than treating the added schema as free bytes.
+    // questionKind adds one closed-vocabulary input to search_code: 97,500 → 97,800 B
+    // (measured 97,727 B), leaving 73 B rather than silently removing the guard.
+    expect(payloadBytes({ preset: 'full' })).toBeLessThan(97_800);
+  });
+
+  it('the DEFAULT surface (no selector) is the substrate payload, well under the full one', () => {
+    // No selector pays the substrate budget (~20 KB), not the ~91 KB full prefix.
+    // Substrate adds three governance reads plus the two spec-workflow composites to the
+    // navigation core. The 19_000 → 21_000 bump is the measured cost of making Generate
+    // and Repair available to a default capable MCP host, with no internal LLM calls.
+    expect(payloadBytes({})).toBe(payloadBytes({ preset: 'substrate' }));
+    expect(payloadBytes({})).toBeLessThan(21_000);
+    expect(payloadBytes({})).toBeLessThan(payloadBytes({ preset: 'full' }));
+  });
+
+  // Nav bumped 13_700 → 14_200 when find_path and trace_execution_path gained their mutual
+  // cross-references (spec: enforce-conclusion-contract-runtime / AdjacentConclusionsCross-
+  // ReferenceAllPairs) — find_path is in the navigation preset, so making the default-surface
+  // path pair mutually legible costs ~180 B here. A conscious budget decision, not silent drift.
+  it('navigation preset stays lean (the low-overhead navigate-only escape)', () => {
+    // The same input raises the navigation surface to 14,462 B. Keep a 38 B margin.
+    expect(payloadBytes({ preset: 'navigation' })).toBeLessThan(14_500);
+  });
+
+  // change: unify-navigation-and-governance-substrate — the `substrate` default
+  // preset is the navigation core + two spec composites + three governance reads. It stays well under
+  // the full surface (governance reads only, no inventories/specs/coordination), so
+  // an out-of-box agent on the default surface still pays only a small prefix.
+  it('substrate preset (navigation + spec workflows + governance reads) stays well under the full surface', () => {
+    expect(payloadBytes({ preset: 'substrate' })).toBeLessThan(21_000);
+    expect(payloadBytes({ preset: 'substrate' })).toBeLessThan(payloadBytes({ preset: 'full' }));
+    expect(payloadBytes({ preset: 'substrate' })).toBeGreaterThan(payloadBytes({ preset: 'navigation' }));
+  });
+
+  it('the two spec composites add less than 1,750 bytes to the default surface', () => {
+    const substrate = selectActiveTools(TOOL_DEFINITIONS, { preset: 'substrate' });
+    const withoutSpecComposites = substrate.filter(t => !SPEC_WORKFLOWS.includes(t.name));
+    expect(toolPayloadBytes(substrate) - toolPayloadBytes(withoutSpecComposites)).toBeLessThan(1_750);
+  });
+
+  // Lossless-dedup + fix-mcp-argument-contract: every tool documents the same
+  // launch-root default, and no schema advertises directory as required.
+  it('every tool documents the shared optional directory default', () => {
+    const directorySchemas = TOOL_DEFINITIONS.map(t => {
+      const schema = t.inputSchema as unknown as { additionalProperties?: boolean; properties?: Record<string, { description?: string }>; required?: string[] };
+      return { additionalProperties: schema.additionalProperties, description: schema.properties?.directory?.description, required: schema.required ?? [] };
+    });
+    const dirDescs = directorySchemas
+      .map(schema => schema.description)
+      .filter((d): d is string => typeof d === 'string');
+    const counts = new Map<string, number>();
+    for (const d of dirDescs) counts.set(d, (counts.get(d) ?? 0) + 1);
+    const [dominant, dominantCount] = [...counts].sort((a, b) => b[1] - a[1])[0];
+    expect(dirDescs).toHaveLength(TOOL_DEFINITIONS.length);
+    expect(dominant).toMatch(/default/i);
+    expect(dominant.length).toBeLessThanOrEqual(30);
+    expect(dominantCount).toBe(dirDescs.length);
+    for (const schema of directorySchemas) {
+      expect(schema.additionalProperties).toBe(false);
+      expect(schema.required).not.toContain('directory');
+    }
+  });
+});

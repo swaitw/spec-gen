@@ -12,6 +12,8 @@ import { VERIFICATION_PREDICTION_MAX_TOKENS } from '../../constants.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { DependencyGraphResult, DependencyNode } from '../analyzer/dependency-graph.js';
 import { ImportExportParser } from '../analyzer/import-parser.js';
+import { protectPrompt } from '../../utils/prompt-boundary.js';
+import { sanitizeForTerminal } from '../../utils/misc.js';
 
 // ============================================================================
 // TYPES
@@ -48,6 +50,11 @@ export interface FilePrediction {
   reasoning: string;
 }
 
+interface JudgedFilePrediction extends FilePrediction {
+  /** Actual provider response model that supplied the optional judge scores. */
+  judgingModel: string;
+}
+
 /**
  * Match result for purpose
  */
@@ -55,7 +62,25 @@ export interface PurposeMatch {
   predicted: string;
   actual: string;
   similarity: number;
+  provenance?:
+    | { source: 'llm-judged'; model: string }
+    | { source: 'keyword-fallback' };
 }
+
+export interface VerificationScoreComposition {
+  kind: 'weighted-mixed-evidence-composite';
+  weights: {
+    purpose: 0.50;
+    requirementCoverage: 0.35;
+    imports: 0.05;
+    exports: 0.10;
+  };
+}
+
+const VERIFICATION_SCORE_COMPOSITION: VerificationScoreComposition = {
+  kind: 'weighted-mixed-evidence-composite',
+  weights: { purpose: 0.50, requirementCoverage: 0.35, imports: 0.05, exports: 0.10 },
+};
 
 /**
  * Match result for imports/exports
@@ -66,6 +91,9 @@ export interface SetMatch {
   precision: number;
   recall: number;
   f1Score: number;
+  provenance?:
+    | { source: 'llm-prediction-compared-deterministically'; model: string }
+    | { source: 'deterministic' };
 }
 
 /**
@@ -75,6 +103,95 @@ export interface RequirementCoverage {
   relatedRequirements: string[];
   actuallyImplements: string[];
   coverage: number;
+  evidence: 'llm-score' | 'keyword-match' | 'none';
+  provenance?:
+    | { source: 'llm-judged'; model: string }
+    | { source: 'keyword-fallback' }
+    | { source: 'none' };
+}
+
+export interface VerificationFailure {
+  filePath: string;
+  reason: string;
+}
+
+const MAX_VERIFICATION_FAILURE_REASON_LENGTH = 1_000;
+
+function escapeMarkdownInline(value: string): string {
+  return value
+    .replace(/[\r\n\t]+/g, ' ')
+    // eslint-disable-next-line no-control-regex -- persisted errors may contain control bytes
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, character =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
+    .replace(/([\\`*_[\]<>#|])/g, '\\$1');
+}
+
+function requireUnitScore(value: unknown, field: string, fallback?: number): number | undefined {
+  if (value === undefined && fallback !== undefined) return fallback;
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${field} must be a finite number between 0 and 1`);
+  }
+  return value;
+}
+
+function requirePresentUnitScore(value: unknown, field: string): number {
+  const score = requireUnitScore(value, field);
+  if (score === undefined) throw new Error(`${field} is required`);
+  return score;
+}
+
+function optionalString(value: unknown, field: string): string {
+  if (value === undefined) return '';
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`);
+  return value;
+}
+
+function optionalStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${field} must be an array of strings`);
+  }
+  return value;
+}
+
+function requireSafeModelId(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('completion model id must be a string');
+  const model = value.trim();
+  if (model.length === 0 || model.length > 200 || !/^[A-Za-z0-9._:/@+-]+$/.test(model)) {
+    throw new Error('completion model id must be 1-200 safe identifier characters');
+  }
+  return model;
+}
+
+function describeVerificationError(error: unknown): string {
+  let reason = 'Unknown verification error';
+  try {
+    if (error instanceof Error && typeof error.message === 'string' && error.message.trim()) {
+      reason = error.message;
+    } else if (typeof error === 'string' && error.trim()) {
+      reason = error;
+    } else {
+      try {
+        const serialized = JSON.stringify(error);
+        if (serialized) reason = serialized;
+      } catch {
+        // A hostile thrown object may reject every coercion attempt.
+      }
+    }
+  } catch {
+    // Error subclasses may expose a throwing message getter.
+  }
+
+  const normalized = reason
+    .replace(/[\r\n\t]+/g, ' ')
+    // eslint-disable-next-line no-control-regex -- provider errors are untrusted input
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim() || 'Unknown verification error';
+  if (normalized.length <= MAX_VERIFICATION_FAILURE_REASON_LENGTH) return normalized;
+  const suffix = '... [truncated]';
+  return `${normalized.slice(0, MAX_VERIFICATION_FAILURE_REASON_LENGTH - suffix.length)}${suffix}`;
 }
 
 /**
@@ -88,7 +205,9 @@ export interface VerificationResult {
   exportMatch: SetMatch;
   requirementCoverage: RequirementCoverage;
   overallScore: number;
+  scoreComposition?: VerificationScoreComposition;
   llmConfidence: number;
+  llmConfidenceProvenance?: { source: 'llm-reported'; model: string };
   feedback: string[];
 }
 
@@ -100,6 +219,7 @@ export interface DomainBreakdown {
   specPath: string;
   filesVerified: number;
   averageScore: number;
+  averageScoreBasis?: 'mean-of-weighted-mixed-evidence-composites';
   weakestArea: string;
 }
 
@@ -118,12 +238,22 @@ export interface SuggestedImprovement {
 export interface VerificationReport {
   timestamp: string;
   specVersion: string;
+  attemptedFiles: number;
   sampledFiles: number;
+  failedFiles: number;
+  failures: VerificationFailure[];
+  aggregateBasis: 'successful-files';
   passedFiles: number;
   overallConfidence: number;
+  overallConfidenceBasis?: {
+    kind: 'mean-of-weighted-mixed-evidence-composites';
+    scoreComposition: VerificationScoreComposition;
+  };
   domainBreakdown: DomainBreakdown[];
   commonGaps: string[];
   recommendation: 'ready' | 'needs-review' | 'regenerate';
+  recommendationBasis?: 'weighted-mixed-evidence-composite-threshold';
+  recommendationQualification?: string;
   suggestedImprovements: SuggestedImprovement[];
   results: VerificationResult[];
 }
@@ -191,9 +321,14 @@ export class SpecVerificationEngine {
   private options: Required<VerificationEngineOptions>;
   private specs: LoadedSpec[] = [];
   private fileDomainMap: Map<string, string> = new Map();
+  private verificationContextPromise: Promise<void> | undefined;
   private parser: ImportExportParser;
 
   constructor(llm: LLMService, options: VerificationEngineOptions) {
+    const passThreshold = options.passThreshold ?? 0.5;
+    if (!Number.isFinite(passThreshold) || passThreshold < 0 || passThreshold > 1) {
+      throw new Error('passThreshold must be a finite number between 0 and 1');
+    }
     this.llm = llm;
     this.parser = new ImportExportParser();
     this.options = {
@@ -203,7 +338,7 @@ export class SpecVerificationEngine {
       minComplexity: options.minComplexity ?? 50,
       maxComplexity: options.maxComplexity ?? 500,
       filesPerDomain: options.filesPerDomain ?? 3,
-      passThreshold: options.passThreshold ?? 0.5,
+      passThreshold,
       generationContext: options.generationContext ?? [],
     };
   }
@@ -213,13 +348,14 @@ export class SpecVerificationEngine {
    */
   async verify(
     depGraph: DependencyGraphResult,
-    specVersion: string
+    specVersion: string,
+    selectedCandidates?: readonly VerificationCandidate[],
   ): Promise<VerificationReport> {
     const startTime = Date.now();
 
-    // Load all specs and the file→domain mapping
-    await this.loadSpecs();
-    await this.loadFileDomainMap();
+    // Load all specs and the file→domain mapping once. prepareCandidates() uses
+    // the same boundary so previewed candidates keep their resolved domains.
+    await this.ensureVerificationContext();
 
     if (this.specs.length === 0) {
       throw new Error('No specs found to verify against');
@@ -228,7 +364,7 @@ export class SpecVerificationEngine {
     logger.analysis(`Loaded ${this.specs.length} spec(s) for verification`);
 
     // Select verification candidates
-    const candidates = this.selectCandidates(depGraph);
+    const candidates = selectedCandidates ? [...selectedCandidates] : this.selectCandidates(depGraph);
     logger.discovery(`Selected ${candidates.length} candidate file(s) for verification`);
 
     if (candidates.length === 0) {
@@ -237,20 +373,23 @@ export class SpecVerificationEngine {
 
     // Run verification for each candidate
     const results: VerificationResult[] = [];
+    const failures: VerificationFailure[] = [];
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
-      logger.analysis(`Verifying ${i + 1}/${candidates.length}: ${candidate.path}`);
+      logger.analysis(`Verifying ${i + 1}/${candidates.length}: ${sanitizeForTerminal(candidate.path)}`);
 
       try {
         const result = await this.verifyFile(candidate);
         results.push(result);
       } catch (error) {
-        logger.warning(`Failed to verify ${candidate.path}: ${(error as Error).message}`);
+        const reason = describeVerificationError(error);
+        failures.push({ filePath: candidate.path, reason });
+        logger.warning(`Failed to verify ${sanitizeForTerminal(candidate.path)}: ${sanitizeForTerminal(reason)}`);
       }
     }
 
     // Generate report
-    const report = this.generateReport(results, specVersion);
+    const report = this.generateReport(results, specVersion, failures);
 
     // Save report
     await this.saveReport(report);
@@ -259,6 +398,42 @@ export class SpecVerificationEngine {
     logger.success(`Verification complete in ${(duration / 1000).toFixed(1)}s`);
 
     return report;
+  }
+
+  /**
+   * Resolve and bound the exact candidate set that a later verify() call will use.
+   * Specs and mapping must be loaded first because domain assignment is part of
+   * candidate identity, not a display-only annotation.
+   */
+  async prepareCandidates(
+    depGraph: DependencyGraphResult,
+    limit?: number,
+  ): Promise<VerificationCandidate[]> {
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new Error('candidate limit must be a positive integer');
+    }
+    await this.ensureVerificationContext();
+    if (this.specs.length === 0) {
+      throw new Error('No specs found to verify against');
+    }
+    const candidates = this.selectCandidates(depGraph);
+    return limit === undefined ? candidates : candidates.slice(0, limit);
+  }
+
+  private async ensureVerificationContext(): Promise<void> {
+    if (!this.verificationContextPromise) {
+      this.verificationContextPromise = (async () => {
+        await this.loadSpecs();
+        if (this.specs.length === 0) {
+          throw new Error('No specs found to verify against');
+        }
+        await this.loadFileDomainMap();
+      })().catch(error => {
+        this.verificationContextPromise = undefined;
+        throw error;
+      });
+    }
+    await this.verificationContextPromise;
   }
 
   /**
@@ -294,12 +469,12 @@ export class SpecVerificationEngine {
   }
 
   /**
-   * Load file→domain mapping from .spec-gen/analysis/mapping.json.
+   * Load file→domain mapping from .openlore/analysis/mapping.json.
    * Falls back silently if the file doesn't exist (e.g. before first analysis run).
    */
   private async loadFileDomainMap(): Promise<void> {
     this.fileDomainMap = new Map();
-    const mappingPath = join(this.options.rootPath, '.spec-gen', 'analysis', 'mapping.json');
+    const mappingPath = join(this.options.rootPath, '.openlore', 'analysis', 'mapping.json');
     try {
       const raw = await readFile(mappingPath, 'utf-8');
       const data = JSON.parse(raw) as {
@@ -416,7 +591,7 @@ export class SpecVerificationEngine {
     // 2. Path-based matching against known spec domains
     const knownDomains = this.specs.map(s => s.domain);
     const structural = new Set(['src', 'lib', 'app', 'core', 'utils', 'helpers', 'common', 'shared']);
-    const rawParts = filePath.split('/');
+    const rawParts = filePath.replace(/\\/g, '/').split('/');
     const segments = rawParts.map((p, i) =>
       i === rawParts.length - 1 ? p.replace(/\.[^.]+$/, '').toLowerCase() : p.toLowerCase()
     );
@@ -460,10 +635,26 @@ export class SpecVerificationEngine {
     const prediction = await this.getPrediction(candidate, fileContent);
 
     // Compare prediction to actual
-    const purposeMatch = this.comparePurpose(prediction.predictedPurpose, fileContent, prediction.specAccuracyScore);
+    const domainSpec = this.specs.find((spec) => spec.domain === candidate.domain);
+    const purposeMatch = this.comparePurpose(
+      prediction.predictedPurpose,
+      fileContent,
+      prediction.specAccuracyScore,
+      prediction.judgingModel,
+      domainSpec?.content ?? '',
+    );
     const importMatch = this.analyzeImportCoverage(fileAnalysis.imports.map(i => i.source), candidate.domain);
-    const exportMatch = this.compareExports(prediction.predictedExports, fileAnalysis.exports.map(e => e.name));
-    const requirementCoverage = this.analyzeRequirementCoverage(candidate.domain, fileContent, prediction.requirementCoverageScore);
+    const exportMatch = this.compareExports(
+      prediction.predictedExports,
+      fileAnalysis.exports.map(e => e.name),
+      prediction.judgingModel,
+    );
+    const requirementCoverage = this.analyzeRequirementCoverage(
+      candidate.domain,
+      fileContent,
+      prediction.requirementCoverageScore,
+      prediction.judgingModel,
+    );
 
     // Calculate overall score
     const overallScore = this.calculateOverallScore(purposeMatch, importMatch, exportMatch, requirementCoverage);
@@ -479,7 +670,9 @@ export class SpecVerificationEngine {
       exportMatch,
       requirementCoverage,
       overallScore,
+      scoreComposition: VERIFICATION_SCORE_COMPOSITION,
       llmConfidence: prediction.confidence,
+      llmConfidenceProvenance: { source: 'llm-reported', model: prediction.judgingModel },
       feedback,
     };
   }
@@ -512,7 +705,7 @@ export class SpecVerificationEngine {
    * specAccuracyScore (0–1) measuring how well the spec describes the file.
    * This replaces the brittle Jaccard keyword-overlap used for purposeMatch.
    */
-  private async getPrediction(candidate: VerificationCandidate, fileContent?: string): Promise<FilePrediction> {
+  private async getPrediction(candidate: VerificationCandidate, fileContent?: string): Promise<JudgedFilePrediction> {
     // Prefer the candidate's own domain spec; fall back to full context if not found.
     const domainSpec = this.specs.find(s => s.domain === candidate.domain);
     const specsContent = domainSpec
@@ -530,15 +723,10 @@ export class SpecVerificationEngine {
 - "requirementCoverageScore": float 0.0–1.0 — of the requirements in the spec that are relevant to THIS file specifically, what fraction does the file actually implement? Ignore requirements that clearly belong to other files in the domain.`
       : '';
 
-    const userPrompt = `Here are the specifications:
-
-${specsContent}${fileExcerpt}
-
-Predict the contents of: ${candidate.path}
-
-IMPORTANT: The specs may contain entries attributed to specific files using \`> \`path\`\` markers.
-Focus ONLY on entries attributed to \`${candidate.path}\`. Ignore entries attributed to other files.
-If no entries are attributed to this file, use only the general domain purpose.${judgeInstruction}
+    const analysisInstruction = `Predict the target file from the supplied specifications and file excerpt.
+The specs may contain entries attributed to specific files using \`> \`path\`\` markers.
+Focus only on entries attributed to the target path. Ignore entries attributed to other files.
+If no entries are attributed to the target path, use only the general domain purpose.${judgeInstruction}
 
 Respond in JSON:
 {
@@ -552,28 +740,36 @@ Respond in JSON:
   "requirementCoverageScore": 0.0-1.0,
   "reasoning": "..."
 }`;
+    const prompts = protectPrompt(
+      `${PREDICTION_SYSTEM_PROMPT}\n\n${analysisInstruction}`,
+      `Specifications:\n${specsContent}${fileExcerpt}\n\nTarget path: ${candidate.path}`,
+    );
 
     try {
-      const prediction = await this.llm.completeJSON<FilePrediction>({
-        systemPrompt: PREDICTION_SYSTEM_PROMPT,
-        userPrompt,
+      const completion = await this.llm.completeJSONWithMetadata<FilePrediction>({
+        ...prompts,
         temperature: 0.3,
         maxTokens: VERIFICATION_PREDICTION_MAX_TOKENS,
       });
+      const prediction = completion.data;
+      if (!prediction || typeof prediction !== 'object' || Array.isArray(prediction)) {
+        throw new Error('verification prediction must be a JSON object');
+      }
 
       return {
-        predictedPurpose: prediction.predictedPurpose ?? '',
-        predictedImports: prediction.predictedImports ?? [],
-        predictedExports: prediction.predictedExports ?? [],
-        predictedLogic: prediction.predictedLogic ?? [],
-        relatedRequirements: prediction.relatedRequirements ?? [],
-        confidence: prediction.confidence ?? 0.5,
-        specAccuracyScore: typeof prediction.specAccuracyScore === 'number' ? prediction.specAccuracyScore : undefined,
-        requirementCoverageScore: typeof prediction.requirementCoverageScore === 'number' ? prediction.requirementCoverageScore : undefined,
-        reasoning: prediction.reasoning ?? '',
+        predictedPurpose: optionalString(prediction.predictedPurpose, 'predictedPurpose'),
+        predictedImports: optionalStringArray(prediction.predictedImports, 'predictedImports'),
+        predictedExports: optionalStringArray(prediction.predictedExports, 'predictedExports'),
+        predictedLogic: optionalStringArray(prediction.predictedLogic, 'predictedLogic'),
+        relatedRequirements: optionalStringArray(prediction.relatedRequirements, 'relatedRequirements'),
+        confidence: requirePresentUnitScore(prediction.confidence, 'confidence'),
+        specAccuracyScore: requireUnitScore(prediction.specAccuracyScore, 'specAccuracyScore'),
+        requirementCoverageScore: requireUnitScore(prediction.requirementCoverageScore, 'requirementCoverageScore'),
+        reasoning: optionalString(prediction.reasoning, 'reasoning'),
+        judgingModel: requireSafeModelId(completion.response.model),
       };
     } catch (error) {
-      logger.warning(`Prediction failed for ${candidate.path}: ${(error as Error).message}`);
+      logger.warning(`Prediction failed for ${sanitizeForTerminal(candidate.path)}: ${sanitizeForTerminal(describeVerificationError(error))}`);
       // Re-throw so verify() skips this file rather than recording a misleading 0% score
       throw error;
     }
@@ -587,14 +783,31 @@ Respond in JSON:
    * the LLM has seen the actual file and can assess whether the spec describes it.
    * Falls back to Jaccard keyword overlap when no LLM score is available.
    */
-  private comparePurpose(predicted: string, fileContent: string, specAccuracyScore?: number): PurposeMatch {
+  private comparePurpose(
+    predicted: string,
+    fileContent: string,
+    specAccuracyScore?: number,
+    judgingModel?: string,
+    deterministicSpecText: string = '',
+  ): PurposeMatch {
     const actual = this.extractPurpose(fileContent);
 
-    const similarity = typeof specAccuracyScore === 'number'
-      ? specAccuracyScore
-      : this.calculateSimilarity(predicted, actual);
+    if (typeof specAccuracyScore === 'number') {
+      if (!judgingModel) throw new Error('LLM-judged purpose score is missing its model provenance');
+      return {
+        predicted,
+        actual,
+        similarity: specAccuracyScore,
+        provenance: { source: 'llm-judged', model: judgingModel },
+      };
+    }
 
-    return { predicted, actual, similarity };
+    return {
+      predicted,
+      actual,
+      similarity: this.calculateSimilarity(deterministicSpecText, actual),
+      provenance: { source: 'keyword-fallback' },
+    };
   }
 
   /**
@@ -609,7 +822,8 @@ Respond in JSON:
     for (let i = 0; i < lines.length; i++) {
       const trimmed = lines[i].trim();
       if (trimmed.startsWith('/**')) { inBlockComment = true; continue; }
-      if (trimmed.startsWith('*/') || trimmed.endsWith('*/')) { inBlockComment = false; break; }
+      // `break` ends the scan, so clearing the flag here would be a dead store.
+      if (trimmed.startsWith('*/') || trimmed.endsWith('*/')) break;
       if (inBlockComment) {
         const comment = trimmed.replace(/^\*\s*/, '').trim();
         if (comment && !comment.startsWith('@')) parts.push(comment);
@@ -622,7 +836,7 @@ Respond in JSON:
 
     // 2. Exported identifier names — split camelCase/PascalCase/snake_case into words.
     // This gives the verifier vocabulary to match against even when comments are absent.
-    // E.g. "readSpecGenConfig" → "read Spec Gen Config"; "SPEC_GEN_DIR" → "spec gen dir".
+    // E.g. "readOpenLoreConfig" → "read Spec Gen Config"; "OPENLORE_DIR" → "spec gen dir".
     const exportMatches = content.matchAll(
       /^export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|interface|type|enum)\s+(\w+)/gm
     );
@@ -633,7 +847,11 @@ Respond in JSON:
       const words = name
         .replace(/_+/g, ' ')
         .replace(/([a-z])([A-Z])/g, '$1 $2')
-        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        // One capital, not `([A-Z]+)`: the `+` ate the whole run of capitals, then
+        // required `[A-Z][a-z]`, then gave it back one character at a time — quadratic
+        // on an unbounded export name. Byte-identical output (see the rationale on
+        // `splitCompound` in bm25-tokenizer.ts): both insert the space in the same place.
+        .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
         .toLowerCase()
         .split(/\s+/)
         .filter(w => w.length > 2);
@@ -732,6 +950,7 @@ Respond in JSON:
       precision: coverage,
       recall: coverage,
       f1Score: coverage,
+      provenance: { source: 'deterministic' },
     };
   }
 
@@ -744,6 +963,7 @@ Respond in JSON:
    */
   private normalizeImport(importPath: string): string {
     const normalized = importPath
+      .replace(/\\/g, '/')
       .replace(/\.(js|ts|jsx|tsx|mjs|cjs)$/, '')
       .replace(/^\.\//, '')
       .replace(/^\.\.\//, '');
@@ -755,11 +975,15 @@ Respond in JSON:
   /**
    * Compare predicted exports to actual
    */
-  private compareExports(predicted: string[], actual: string[]): SetMatch {
-    return this.calculateSetMatch(
+  private compareExports(predicted: string[], actual: string[], judgingModel?: string): SetMatch {
+    if (!judgingModel) throw new Error('LLM-predicted export match is missing its model provenance');
+    return {
+      ...this.calculateSetMatch(
       predicted.map(p => p.toLowerCase()),
       actual.map(a => a.toLowerCase())
-    );
+      ),
+      provenance: { source: 'llm-prediction-compared-deterministically', model: judgingModel },
+    };
   }
 
   /**
@@ -790,7 +1014,13 @@ Respond in JSON:
   /**
    * Parse requirements from a spec's markdown content.
    * Returns an array of { name, description } extracted from
-   * "### Requirement: Name\n\nThe system SHALL ..." blocks.
+   * "### Requirement: Name\n\nThe system SHALL ..." blocks — the level OpenSpec itself counts.
+   *
+   * The description is the first line of NORMATIVE text. Provenance lines are skipped — an
+   * implementation anchor and its continuation lines, and a provenance blockquote such as
+   * `> Decision recorded:` — so a requirement whose anchor precedes its text is not described by the
+   * anchor. A blockquote that carries normative text is still the description
+   * (change: ground-generated-specs-in-the-graph).
    */
   private parseSpecRequirements(specContent: string): Array<{ name: string; description: string }> {
     const requirements: Array<{ name: string; description: string }> = [];
@@ -800,11 +1030,23 @@ Respond in JSON:
       const m = lines[i].match(/^###\s+Requirement:\s+(.+)/i);
       if (!m) continue;
       const name = m[1].trim();
-      // Look ahead for the description line (first non-empty line after the heading)
       let description = '';
-      for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+      let afterAnchor = false;
+      for (let j = i + 1; j < Math.min(i + 20, lines.length); j++) {
         const l = lines[j].trim();
-        if (l.length > 0) { description = l; break; }
+        if (l.length === 0) continue;
+        if (/^#{1,6}\s/.test(l)) break;
+        // An implementation anchor item, and the backtick-only lines that continue it — only directly
+        // after the anchor, so a normative line that is just a code span is still the description.
+        if (/^[-*]?\s*\*\*Implementation\*\*:/.test(l)) { afterAnchor = true; continue; }
+        if (afterAnchor && /^[-*]?\s*(?:`[^`]+`[\s,]*)+$/.test(l)) continue;
+        afterAnchor = false;
+        // A provenance blockquote names its label with a colon, or is a bare code span; a blockquote
+        // carrying normative prose is the description.
+        if (/^>\s*(?:Decision recorded|Date|Implementation|Implements|Source files?):/i.test(l)
+          || /^>\s*`[^`]+`\s*$/.test(l)) continue;
+        description = l;
+        break;
       }
       if (name) requirements.push({ name, description });
     }
@@ -821,27 +1063,35 @@ Respond in JSON:
    *
    * Falls back to keyword matching when no LLM score is available.
    */
-  private analyzeRequirementCoverage(domain: string, fileContent: string, llmScore?: number): RequirementCoverage {
+  private analyzeRequirementCoverage(
+    domain: string,
+    fileContent: string,
+    llmScore?: number,
+    judgingModel?: string,
+  ): RequirementCoverage {
     const spec = this.specs.find(s => s.domain === domain);
     if (!spec) {
-      return { relatedRequirements: [], actuallyImplements: [], coverage: 0 };
+      return { relatedRequirements: [], actuallyImplements: [], coverage: 0, evidence: 'none', provenance: { source: 'none' } };
     }
 
     const requirements = this.parseSpecRequirements(spec.content);
     const relatedRequirements = requirements.map(r => r.name);
 
-    // LLM-as-judge: use the score directly, synthesize actuallyImplements proportionally
+    // LLM-as-judge: the scalar is evidence for aggregate coverage only. It cannot
+    // support named per-requirement membership claims.
     if (typeof llmScore === 'number') {
-      const implementedCount = Math.round(llmScore * requirements.length);
+      if (!judgingModel) throw new Error('LLM-judged requirement coverage is missing its model provenance');
       return {
         relatedRequirements,
-        actuallyImplements: relatedRequirements.slice(0, implementedCount),
+        actuallyImplements: [],
         coverage: llmScore,
+        evidence: 'llm-score',
+        provenance: { source: 'llm-judged', model: judgingModel },
       };
     }
 
     if (requirements.length === 0) {
-      return { relatedRequirements: [], actuallyImplements: [], coverage: 0 };
+      return { relatedRequirements: [], actuallyImplements: [], coverage: 0, evidence: 'none', provenance: { source: 'none' } };
     }
 
     const contentLower = fileContent.toLowerCase();
@@ -863,7 +1113,13 @@ Respond in JSON:
     }
 
     const coverage = actuallyImplements.length / requirements.length;
-    return { relatedRequirements, actuallyImplements, coverage };
+    return {
+      relatedRequirements,
+      actuallyImplements,
+      coverage,
+      evidence: 'keyword-match',
+      provenance: { source: 'keyword-fallback' },
+    };
   }
 
   /**
@@ -916,12 +1172,25 @@ Respond in JSON:
     // Missing exports
     const missingExports = exportMatch.actual.filter(a => !exportMatch.predicted.includes(a));
     if (missingExports.length > 0) {
-      feedback.push(`Undocumented exports: ${missingExports.slice(0, 3).join(', ')} not described in specs`);
+      const model = exportMatch.provenance?.source === 'llm-prediction-compared-deterministically'
+        ? exportMatch.provenance.model
+        : 'model provenance unavailable';
+      feedback.push(
+        `LLM-predicted export mismatch: ${model} did not predict ${missingExports.slice(0, 3).join(', ')}; ` +
+        'this is not proof that the specs omit them',
+      );
     }
 
     // Low requirement coverage
-    if (requirementCoverage.coverage < 0.5 && prediction.relatedRequirements.length > 0) {
-      const missing = prediction.relatedRequirements.filter(r => !requirementCoverage.actuallyImplements.includes(r));
+    if (requirementCoverage.evidence === 'llm-score' && requirementCoverage.coverage < 0.5) {
+      const model = requirementCoverage.provenance?.source === 'llm-judged'
+        ? requirementCoverage.provenance.model
+        : 'model provenance unavailable';
+      feedback.push(
+        `Requirement coverage: ${(requirementCoverage.coverage * 100).toFixed(0)}% (LLM-judged by ${model}; no per-requirement claims)`,
+      );
+    } else if (requirementCoverage.evidence === 'keyword-match' && requirementCoverage.coverage < 0.5) {
+      const missing = requirementCoverage.relatedRequirements.filter(r => !requirementCoverage.actuallyImplements.includes(r));
       if (missing.length > 0) {
         feedback.push(`Requirements ${missing.slice(0, 2).join(', ')} don't appear to be implemented in this file`);
       }
@@ -938,7 +1207,11 @@ Respond in JSON:
   /**
    * Generate verification report
    */
-  private generateReport(results: VerificationResult[], specVersion: string): VerificationReport {
+  private generateReport(
+    results: VerificationResult[],
+    specVersion: string,
+    failures: VerificationFailure[] = [],
+  ): VerificationReport {
     const passedFiles = results.filter(r => r.overallScore >= this.options.passThreshold).length;
     const overallConfidence = results.length > 0
       ? results.reduce((sum, r) => sum + r.overallScore, 0) / results.length
@@ -976,6 +1249,7 @@ Respond in JSON:
         specPath: `openspec/specs/${domain}/spec.md`,
         filesVerified: domainRes.length,
         averageScore: avgScore,
+        averageScoreBasis: 'mean-of-weighted-mixed-evidence-composites',
         weakestArea: weakest.name,
       });
     }
@@ -1000,7 +1274,7 @@ Respond in JSON:
       if (breakdown.averageScore < 0.7) {
         suggestedImprovements.push({
           domain: breakdown.domain,
-          issue: `Low verification score (${(breakdown.averageScore * 100).toFixed(0)}%)`,
+          issue: `Low weighted mixed-evidence composite score (${(breakdown.averageScore * 100).toFixed(0)}%)`,
           suggestion: `Review and enhance ${breakdown.specPath}, especially ${breakdown.weakestArea} descriptions`,
         });
       }
@@ -1008,23 +1282,37 @@ Respond in JSON:
 
     // Recommendation
     let recommendation: 'ready' | 'needs-review' | 'regenerate';
-    if (overallConfidence >= 0.75) {
+    if (overallConfidence >= this.options.passThreshold) {
       recommendation = 'ready';
     } else if (overallConfidence >= 0.5) {
       recommendation = 'needs-review';
     } else {
       recommendation = 'regenerate';
     }
+    const recommendationQualification = failures.length > 0
+      ? `${failures.length} of ${results.length + failures.length} attempted files could not be verified; aggregates cover successful files only.`
+      : undefined;
+    if (recommendation === 'ready' && failures.length > 0) recommendation = 'needs-review';
 
     return {
-      timestamp: new Date().toLocaleString(),
+      timestamp: new Date().toISOString(),
       specVersion,
+      attemptedFiles: results.length + failures.length,
       sampledFiles: results.length,
+      failedFiles: failures.length,
+      failures,
+      aggregateBasis: 'successful-files',
       passedFiles,
       overallConfidence,
+      overallConfidenceBasis: {
+        kind: 'mean-of-weighted-mixed-evidence-composites',
+        scoreComposition: VERIFICATION_SCORE_COMPOSITION,
+      },
       domainBreakdown,
       commonGaps,
       recommendation,
+      recommendationBasis: 'weighted-mixed-evidence-composite-threshold',
+      ...(recommendationQualification ? { recommendationQualification } : {}),
       suggestedImprovements,
       results,
     };
@@ -1057,7 +1345,7 @@ Respond in JSON:
     lines.push('# Spec Verification Report');
     lines.push('');
     lines.push(`Generated: ${report.timestamp}`);
-    lines.push(`Spec Version: ${report.specVersion}`);
+    lines.push(`Spec Version: ${escapeMarkdownInline(report.specVersion)}`);
     lines.push('');
 
     // Summary
@@ -1065,16 +1353,30 @@ Respond in JSON:
     lines.push('');
     lines.push(`| Metric | Value |`);
     lines.push(`|--------|-------|`);
-    lines.push(`| Files Verified | ${report.sampledFiles} |`);
+    lines.push(`| Files Attempted | ${report.attemptedFiles} |`);
+    lines.push(`| Files Verified Successfully | ${report.sampledFiles} |`);
+    lines.push(`| Files Failed Verification | ${report.failedFiles} |`);
     lines.push(`| Files Passed | ${report.passedFiles} (${report.sampledFiles > 0 ? ((report.passedFiles / report.sampledFiles) * 100).toFixed(0) : 'N/A'}%) |`);
-    lines.push(`| Overall Confidence | ${(report.overallConfidence * 100).toFixed(1)}% |`);
+    const overallBasis = report.overallConfidenceBasis
+      ? 'weighted mixed-evidence composite: purpose 50%, requirements 35%, imports 5%, exports 10%'
+      : 'provenance unavailable';
+    lines.push(`| Overall Composite Confidence | ${(report.overallConfidence * 100).toFixed(1)}% (${overallBasis}) |`);
     lines.push(`| Recommendation | **${report.recommendation}** |`);
+    lines.push(`| Recommendation Basis | ${report.recommendationBasis ?? 'provenance unavailable'} |`);
+    lines.push(`| Aggregate Basis | ${report.aggregateBasis} |`);
     lines.push('');
+
+    if (report.recommendationQualification) {
+      lines.push(`> ${escapeMarkdownInline(report.recommendationQualification)}`);
+      lines.push('');
+    }
 
     // Recommendation explanation
     lines.push('### Recommendation');
-    if (report.recommendation === 'ready') {
-      lines.push('✅ Specs accurately describe the codebase and are ready for use.');
+    if (report.failedFiles > 0) {
+      lines.push('⚠️ Verification was incomplete; review the failed files before relying on this result.');
+    } else if (report.recommendation === 'ready') {
+      lines.push('✅ The weighted mixed-evidence composite meets the configured readiness threshold.');
     } else if (report.recommendation === 'needs-review') {
       lines.push('⚠️ Specs need review. Some gaps were identified that should be addressed.');
     } else {
@@ -1082,14 +1384,23 @@ Respond in JSON:
     }
     lines.push('');
 
+    if (report.failures.length > 0) {
+      lines.push('## Verification Failures');
+      lines.push('');
+      for (const failure of report.failures) {
+        lines.push(`- ${escapeMarkdownInline(failure.filePath)}: ${escapeMarkdownInline(failure.reason)}`);
+      }
+      lines.push('');
+    }
+
     // Domain breakdown
     lines.push('## Domain Breakdown');
     lines.push('');
-    lines.push('| Domain | Spec Path | Files | Avg Score | Weakest Area |');
+    lines.push('| Domain | Spec Path | Files | Avg Composite Score | Weakest Area |');
     lines.push('|--------|-----------|-------|-----------|--------------|');
     for (const domain of report.domainBreakdown) {
       const scorePercent = (domain.averageScore * 100).toFixed(0);
-      lines.push(`| ${domain.domain} | ${domain.specPath} | ${domain.filesVerified} | ${scorePercent}% | ${domain.weakestArea} |`);
+      lines.push(`| ${escapeMarkdownInline(domain.domain)} | ${escapeMarkdownInline(domain.specPath)} | ${domain.filesVerified} | ${scorePercent}% | ${escapeMarkdownInline(domain.weakestArea)} |`);
     }
     lines.push('');
 
@@ -1098,7 +1409,7 @@ Respond in JSON:
       lines.push('## Common Gaps');
       lines.push('');
       for (const gap of report.commonGaps) {
-        lines.push(`- ${gap}`);
+        lines.push(`- ${escapeMarkdownInline(gap)}`);
       }
       lines.push('');
     }
@@ -1108,9 +1419,9 @@ Respond in JSON:
       lines.push('## Suggested Improvements');
       lines.push('');
       for (const improvement of report.suggestedImprovements) {
-        lines.push(`### ${improvement.domain}`);
-        lines.push(`- **Issue**: ${improvement.issue}`);
-        lines.push(`- **Suggestion**: ${improvement.suggestion}`);
+        lines.push(`### ${escapeMarkdownInline(improvement.domain)}`);
+        lines.push(`- **Issue**: ${escapeMarkdownInline(improvement.issue)}`);
+        lines.push(`- **Suggestion**: ${escapeMarkdownInline(improvement.suggestion)}`);
         lines.push('');
       }
     }
@@ -1121,31 +1432,55 @@ Respond in JSON:
     for (const result of report.results) {
       const scorePercent = (result.overallScore * 100).toFixed(0);
       const status = result.overallScore >= this.options.passThreshold ? '✅' : '❌';
-      lines.push(`### ${status} ${result.filePath}`);
+      lines.push(`### ${status} ${escapeMarkdownInline(result.filePath)}`);
       lines.push('');
-      lines.push(`- **Domain**: ${result.domain}`);
-      lines.push(`- **Overall Score**: ${scorePercent}%`);
-      lines.push(`- **LLM Confidence**: ${(result.llmConfidence * 100).toFixed(0)}%`);
+      lines.push(`- **Domain**: ${escapeMarkdownInline(result.domain)}`);
+      const scoreBasis = result.scoreComposition
+        ? 'weighted mixed-evidence composite: purpose 50%, requirements 35%, imports 5%, exports 10%'
+        : 'provenance unavailable';
+      lines.push(`- **Overall Composite Score**: ${scorePercent}% (${scoreBasis})`);
+      const confidenceEvidence = result.llmConfidenceProvenance
+        ? `llm-reported: ${escapeMarkdownInline(result.llmConfidenceProvenance.model)}`
+        : 'provenance unavailable';
+      lines.push(`- **LLM Confidence**: ${(result.llmConfidence * 100).toFixed(0)}% (${confidenceEvidence})`);
       lines.push('');
       lines.push('| Category | Score |');
       lines.push('|----------|-------|');
-      lines.push(`| Purpose Match | ${(result.purposeMatch.similarity * 100).toFixed(0)}% |`);
-      lines.push(`| Import Match (F1) | ${(result.importMatch.f1Score * 100).toFixed(0)}% |`);
-      lines.push(`| Export Match (F1) | ${(result.exportMatch.f1Score * 100).toFixed(0)}% |`);
-      lines.push(`| Requirement Coverage | ${(result.requirementCoverage.coverage * 100).toFixed(0)}% |`);
+      const purposeEvidence = result.purposeMatch.provenance?.source === 'llm-judged'
+        ? `llm-judged: ${escapeMarkdownInline(result.purposeMatch.provenance.model)}`
+        : result.purposeMatch.provenance?.source === 'keyword-fallback'
+          ? 'keyword-fallback'
+          : 'provenance unavailable';
+      const requirementEvidence = result.requirementCoverage.provenance?.source === 'llm-judged'
+        ? `llm-judged: ${escapeMarkdownInline(result.requirementCoverage.provenance.model)}`
+        : result.requirementCoverage.provenance?.source === 'keyword-fallback'
+          ? 'keyword-fallback'
+          : result.requirementCoverage.provenance?.source === 'none'
+            ? 'none'
+            : 'provenance unavailable';
+      lines.push(`| Purpose Match | ${(result.purposeMatch.similarity * 100).toFixed(0)}% (${purposeEvidence}) |`);
+      const importEvidence = result.importMatch.provenance?.source === 'deterministic'
+        ? 'deterministic'
+        : 'provenance unavailable';
+      const exportEvidence = result.exportMatch.provenance?.source === 'llm-prediction-compared-deterministically'
+        ? `deterministic comparison over ${escapeMarkdownInline(result.exportMatch.provenance.model)} prediction`
+        : 'provenance unavailable';
+      lines.push(`| Import Match (F1) | ${(result.importMatch.f1Score * 100).toFixed(0)}% (${importEvidence}) |`);
+      lines.push(`| Export Match (F1) | ${(result.exportMatch.f1Score * 100).toFixed(0)}% (${exportEvidence}) |`);
+      lines.push(`| Requirement Coverage | ${(result.requirementCoverage.coverage * 100).toFixed(0)}% (${requirementEvidence}) |`);
       lines.push('');
 
       if (result.feedback.length > 0) {
         lines.push('**Feedback:**');
         for (const fb of result.feedback) {
-          lines.push(`- ${fb}`);
+          lines.push(`- ${escapeMarkdownInline(fb)}`);
         }
         lines.push('');
       }
     }
 
     lines.push('---');
-    lines.push('*Generated by spec-gen verify*');
+    lines.push('*Generated by openlore verify*');
 
     return lines.join('\n');
   }
@@ -1156,9 +1491,7 @@ Respond in JSON:
    * triggers an eager load so callers can preview domains without a full LLM run.
    */
   async getDomains(): Promise<string[]> {
-    if (this.specs.length === 0) {
-      await this.loadSpecs();
-    }
+    await this.ensureVerificationContext();
     return this.specs.map(s => s.domain);
   }
 }

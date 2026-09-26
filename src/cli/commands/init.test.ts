@@ -1,5 +1,5 @@
 /**
- * Tests for spec-gen init command
+ * Tests for openlore init command
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -28,12 +28,12 @@ vi.mock('../../core/services/project-detector.js', () => ({
 }));
 
 vi.mock('../../core/services/config-manager.js', () => ({
-  specGenConfigExists: vi.fn().mockResolvedValue(false),
+  openloreConfigExists: vi.fn().mockResolvedValue(false),
   openspecDirExists: vi.fn().mockResolvedValue(false),
   openspecConfigExists: vi.fn().mockResolvedValue(false),
   getDefaultConfig: vi.fn().mockReturnValue({ projectType: 'nodejs', createdAt: '2024-01-01' }),
-  readSpecGenConfig: vi.fn().mockResolvedValue(null),
-  writeSpecGenConfig: vi.fn().mockResolvedValue(undefined),
+  readOpenLoreConfig: vi.fn().mockResolvedValue(null),
+  writeOpenLoreConfig: vi.fn().mockResolvedValue(undefined),
   readOpenSpecConfig: vi.fn().mockResolvedValue(null),
   createOpenSpecStructure: vi.fn().mockResolvedValue(undefined),
 }));
@@ -42,6 +42,7 @@ vi.mock('../../core/services/gitignore-manager.js', () => ({
   gitignoreExists: vi.fn().mockResolvedValue(false),
   isInGitignore: vi.fn().mockResolvedValue(false),
   addToGitignore: vi.fn().mockResolvedValue(undefined),
+  ensureGitignored: vi.fn().mockResolvedValue('created'),
 }));
 
 vi.mock('@inquirer/prompts', () => ({
@@ -79,7 +80,7 @@ describe('init command', () => {
 
     it('should reject openspec paths outside the project root', async () => {
       const { logger } = await import('../../utils/logger.js');
-      await initCommand.parseAsync(['node', 'init', '--openspec-path', '../outside'], { from: 'user' });
+      await initCommand.parseAsync(['--openspec-path', '../outside'], { from: 'user' });
       expect(logger.error).toHaveBeenCalledWith(
         expect.stringContaining('within the project directory')
       );
@@ -88,7 +89,7 @@ describe('init command', () => {
 
     it('should reject deeply nested traversal paths', async () => {
       const { logger } = await import('../../utils/logger.js');
-      await initCommand.parseAsync(['node', 'init', '--openspec-path', '../../way/outside'], { from: 'user' });
+      await initCommand.parseAsync(['--openspec-path', '../../way/outside'], { from: 'user' });
       expect(logger.error).toHaveBeenCalledWith(
         expect.stringContaining('within the project directory')
       );
@@ -96,7 +97,7 @@ describe('init command', () => {
     });
 
     it('should accept paths within the project root', async () => {
-      await initCommand.parseAsync(['node', 'init', '--openspec-path', './docs/specs'], { from: 'user' });
+      await initCommand.parseAsync(['--openspec-path', './docs/specs'], { from: 'user' });
       expect(process.exitCode).not.toBe(1);
     });
   });
@@ -107,7 +108,7 @@ describe('init command', () => {
       vi.clearAllMocks();
 
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.specGenConfigExists).mockResolvedValue(false);
+      vi.mocked(configManager.openloreConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecDirExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.getDefaultConfig).mockReturnValue({ projectType: 'nodejs', createdAt: '2024-01-01' } as never);
@@ -124,13 +125,13 @@ describe('init command', () => {
 
     it('should write config when no config exists', async () => {
       const configManager = await import('../../core/services/config-manager.js');
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
-      expect(configManager.writeSpecGenConfig).toHaveBeenCalled();
+      await initCommand.parseAsync([], { from: 'user' });
+      expect(configManager.writeOpenLoreConfig).toHaveBeenCalled();
     });
 
     it('should create openspec structure when directory does not exist', async () => {
       const configManager = await import('../../core/services/config-manager.js');
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+      await initCommand.parseAsync([], { from: 'user' });
       expect(configManager.createOpenSpecStructure).toHaveBeenCalled();
     });
 
@@ -138,12 +139,12 @@ describe('init command', () => {
       const configManager = await import('../../core/services/config-manager.js');
       vi.mocked(configManager.openspecDirExists).mockResolvedValue(true);
 
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+      await initCommand.parseAsync([], { from: 'user' });
       expect(configManager.createOpenSpecStructure).not.toHaveBeenCalled();
     });
 
     it('should not set process.exitCode on success', async () => {
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+      await initCommand.parseAsync([], { from: 'user' });
       expect(process.exitCode).not.toBe(1);
     });
   });
@@ -154,8 +155,8 @@ describe('init command', () => {
       vi.clearAllMocks();
 
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.specGenConfigExists).mockResolvedValue(true);
-      vi.mocked(configManager.readSpecGenConfig).mockResolvedValue({
+      vi.mocked(configManager.openloreConfigExists).mockResolvedValue(true);
+      vi.mocked(configManager.readOpenLoreConfig).mockResolvedValue({
         projectType: 'nodejs',
         createdAt: '2024-01-01T00:00:00Z',
         openspecPath: './openspec',
@@ -182,7 +183,7 @@ describe('init command', () => {
       Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
 
       try {
-        await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+        await initCommand.parseAsync([], { from: 'user' });
         expect(process.exitCode).toBe(1);
       } finally {
         Object.defineProperty(process.stdin, 'isTTY', { value: originalIsTTY, configurable: true });
@@ -191,8 +192,8 @@ describe('init command', () => {
 
     it('should overwrite config when --force is passed', async () => {
       const configManager = await import('../../core/services/config-manager.js');
-      await initCommand.parseAsync(['node', 'init', '--force'], { from: 'user' });
-      expect(configManager.writeSpecGenConfig).toHaveBeenCalled();
+      await initCommand.parseAsync(['--force'], { from: 'user' });
+      expect(configManager.writeOpenLoreConfig).toHaveBeenCalled();
       expect(process.exitCode).not.toBe(1);
     });
   });
@@ -203,7 +204,7 @@ describe('init command', () => {
       vi.clearAllMocks();
 
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.specGenConfigExists).mockResolvedValue(false);
+      vi.mocked(configManager.openloreConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecDirExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.getDefaultConfig).mockReturnValue({ projectType: 'nodejs', createdAt: '2024-01-01' } as never);
@@ -215,7 +216,7 @@ describe('init command', () => {
       vi.mocked(detector.getProjectTypeName).mockReturnValue('Node.js');
     });
 
-    it('should add .spec-gen/ to gitignore when gitignore exists and not yet ignored', async () => {
+    it('should add .openlore/ to gitignore when gitignore exists and not yet ignored', async () => {
       const gitignoreManager = await import('../../core/services/gitignore-manager.js');
       vi.mocked(gitignoreManager.gitignoreExists).mockResolvedValue(true);
       vi.mocked(gitignoreManager.isInGitignore).mockResolvedValue(false);
@@ -225,8 +226,8 @@ describe('init command', () => {
       Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
 
       try {
-        await initCommand.parseAsync(['node', 'init'], { from: 'user' });
-        expect(gitignoreManager.addToGitignore).toHaveBeenCalled();
+        await initCommand.parseAsync([], { from: 'user' });
+        expect(gitignoreManager.ensureGitignored).toHaveBeenCalled();
       } finally {
         Object.defineProperty(process.stdin, 'isTTY', { value: originalIsTTY, configurable: true });
       }
@@ -237,16 +238,29 @@ describe('init command', () => {
       vi.mocked(gitignoreManager.gitignoreExists).mockResolvedValue(true);
       vi.mocked(gitignoreManager.isInGitignore).mockResolvedValue(true);
 
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
-      expect(gitignoreManager.addToGitignore).not.toHaveBeenCalled();
+      await initCommand.parseAsync([], { from: 'user' });
+      expect(gitignoreManager.ensureGitignored).not.toHaveBeenCalled();
     });
 
-    it('should skip gitignore update when no .gitignore file exists', async () => {
+    it('should create .gitignore with .openlore/ when no .gitignore file exists', async () => {
       const gitignoreManager = await import('../../core/services/gitignore-manager.js');
       vi.mocked(gitignoreManager.gitignoreExists).mockResolvedValue(false);
+      vi.mocked(gitignoreManager.isInGitignore).mockResolvedValue(false);
 
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
-      expect(gitignoreManager.addToGitignore).not.toHaveBeenCalled();
+      // Non-TTY: auto-add (no interactive prompt)
+      const originalIsTTY = process.stdin.isTTY;
+      Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+
+      try {
+        await initCommand.parseAsync([], { from: 'user' });
+        expect(gitignoreManager.ensureGitignored).toHaveBeenCalledWith(
+          expect.any(String),
+          '.openlore/',
+          expect.any(String)
+        );
+      } finally {
+        Object.defineProperty(process.stdin, 'isTTY', { value: originalIsTTY, configurable: true });
+      }
     });
   });
 
@@ -256,7 +270,7 @@ describe('init command', () => {
       vi.clearAllMocks();
 
       const configManager = await import('../../core/services/config-manager.js');
-      vi.mocked(configManager.specGenConfigExists).mockResolvedValue(false);
+      vi.mocked(configManager.openloreConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecDirExists).mockResolvedValue(false);
       vi.mocked(configManager.openspecConfigExists).mockResolvedValue(false);
       vi.mocked(configManager.getDefaultConfig).mockReturnValue({ projectType: 'python', createdAt: '2024-01-01' } as never);
@@ -272,7 +286,7 @@ describe('init command', () => {
         confidence: 'low',
       });
 
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+      await initCommand.parseAsync([], { from: 'user' });
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('detect project type'));
     });
 
@@ -287,7 +301,7 @@ describe('init command', () => {
       });
       vi.mocked(detector.getProjectTypeName).mockReturnValue('Python');
 
-      await initCommand.parseAsync(['node', 'init'], { from: 'user' });
+      await initCommand.parseAsync([], { from: 'user' });
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('.git'));
     });
   });

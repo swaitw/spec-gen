@@ -6,6 +6,7 @@
  */
 
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import logger from '../../utils/logger.js';
 import { SKELETON_EXCERPT_MAX_CHARS, SKELETON_STANDALONE_MAX_CHARS, STAGE_CHUNK_MAX_CHARS } from '../../constants.js';
@@ -13,7 +14,9 @@ import type { ProgressIndicator } from '../../utils/progress.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { RepoStructure, LLMContext } from '../analyzer/artifact-generator.js';
 import { buildGraphPromptSection, getFileGodFunctions, extractSubgraph } from '../analyzer/subgraph-extractor.js';
-import { getSkeletonContent, detectLanguage, isSkeletonWorthIncluding } from '../analyzer/code-shaper.js';
+import { protectPrompt } from '../../utils/prompt-boundary.js';
+import { getSkeletonContent, isSkeletonWorthIncluding } from '../analyzer/code-shaper.js';
+import { detectLanguage } from '../analyzer/language-detection.js';
 import type { DependencyGraphResult } from '../analyzer/dependency-graph.js';
 import type { RefactorReport } from '../analyzer/refactor-analyzer.js';
 import { isTestFile } from '../analyzer/artifact-generator.js';
@@ -23,6 +26,10 @@ import { runStage3 } from './stages/stage3-services.js';
 import { runStage4 } from './stages/stage4-api.js';
 import { runStage5 } from './stages/stage5-architecture.js';
 import { runStage6 } from './stages/stage6-adr.js';
+import { buildDomainEvidence } from './domain-evidence.js';
+import { resolveDomainSelection } from './domain-evidence.js';
+import { normalizeDomainName } from './openspec-compat.js';
+import { safeJoin } from '../../utils/path-confinement.js';
 import { PROMPTS } from './prompts.js';
 import { SUBSPEC_SCHEMA } from './schemas.js';
 import type {
@@ -79,6 +86,7 @@ export class SpecGenerationPipeline implements PipelineContext {
   private currentLLMContext?: LLMContext;
   /** Set at the start of run() and used by schemasFor() / routesFor() */
   private currentRepoStructure?: RepoStructure;
+  private readonly cacheScope: string | null;
 
   constructor(llm: LLMService, options: PipelineOptions) {
     this.llm = llm;
@@ -86,6 +94,7 @@ export class SpecGenerationPipeline implements PipelineContext {
     this.semanticSearch = options.semanticSearch;
     this.options = {
       outputDir: options.outputDir,
+      domains: [...(options.domains ?? [])].map(normalizeDomainName).sort(),
       skipStages: options.skipStages ?? [],
       resumeFrom: options.resumeFrom ?? '',
       force: options.force ?? false,
@@ -95,6 +104,9 @@ export class SpecGenerationPipeline implements PipelineContext {
       generateADRs: options.generateADRs ?? false,
       chunkMaxChars: options.chunkMaxChars ?? STAGE_CHUNK_MAX_CHARS,
     };
+    this.cacheScope = this.options.domains.length > 0
+      ? `domains-${createHash('sha256').update(this.options.domains.join('\0')).digest('hex').slice(0, 12)}`
+      : null;
   }
 
   /**
@@ -108,6 +120,18 @@ export class SpecGenerationPipeline implements PipelineContext {
   ): Promise<PipelineResult> {
     this.currentLLMContext = llmContext;
     this.currentRepoStructure = repoStructure;
+    const allDomainEvidence = buildDomainEvidence(repoStructure, llmContext);
+    const selectedDomains = new Set(resolveDomainSelection(
+      allDomainEvidence.map(bundle => bundle.name),
+      this.options.domains,
+    ));
+    const domainEvidence = selectedDomains.size > 0
+      ? allDomainEvidence.filter(bundle => selectedDomains.has(normalizeDomainName(bundle.name)))
+      : allDomainEvidence;
+    const domainForFile = (path: string): string => domainEvidence.find(bundle => bundle.files.includes(path))?.name ?? 'undomained';
+    const scopedFilePaths = new Set(domainEvidence.flatMap(bundle => bundle.files));
+    const withinDomainScope = (files: Array<{ path: string; content: string }>) =>
+      files.filter(file => scopedFilePaths.has(file.path));
     const startTime = Date.now();
     let totalTokens = 0;
     const completedStages: string[] = [];
@@ -204,14 +228,18 @@ export class SpecGenerationPipeline implements PipelineContext {
 
       // Stage 2: Entity Extraction
       let entities: ExtractedEntity[] = [];
-      const schemaFiles = await this.resolveFiles(llmContext, survey.schemaFiles ?? [], await this.getSchemaFiles(llmContext));
+      const schemaFiles = await this.resolveFiles(
+        llmContext,
+        domainEvidence.flatMap(bundle => bundle.schemaFiles),
+        withinDomainScope(await this.getSchemaFiles(llmContext)),
+      );
       if (schemaFiles.length > 0) {
         entities = await executeStage(
           'entities',
           'Entity Extraction',
           async () => runStage2(this, survey, schemaFiles, (i, total, file) => {
             this.progress?.updateGeneration({ stage: stageNum, totalStages, stageName: `Entity Extraction ${i}/${total}: ${file}` });
-          }),
+          }, domainForFile),
           () => []
         );
       } else {
@@ -221,14 +249,18 @@ export class SpecGenerationPipeline implements PipelineContext {
 
       // Stage 3: Service Analysis
       let services: ExtractedService[] = [];
-      const serviceFiles = await this.resolveFiles(llmContext, survey.serviceFiles ?? [], await this.getServiceFiles(llmContext));
+      const serviceFiles = await this.resolveFiles(
+        llmContext,
+        domainEvidence.flatMap(bundle => bundle.serviceFiles),
+        withinDomainScope(await this.getServiceFiles(llmContext)),
+      );
       if (serviceFiles.length > 0) {
         services = await executeStage(
           'services',
           'Service Analysis',
           async () => runStage3(this, survey, entities, serviceFiles, (i, total, file) => {
             this.progress?.updateGeneration({ stage: stageNum, totalStages, stageName: `Service Analysis ${i}/${total}: ${file}` });
-          }),
+          }, domainForFile),
           () => []
         );
       } else {
@@ -238,14 +270,18 @@ export class SpecGenerationPipeline implements PipelineContext {
 
        // Stage 4: API Extraction
        let endpoints: ExtractedEndpoint[] = [];
-       const apiFiles = await this.resolveFiles(llmContext, survey.apiFiles ?? [], await this.getApiFiles(llmContext));
+       const apiFiles = await this.resolveFiles(
+         llmContext,
+         domainEvidence.flatMap(bundle => bundle.apiFiles),
+         withinDomainScope(await this.getApiFiles(llmContext)),
+       );
        if (apiFiles.length > 0) {
          endpoints = await executeStage(
            'api',
            'API Extraction',
-           async () => runStage4(this, apiFiles, (i, total, file) => {
-             this.progress?.updateGeneration({ stage: stageNum, totalStages, stageName: `API Extraction ${i}/${total}: ${file}` });
-           }),
+          async () => runStage4(this, apiFiles, (i, total, file) => {
+            this.progress?.updateGeneration({ stage: stageNum, totalStages, stageName: `API Extraction ${i}/${total}: ${file}` });
+          }, domainForFile),
            () => []
          );
        } else {
@@ -504,8 +540,10 @@ export class SpecGenerationPipeline implements PipelineContext {
 
     try {
       const result = await this.llm.completeJSON<ServiceSubSpec[]>({
-        systemPrompt: PROMPTS.stage3_subspec_system,
-        userPrompt: PROMPTS.stage3_subspec(parentName, parentPurpose, calleeInfos),
+        ...protectPrompt(
+          PROMPTS.stage3_subspec_system,
+          PROMPTS.stage3_subspec(parentName, parentPurpose, calleeInfos),
+        ),
         temperature: 0.3,
         maxTokens: 4000,
       }, SUBSPEC_SCHEMA);
@@ -747,9 +785,7 @@ export class SpecGenerationPipeline implements PipelineContext {
       // 2. Read from disk when rootPath is configured (covers files outside phase2_deep)
       if (this.options.rootPath) {
         try {
-          const absPath = resolve(this.options.rootPath, p);
-          // Prevent path traversal outside the project root
-          if (!absPath.startsWith(resolve(this.options.rootPath))) continue;
+          const absPath = safeJoin(resolve(this.options.rootPath), p);
           const content = await readFile(absPath, 'utf-8');
           resolved.push({ path: p, content });
         } catch {
@@ -798,7 +834,7 @@ export class SpecGenerationPipeline implements PipelineContext {
    * Save intermediate result
    */
   async saveResult(name: string, data: unknown): Promise<void> {
-    const filepath = join(this.options.outputDir, `${name}.json`);
+    const filepath = join(this.options.outputDir, `${this.scopedCacheName(name)}.json`);
     await writeFile(filepath, JSON.stringify(data, null, 2));
     logger.debug(`Saved ${name} to ${filepath}`);
   }
@@ -818,18 +854,23 @@ export class SpecGenerationPipeline implements PipelineContext {
     return map[stage] ?? `stage-${stage}`;
   }
 
+  /** Stage 1 is project-wide; all downstream results are isolated by domain scope. */
+  private scopedCacheName(name: string): string {
+    return this.cacheScope && name !== 'stage1-survey' ? `${name}.${this.cacheScope}` : name;
+  }
+
   /**
    * Load previous stage result (for resume)
    */
   async loadStageResult<T>(stage: string): Promise<StageResult<T> | null> {
     try {
-      const filepath = join(this.options.outputDir, `${this.stageFileName(stage)}.json`);
+      const filepath = join(this.options.outputDir, `${this.scopedCacheName(this.stageFileName(stage))}.json`);
 
       // Invalidate cache if analysis (llm-context.json) is newer than the stage file.
-      // This ensures that running `spec-gen analyze` followed by `spec-gen generate`
+      // This ensures that running `openlore analyze` followed by `openlore generate`
       // always re-runs the pipeline rather than serving stale LLM results.
       if (this.options.rootPath) {
-        const analysisFile = join(this.options.rootPath, '.spec-gen', 'analysis', 'llm-context.json');
+        const analysisFile = join(this.options.rootPath, '.openlore', 'analysis', 'llm-context.json');
         try {
           const [stageStat, analysisStat] = await Promise.all([stat(filepath), stat(analysisFile)]);
           if (analysisStat.mtimeMs > stageStat.mtimeMs) {

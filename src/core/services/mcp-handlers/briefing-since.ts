@@ -1,0 +1,355 @@
+/**
+ * Change significance briefing (change: add-change-significance-briefing) —
+ * "a lot changed since I last looked; what actually matters?"
+ *
+ * Every other change-oriented tool OpenLore has is about YOUR OWN pending diff
+ * (`blast_radius`, `change_impact_certificate`). This one answers the reviewer /
+ * catch-up / onboarding question instead: given a base ref, what changed since it
+ * and which of those changes is structurally load-bearing — ranked by labels the
+ * analyzer already produces, never by a hidden weighted score.
+ *
+ * The pipeline is pure reuse:
+ *   1. `getChangedFiles` (drift/git-diff) → the files changed since the base ref.
+ *   2. `seedsFromFiles` + `narrowToChangedSymbols` (test-impact) → the production symbols that
+ *      changed: exact where both revisions hash cleanly, file-level (disclosed) where they do not
+ *      (change: add-symbol-content-hashes).
+ *   3. `computeLandmarkSignals` → each symbol's hub/orchestrator/chokepoint labels.
+ *   4. `analyzeChangeCoupling` → per-file churn + how much history exists.
+ *   5. `labelChangeSignificance` (analyzer/change-significance) → one tier per symbol.
+ *   6. `handleSelectTests` → the tests to run for the whole change set.
+ *
+ * Honest by construction: any file-level fallback is disclosed with its reason; the surprising-change
+ * label is withheld when history is too shallow; truncation always carries a receipt
+ * (omitted count + lowest tier reached) and never drops a higher tier for a lower
+ * one. The cursor is the base ref, never wall-clock time.
+ */
+
+import { validateDirectory, readCachedContext, diagnoseIndexUnservable } from './utils.js';
+import { seedsFromFiles, handleSelectTests, narrowToChangedSymbols } from './test-impact.js';
+import {
+  carriedCaveat,
+  changedSymbolIds,
+  granularityCaveat,
+  importsAddedCaveat,
+  noChangeClaim,
+  type CarriedSymbol,
+  type DiffEntry,
+  type SymbolChangedSet,
+} from '../symbol-changed-set.js';
+import { isCodeNode, isExcludedPath } from './code-node.js';
+import { computeLandmarkSignals } from '../../analyzer/landmark-signals.js';
+import { analyzeChangeCoupling } from '../../provenance/change-coupling.js';
+import { assembleBoundary, computeStaleness } from './confidence-boundary.js';
+import {
+  labelChangeSignificance,
+  tierCounts,
+  TIERS_BY_RANK,
+  type ChangedSymbolFacts,
+  type LabeledChange,
+  type SignificanceTier,
+} from '../../analyzer/change-significance.js';
+import type { SerializedCallGraph } from '../../analyzer/call-graph.js';
+
+export interface BriefingSinceInput {
+  directory: string;
+  /**
+   * The cursor: a git ref to brief changes SINCE (the last-reviewed commit, a PR
+   * base, "where I was when I left"). Default "auto" → resolve main → master →
+   * HEAD~1 → empty tree. Never wall-clock time.
+   */
+  baseRef?: string;
+  /** Region scope — only brief changes whose file path contains this substring. */
+  filePattern?: string;
+  /** Bound on briefed symbols, highest-tier-first (default 50, capped 200). */
+  maxResults?: number;
+}
+
+const MAX_RESULTS_DEFAULT = 50;
+const MAX_RESULTS_CAP = 200;
+/** Cap on the test-file list echoed in the briefing (the full count is always reported). */
+const MAX_TEST_FILES = 50;
+/** Cap on changed-file paths echoed (the full count is always reported). */
+const MAX_CHANGED_FILES = 50;
+
+/** Normalize a path for tolerant churn lookup (git and node paths are repo-relative). */
+function normPath(p: string): string {
+  return p.replace(/^\/+/, '');
+}
+
+/**
+ * Produce a ranked, labeled catch-up briefing of what changed since a base ref.
+ * Read-only, deterministic, offline. Returns `unknown` (additive-by-cast),
+ * conclusion-shaped (a ranked tier list + receipts), never a diff or a graph.
+ */
+export async function handleBriefingSince(input: BriefingSinceInput): Promise<unknown> {
+  const absDir = await validateDirectory(input.directory);
+  const ctx = await readCachedContext(absDir);
+  if (!ctx) return await diagnoseIndexUnservable(absDir);
+  if (!ctx.callGraph) return { error: 'Call graph not available. Re-run analyze_codebase.' };
+
+  const cg = ctx.callGraph as SerializedCallGraph;
+  const maxResults = Math.max(1, Math.min(input.maxResults ?? MAX_RESULTS_DEFAULT, MAX_RESULTS_CAP));
+  const baseRefInput = input.baseRef && input.baseRef.length > 0 ? input.baseRef : 'auto';
+
+  // ── 1. Changed files since the base ref ─────────────────────────────────────
+  // Resolve-or-disclose through the one shared helper (fix-cli-conclusion-honesty):
+  // it returns the ref git actually diffs against (post main → master → HEAD~1
+  // fallback) AND whether the caller's explicit ref was genuinely unresolvable — so a
+  // typo'd `--base` is disclosed rather than silently briefing against a base the
+  // caller never asked for. The `auto` default explicitly requests the fallback chain.
+  let resolvedBase: string;
+  let requestedRefUnresolved: boolean;
+  let changedFiles: string[];
+  let diffEntries: DiffEntry[];
+  /** The analyzed root's path inside the work tree, for re-framing diff paths (`''` at the root). */
+  let repoPrefix = '';
+  /** Bound once the git-diff module is loaded below; the region filter needs it afterwards. */
+  let reframeRepoPath: (repoRelPath: string, prefix: string) => string | null = p => p;
+  try {
+    const { getChangedFiles, resolveBaseRefDisclosed, getRepoPrefix, reframeRepoPath: reframe } = await import('../../drift/git-diff.js');
+    reframeRepoPath = reframe;
+    const base = await resolveBaseRefDisclosed(absDir, baseRefInput);
+    resolvedBase = base.resolved;
+    requestedRefUnresolved = base.fellBack;
+    const diff = await getChangedFiles({ rootPath: absDir, baseRef: resolvedBase, includeUnstaged: true });
+    diffEntries = diff.files;
+    // Below the repository root, git returns repo-root-relative paths while the call
+    // graph is analyzed-root-relative; re-frame so the changed-symbol join is correct
+    // (no-op at the root). Files outside the analyzed subtree are dropped.
+    const prefix = (await getRepoPrefix(absDir)) ?? '';
+    repoPrefix = prefix;
+    // Production code files only — tests/config/generated are not "changes that matter"
+    // to rank; they still drive the tests-to-run selection below.
+    changedFiles = diff.files
+      .filter(f => !f.isTest)
+      .map(f => reframeRepoPath(f.path, prefix))
+      .filter((p): p is string => p !== null);
+  } catch (err) {
+    return { error: `git diff failed (base ${baseRefInput}): ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // ── 2. Changed production symbols ───────────────────────────────────────────
+  // A region scope (filePattern) narrows BOTH the briefed symbols and the file
+  // count/sample, so the reported denominators match the scoped briefing.
+  const scope: 'repo' | 'region' = input.filePattern ? 'region' : 'repo';
+  const scopedFiles = input.filePattern
+    ? changedFiles.filter(f => f.includes(input.filePattern!))
+    : changedFiles;
+  // Scope to hand-authored SOURCE CODE only — the same candidate set the significance-
+  // ranking sibling `report_coverage_gaps` uses (`code-node.ts`). The tiers (call-graph
+  // hub/orchestrator/chokepoint) and the tests-to-run are code concepts, so infrastructure
+  // (IaC) resources and generated/vendored shims do not belong in this ranking; infra
+  // change-impact has its own lens (`blast_radius` / `analyze_impact`). `seedsFromFiles`
+  // already drops external + test nodes.
+  let fileSymbols = seedsFromFiles(cg, scopedFiles)
+    .filter(n => isCodeNode(n) && !isExcludedPath(n.filePath));
+  if (input.filePattern) {
+    fileSymbols = fileSymbols.filter(n => n.filePath.includes(input.filePattern!));
+  }
+  // Brief only the symbols that changed (change: add-symbol-content-hashes). A symbol kept by the
+  // changed-set only because it references a changed one, or holds a dynamic-dispatch site, did not
+  // change and is not briefed. A rename or move IS briefed — its id and every caller changed, and a
+  // renamed hub is exactly what a returning reader must see — and the pair is named under `carried`.
+  // A region scope narrows the receipt too: telling a reader scoped to `src/cli/` about fallbacks in
+  // files they cannot see breaks the same denominators-match-the-briefing rule as the counts above.
+  // Match the pattern in the briefing's own frame: diff paths are repository-relative, while the
+  // pattern and the briefed symbols are analyzed-root relative, and below the repository root the
+  // two differ (the same trap the size probe hit).
+  const scopedEntries = input.filePattern
+    ? diffEntries.filter(entry => (reframeRepoPath(entry.path, repoPrefix) ?? entry.path).includes(input.filePattern!))
+    : diffEntries;
+  const narrowed = await narrowToChangedSymbols(absDir, resolvedBase, scopedEntries, cg, fileSymbols);
+  const carried: CarriedSymbol[] = narrowed.set?.carried ?? [];
+  const changedSymbols = fileSymbols.filter(n => {
+    const change = narrowed.set?.byFile.get(n.filePath);
+    if (!change || change.granularity === 'file') return true;
+    return changedSymbolIds(change).has(n.id);
+  });
+  const changeGranularity = narrowed.receipt;
+
+  // ── 3. Structural labels (reused classifier, no new score) ──────────────────
+  const landmarks = computeLandmarkSignals(cg);
+  const labelsById = new Map(landmarks.map(l => [l.id, new Set(l.signals.map(s => s.label))]));
+
+  // ── 4. Churn + history depth (reused change-coupling miner) ─────────────────
+  // Mine churn strictly BEFORE the briefed range: passing the resolved base as the
+  // start ref logs from that commit and its ancestors, so commits INSIDE base..HEAD
+  // (the very change being briefed) never inflate `priorChurn`. Otherwise a dormant
+  // hub hammered within the briefed range reads medium/high volatility and has its own
+  // `surprising-change` tier withheld — the tier demoting itself as significance rises.
+  const coupling = await analyzeChangeCoupling(absDir, { startRef: resolvedBase });
+  const churnByPath = new Map<string, number>();
+  for (const [file, n] of coupling.churn) churnByPath.set(normPath(file), n);
+  // "Rarely changed before" needs a non-degenerate history: a single (or zero)
+  // commit BEFORE the range has no "before" to be rare within, so the surprise label
+  // is withheld. commitsScanned now counts only the pre-base window (see startRef).
+  const historyAvailable = coupling.stats.commitsScanned >= 2;
+
+  const facts: ChangedSymbolFacts[] = changedSymbols.map(n => {
+    const labels = labelsById.get(n.id) ?? new Set<string>();
+    return {
+      id: n.id,
+      name: n.name,
+      filePath: n.filePath,
+      fanIn: n.fanIn ?? 0,
+      fanOut: n.fanOut ?? 0,
+      isHub: labels.has('hub'),
+      isOrchestrator: labels.has('orchestrator'),
+      isChokepoint: labels.has('chokepoint'),
+      churn: churnByPath.get(normPath(n.filePath)) ?? 0,
+      ...(n.communityLabel ? { community: n.communityLabel } : {}),
+    };
+  });
+
+  // ── 5. Label + rank (pure analyzer function) ────────────────────────────────
+  const labeled = labelChangeSignificance(facts, { historyAvailable });
+  const counts = tierCounts(labeled);
+
+  // ── 6. Bounded briefing + truncation receipt (no silent cap) ────────────────
+  // labeled is already sorted highest-tier-first, so slicing drops only the lowest
+  // tiers — a surprising-change is never dropped in favor of an ordinary-change.
+  const returned = labeled.slice(0, maxResults);
+  const omittedItems = labeled.slice(maxResults);
+  const truncation = buildTruncationReceipt(returned, omittedItems);
+
+  // ── Region rollup over the returned set ─────────────────────────────────────
+  const regionMap = new Map<string, number>();
+  for (const c of returned) {
+    const key = c.community ?? '(no community)';
+    regionMap.set(key, (regionMap.get(key) ?? 0) + 1);
+  }
+  const regions = [...regionMap.entries()]
+    .map(([community, count]) => ({ community, count }))
+    .sort((a, b) => b.count - a.count || a.community.localeCompare(b.community));
+
+  // ── Tests to run for the whole change set (reused select_tests) ─────────────
+  const testsToRun = await selectTestsSummary(absDir, resolvedBase, narrowed.set);
+
+  // ── Honesty: a base ref that matched no production symbol is "nothing changed",
+  // never the reassuring "nothing significant changed". ───────────────────────
+  let note: string | undefined;
+  if (changedSymbols.length === 0) {
+    if (scope === 'region') {
+      // A region scope that emptied the set is "nothing matched the filter", NOT
+      // "nothing changed" — production code may well have changed elsewhere. Saying
+      // "nothing changed" here would be a false all-clear.
+      note = scopedFiles.length === 0
+        ? `No changed file matched filePattern "${input.filePattern}" (production code may have changed elsewhere) — "nothing matched", NOT "nothing changed".`
+        : `No changed production symbol matched filePattern "${input.filePattern}" — "nothing matched", NOT "nothing significant".`;
+    } else {
+      note = changedFiles.length === 0
+        ? diffEntries.length === 0
+          ? `Nothing changed since ${resolvedBase}: the diff is empty.`
+          : `No production code changed since ${resolvedBase} (the diff touched only tests/config/non-code files) — "nothing changed", NOT "nothing significant".`
+        : changeGranularity && (fileSymbols.length > 0 || changeGranularity.changedSymbolsFound > 0)
+          ? `Nothing was briefed against ${resolvedBase}: ${noChangeClaim(changeGranularity).text}`
+          : 'The changed file(s) contain no analyzed production symbol (not yet analyzed, or only tests/generated) — "nothing matched", NOT "nothing significant".';
+    }
+  }
+
+  const granularityNote = changeGranularity && granularityCaveat(changeGranularity);
+  const importsNote = changeGranularity && importsAddedCaveat(changeGranularity);
+  const caveats: string[] = [
+    ...(granularityNote ? [granularityNote] : []),
+    ...(importsNote ? [importsNote] : []),
+    ...(carriedCaveat(carried) ? [carriedCaveat(carried)!] : []),
+    'Significance is a tier label from existing classifiers (hub/orchestrator/chokepoint) plus raw evidence — not a weighted score. The caller makes the final judgment.',
+    'Scope is hand-authored source code: infrastructure (IaC) resources and generated/vendored files are excluded (their change-impact has its own lens — blast_radius / analyze_impact). Non-code changed files still count toward changedFiles.',
+  ];
+  // The unresolved-ref disclosure leads the caveats — it changes which base every
+  // number below was computed against, so it must not be buried.
+  if (requestedRefUnresolved) {
+    caveats.unshift(`Requested base ref "${baseRefInput}" could not be resolved; briefed against "${resolvedBase}" instead (git's silent fallback). Pass a ref that exists to target the base you meant.`);
+  }
+  if (!historyAvailable) {
+    caveats.push(`Git history is too shallow (${coupling.stats.commitsScanned} commit(s) scanned) to establish "rarely changed before" — the surprising-change label is withheld and those hubs rank as hub-change.`);
+  }
+  // Surprise rests on per-file churn matched by exact path. git history does not
+  // follow renames, so a just-renamed (or non-ASCII-path) hub can read low churn and
+  // be over-flagged surprising-change. Only disclose when the signal is actually live.
+  if (counts['surprising-change'] > 0) {
+    caveats.push('The surprising-change signal uses per-file churn matched by exact path; git history does not follow renames, so a just-renamed file may read as low-churn and be over-flagged surprising. Confirm against its rename history.');
+  }
+
+  const staleness = await computeStaleness(absDir);
+  const confidenceBoundary = assembleBoundary({ staleness, integrity: ctx?.integrity });
+
+  return {
+    baseRef: resolvedBase,
+    ...(requestedRefUnresolved ? { baseRefFallback: { requested: baseRefInput, resolved: resolvedBase } } : {}),
+    scope,
+    ...(input.filePattern ? { filePattern: input.filePattern } : {}),
+    changedFiles: scopedFiles.length,
+    ...(scopedFiles.length > 0
+      ? { changedFilesSample: [...scopedFiles].sort().slice(0, MAX_CHANGED_FILES) }
+      : {}),
+    changedSymbols: changedSymbols.length,
+    ...(changeGranularity ? { changeGranularity } : {}),
+    ...(carried.length > 0 ? { carried } : {}),
+    tierCounts: counts,
+    briefing: returned,
+    truncation,
+    regions,
+    testsToRun,
+    surprisingChange: {
+      available: historyAvailable,
+      ...(historyAvailable ? {} : { reason: `only ${coupling.stats.commitsScanned} commit(s) of history — no "before" to be rare within` }),
+      historyCommitsScanned: coupling.stats.commitsScanned,
+    },
+    ...(note ? { note } : {}),
+    caveats,
+    confidenceBoundary,
+  };
+}
+
+interface TruncationReceipt {
+  bounded: boolean;
+  returned: number;
+  omitted: number;
+  /** Lowest tier present in the RETURNED set (how deep the briefing reached). */
+  lowestTierReached: SignificanceTier | null;
+  /** Per-tier count of what was dropped (only ever lower tiers). */
+  omittedByTier?: Record<string, number>;
+}
+
+function buildTruncationReceipt(returned: LabeledChange[], omitted: LabeledChange[]): TruncationReceipt {
+  const lowestTierReached = returned.length
+    ? [...returned].reduce<SignificanceTier>((lo, c) =>
+        TIERS_BY_RANK.indexOf(c.tier) > TIERS_BY_RANK.indexOf(lo) ? c.tier : lo, returned[0].tier)
+    : null;
+  if (omitted.length === 0) {
+    return { bounded: false, returned: returned.length, omitted: 0, lowestTierReached };
+  }
+  const omittedByTier: Record<string, number> = {};
+  for (const c of omitted) omittedByTier[c.tier] = (omittedByTier[c.tier] ?? 0) + 1;
+  return { bounded: true, returned: returned.length, omitted: omitted.length, lowestTierReached, omittedByTier };
+}
+
+/** Compact tests-to-run summary via the existing select_tests path. */
+async function selectTestsSummary(
+  absDir: string,
+  baseRef: string,
+  /** The changed-set this briefing already computed for the same base ref and diff. */
+  changedSet?: SymbolChangedSet,
+): Promise<{ count: number; files: string[]; note?: string; truncatedAtDepth?: number; soundness?: unknown }> {
+  try {
+    const result = (await handleSelectTests({ directory: absDir, diffRef: baseRef }, { changedSet })) as {
+      selectedTests?: Array<{ file: string }>;
+      error?: string;
+      truncatedAtDepth?: number;
+      soundness?: unknown;
+    };
+    if (result.error) return { count: 0, files: [], note: `test selection unavailable: ${result.error}` };
+    const tests = result.selectedTests ?? [];
+    const files = [...new Set(tests.map(t => t.file))].sort();
+    return {
+      count: tests.length,
+      files: files.slice(0, MAX_TEST_FILES),
+      ...(result.truncatedAtDepth !== undefined ? { truncatedAtDepth: result.truncatedAtDepth } : {}),
+      ...(result.soundness !== undefined ? { soundness: result.soundness } : {}),
+      ...(files.length > MAX_TEST_FILES ? { note: `${files.length} test files reach the change set; showing the first ${MAX_TEST_FILES}.` } : {}),
+    };
+  } catch (err) {
+    return { count: 0, files: [], note: `test selection failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}

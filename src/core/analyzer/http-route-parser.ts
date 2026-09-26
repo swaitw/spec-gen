@@ -26,9 +26,19 @@
  *   fuzzy   — normalised path matches after prefix stripping
  */
 
-import { readFile } from 'node:fs/promises';
 import { extname } from 'node:path';
-import { getSkeletonContent, detectLanguage } from './code-shaper.js';
+import { isTestFile } from './test-file.js';
+import {
+  mapFilesBounded,
+  readSourceCapped,
+  type OversizedFileObserver,
+} from './bounded-file-scan.js';
+import { blankCommentsPreservingLayout } from './comment-blanking.js';
+import { scanJavaMethodDeclarations } from './java-method-scanner.js';
+import { lineFromIndex } from './line-index.js';
+import { getExceptionParser } from './exception-flow.js';
+import type Parser from 'tree-sitter';
+import { parseBudgetOverrunMs, parseWithBudget, type BudgetableParser } from './parse-budget.js';
 
 // ============================================================================
 // TYPES
@@ -46,9 +56,19 @@ export interface HttpCall {
   normalizedUrl: string;
   /** 1-based source line */
   line: number;
+  /** Byte offset of the call expression when the extractor can prove it. */
+  offset?: number;
   /** axios / fetch / ky / got / custom */
   client: string;
 }
+
+export interface HttpExtractionDegradation {
+  file: string;
+  reason: 'budget-exceeded' | 'parse-failure' | 'traversal-budget';
+  budgetMs?: number;
+}
+
+type HttpDegradationObserver = (degradation: HttpExtractionDegradation) => void;
 
 /** A route handler found in a Python source file */
 export interface RouteDefinition {
@@ -88,6 +108,16 @@ export interface HttpEdge {
   /** How confident the match is */
   confidence: 'exact' | 'path' | 'fuzzy';
 }
+
+// The cross-service HTTP capability surface (which languages contribute client
+// call sites / server routes) lives in a dependency-free leaf module so the
+// language-support registry can derive its column without importing this module
+// (several tests vi.mock it). Re-exported here for the public extraction API.
+export {
+  HTTP_CLIENT_LANGUAGES,
+  HTTP_ROUTE_LANGUAGES,
+  CROSS_SERVICE_HTTP_LANGUAGES,
+} from './http-capability.js';
 
 // ============================================================================
 // NORMALISATION HELPERS
@@ -157,35 +187,49 @@ function candidatePaths(normalizedUrl: string): string[] {
 /**
  * Extract all HTTP calls from a JavaScript or TypeScript source file.
  */
-export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
+export async function extractHttpCalls(
+  filePath: string,
+  residentSource?: string,
+  onDegraded?: HttpDegradationObserver,
+): Promise<HttpCall[]> {
   const ext = extname(filePath).toLowerCase();
-  if (!['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'].includes(ext)) return [];
+  if (!['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.pyw', '.go'].includes(ext)) return [];
 
-  let content: string;
-  try {
-    content = await readFile(filePath, 'utf8');
-  } catch {
-    return [];
+  const content = residentSource ?? await readSourceCapped(filePath);
+  if (content === null) return [];
+  // The AST extractors are the authority for syntax/binding correctness, but a
+  // repository-wide HTTP pass should not pay for a second parse of every unrelated
+  // Python/Go file. These token checks may over-admit strings/comments (only costing
+  // a parse); they can never create an edge because the AST pass still decides.
+  if (ext === '.py' || ext === '.pyw') {
+    if (!content.includes('requests') && !content.includes('httpx')) return [];
+    return extractPythonHttpCalls(filePath, content, onDegraded);
+  }
+  if (ext === '.go') {
+    if (!content.includes('net/http')) return [];
+    return extractGoHttpCalls(filePath, content, onDegraded);
   }
 
   const calls: HttpCall[] = [];
 
-  // Strip comments to avoid false matches.
-  // The line-comment regex must NOT match `://` inside URLs — we only strip
-  // `//` that is preceded by whitespace, punctuation, brackets, or the start
-  // of the line (i.e. genuine JS/TS comments, not protocol separators).
-  // The character class intentionally includes ) and ] so that patterns like
-  // `fetch('/api/items') // comment` are correctly stripped.
+  // Mask comments (to avoid false matches) LENGTH-PRESERVINGLY: blank them to spaces
+  // and keep newlines, so `clean` stays byte-aligned with `content` and every
+  // regex `m.index` below feeds getLine() the correct line. Removing comment text
+  // instead (the old behavior) shifted offsets, so a call AFTER any comment got a
+  // wrong (earlier) line — which then mis-resolved or dropped its enclosing-function
+  // edge in the call-graph HTTP pass. The line-comment regex must NOT match `://`
+  // inside URLs — only `//` preceded by whitespace, punctuation, brackets, or the
+  // start of line (the prefix char is preserved; only the comment body is blanked).
   const clean = content
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[\s,;()[\]{}])\/\/.*$/gm, '$1');
+    .replace(/\/\*[\s\S]*?\*\//g, blankKeepNewlines)
+    .replace(/(^|[\s,;()[\]{}])(\/\/.*)$/gm, (_m, prefix, comment) => prefix + ' '.repeat(comment.length));
 
   const lines = content.split('\n'); // keep original for line numbers
 
   // ── fetch ──────────────────────────────────────────────────────────────────
   // fetch('/api/search')
   // fetch(`/api/search/${id}`, { method: 'POST' })
-  const fetchRegex = /\bfetch\s*\(\s*(`[^`]+`|'[^']+'|"[^"]+")\s*(?:,\s*\{([^}]*)\})?\s*\)/g;
+  const fetchRegex = /\bfetch\s*\(\s*(`[^`]+`|'[^']+'|"[^"]+")\s*(?:,\s*\{([^}]{0,4000})\})?\s*\)/g;
   let m: RegExpExecArray | null;
   while ((m = fetchRegex.exec(clean)) !== null) {
     const rawUrl = m[1].replace(/^[`'"]/,'').replace(/[`'"]$/,'');
@@ -199,6 +243,7 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
       url: rawUrl,
       normalizedUrl: normalizeUrl(rawUrl),
       line: getLine(lines, m.index),
+      offset: m.index,
       client: 'fetch',
     });
   }
@@ -218,6 +263,7 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
       url: rawUrl,
       normalizedUrl: normalizeUrl(rawUrl),
       line: getLine(lines, m.index),
+      offset: m.index,
       client: 'axios',
     });
   }
@@ -237,6 +283,7 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
       url: rawUrl,
       normalizedUrl: normalizeUrl(rawUrl),
       line: getLine(lines, m.index),
+      offset: m.index,
       client: 'axios',
     });
   }
@@ -252,6 +299,7 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
       url: rawUrl,
       normalizedUrl: normalizeUrl(rawUrl),
       line: getLine(lines, m.index),
+      offset: m.index,
       client: 'ky',
     });
   }
@@ -267,6 +315,7 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
       url: rawUrl,
       normalizedUrl: normalizeUrl(rawUrl),
       line: getLine(lines, m.index),
+      offset: m.index,
       client: 'got',
     });
   }
@@ -278,6 +327,372 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
   return calls;
 }
 
+type SyntaxNode = Parser.SyntaxNode;
+const MAX_HTTP_AST_DEPTH = 512;
+const MAX_HTTP_AST_NODES = 250_000;
+
+function httpAstWithinTraversalBudget(root: SyntaxNode): boolean {
+  const stack: Array<{ node: SyntaxNode; depth: number }> = [{ node: root, depth: 0 }];
+  let visited = 0;
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop()!;
+    if (depth > MAX_HTTP_AST_DEPTH || ++visited > MAX_HTTP_AST_NODES) return false;
+    for (let i = node.namedChildren.length - 1; i >= 0; i--) {
+      stack.push({ node: node.namedChildren[i], depth: depth + 1 });
+    }
+  }
+  return true;
+}
+type PythonBinding = 'requests-module' | 'httpx-module' | 'requests-client' | 'httpx-client' | 'invalid';
+interface BindingEvent { name: string; index: number; binding: PythonBinding }
+interface PythonScope { node: SyntaxNode; parent?: PythonScope; kind?: 'class'; locals: Set<string>; events: BindingEvent[] }
+
+const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options']);
+
+function staticString(node: SyntaxNode | undefined, language: 'Python' | 'Go'): string | undefined {
+  if (!node) return undefined;
+  if (language === 'Go') {
+    if (node.type === 'raw_string_literal') return node.text.slice(1, -1);
+    if (node.type !== 'interpreted_string_literal') return undefined;
+    const raw = node.text.slice(1, -1);
+    // Decoding arbitrary Go escapes incorrectly could invent a path. HTTP literals
+    // normally need none; reject them conservatively rather than guess.
+    return raw.includes('\\') ? undefined : raw;
+  }
+  if (node.type !== 'string' || node.namedChildren.some(c => c.type === 'interpolation')) return undefined;
+  const match = node.text.match(/^([rRuUbBfF]*)(['"])([\s\S]*)\2$/);
+  if (!match || /f/i.test(match[1]) || match[3].includes('\\')) return undefined;
+  return match[3];
+}
+
+function pythonAttribute(node: SyntaxNode | undefined): { receiver: string; member: string } | undefined {
+  if (node?.type !== 'attribute' || node.namedChildren.length < 2) return undefined;
+  const receiver = node.namedChildren[0];
+  const member = node.namedChildren.at(-1)!;
+  if (receiver.type !== 'identifier' || member.type !== 'identifier') return undefined;
+  return { receiver: receiver.text, member: member.text };
+}
+
+function assignmentTargets(node: SyntaxNode): string[] {
+  const left = node.childForFieldName('left') ?? node.namedChildren[0];
+  if (!left) return [];
+  if (left.type === 'identifier') return [left.text];
+  return left.namedChildren.filter(c => c.type === 'identifier').map(c => c.text);
+}
+
+function resolvePython(scope: PythonScope, name: string, at: number): PythonBinding | undefined {
+  let current: PythonScope | undefined = scope;
+  const origin = scope;
+  while (current) {
+    // A method does not close over its class namespace. Class attributes require
+    // `C.name`/`self.name`, so an unqualified import here is not visible below.
+    if (current.kind === 'class' && current !== origin) { current = current.parent; continue; }
+    const local = current.locals.has(name);
+    const event = current.events.filter(e => e.name === name && e.index < at).at(-1);
+    if (event) return event.binding === 'invalid' ? undefined : event.binding;
+    if (local) return undefined;
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function pythonKeywordArgument(args: SyntaxNode | undefined, name: string): SyntaxNode | undefined {
+  const keyword = args?.namedChildren.find(child => {
+    if (child.type !== 'keyword_argument') return false;
+    const key = child.childForFieldName('name') ?? child.namedChildren[0];
+    return key?.text === name;
+  });
+  return keyword?.childForFieldName('value') ?? keyword?.namedChildren.at(-1);
+}
+
+/** AST-backed lower-bound extraction. Parsing, rather than masking regexes, keeps
+ * comments/docstrings/ordinary strings out of the call stream and preserves exact offsets. */
+async function extractPythonHttpCalls(filePath: string, content: string, onDegraded?: HttpDegradationObserver): Promise<HttpCall[]> {
+  const parser = await getExceptionParser('Python', filePath);
+  if (!parser) return [];
+  let root: SyntaxNode;
+  try {
+    root = parseWithBudget(parser as unknown as BudgetableParser<Parser.Tree>, content).rootNode;
+  } catch (error) {
+    const budgetMs = parseBudgetOverrunMs((error as Error).message);
+    onDegraded?.({ file: filePath, reason: budgetMs === undefined ? 'parse-failure' : 'budget-exceeded', ...(budgetMs === undefined ? {} : { budgetMs }) });
+    return [];
+  }
+  return extractPythonHttpCallsFromRoot(filePath, root);
+}
+
+export function extractPythonHttpCallsFromRoot(filePath: string, root: SyntaxNode, onDegraded?: HttpDegradationObserver): HttpCall[] {
+  if (root.hasError) { onDegraded?.({ file: filePath, reason: 'parse-failure' }); return []; }
+  if (!httpAstWithinTraversalBudget(root)) { onDegraded?.({ file: filePath, reason: 'traversal-budget' }); return []; }
+  const rootScope: PythonScope = { node: root, locals: new Set(), events: [] };
+  const scopes = new Map<number, PythonScope>([[root.startIndex, rootScope]]);
+
+  const buildScopes = (node: SyntaxNode, scope: PythonScope): void => {
+    let active = scope;
+    if (node !== root && node.type === 'class_definition') {
+      active = { node, parent: scope, kind: 'class', locals: new Set(), events: [] };
+      scopes.set(node.startIndex, active);
+    } else if (node !== root && (node.type === 'function_definition' || node.type === 'lambda')) {
+      active = { node, parent: scope, locals: new Set(), events: [] };
+      scopes.set(node.startIndex, active);
+      const params = node.childForFieldName('parameters');
+      if (params) for (const id of params.namedChildren) {
+        const name = id.type === 'identifier' ? id.text : id.namedChildren.find(c => c.type === 'identifier')?.text;
+        if (name) active.locals.add(name);
+      }
+    }
+    if (node.type === 'import_statement') {
+      const conditional = (() => {
+        let parent = node.parent;
+        while (parent && parent !== active.node) {
+          if (['if_statement', 'for_statement', 'while_statement', 'try_statement', 'match_statement'].includes(parent.type)) return true;
+          parent = parent.parent;
+        }
+        return false;
+      })();
+      for (const item of node.namedChildren) {
+        const source = item.type === 'aliased_import' ? item.namedChildren[0]?.text : item.text;
+        const alias = item.type === 'aliased_import' ? item.namedChildren.at(-1)?.text : source?.split('.')[0];
+        if (alias) {
+          active.locals.add(alias);
+          const binding = !conditional && (source === 'requests' || source === 'httpx')
+            ? `${source}-module` as PythonBinding
+            : 'invalid';
+          active.events.push({ name: alias, index: node.startIndex, binding });
+        }
+      }
+    } else if (node.type === 'import_from_statement') {
+      // Any imported name can shadow a previously proven HTTP binding. Direct
+      // function imports are not modeled as clients, so record invalidations.
+      for (const item of node.namedChildren.slice(1)) {
+        const alias = item.type === 'aliased_import' ? item.namedChildren.at(-1)?.text : item.text;
+        if (alias && /^\w+$/.test(alias)) {
+          active.locals.add(alias);
+          active.events.push({ name: alias, index: node.startIndex, binding: 'invalid' });
+        }
+      }
+    } else if (node.type === 'assignment' || node.type === 'named_expression') {
+      const targets = assignmentTargets(node);
+      const right = node.childForFieldName('right') ?? node.namedChildren.at(-1);
+      let binding: PythonBinding = 'invalid';
+      if (right?.type === 'call') {
+        const attr = pythonAttribute(right.childForFieldName('function') ?? right.namedChildren[0]);
+        if (attr && ((attr.member === 'Session') || (attr.member === 'Client'))) {
+          const owner = resolvePython(active, attr.receiver, node.startIndex);
+          if (owner === 'requests-module' && attr.member === 'Session') binding = 'requests-client';
+          if (owner === 'httpx-module' && attr.member === 'Client') binding = 'httpx-client';
+        }
+      }
+      for (const name of targets) {
+        active.locals.add(name);
+        active.events.push({ name, index: node.startIndex, binding });
+      }
+    } else if (node.type === 'with_item') {
+      const pattern = node.namedChildren.find(c => c.type === 'as_pattern');
+      const value = pattern?.namedChildren[0];
+      const aliasNode = pattern?.childForFieldName('alias') ?? pattern?.namedChildren.at(-1);
+      const alias = aliasNode?.type === 'identifier'
+        ? aliasNode
+        : aliasNode?.namedChildren.find(c => c.type === 'identifier');
+      if (value?.type === 'call' && alias) {
+        const attr = pythonAttribute(value.childForFieldName('function') ?? value.namedChildren[0]);
+        const owner = attr ? resolvePython(active, attr.receiver, node.startIndex) : undefined;
+        if (owner === 'httpx-module' && attr?.member === 'AsyncClient') {
+          active.locals.add(alias.text);
+          active.events.push({ name: alias.text, index: node.startIndex, binding: 'httpx-client' });
+          const withStatement = node.parent?.parent;
+          if (withStatement?.type === 'with_statement') {
+            active.events.push({ name: alias.text, index: withStatement.endIndex, binding: 'invalid' });
+          }
+        }
+      }
+    }
+    for (const child of node.namedChildren) buildScopes(child, active);
+  };
+  buildScopes(root, rootScope);
+  for (const scope of scopes.values()) scope.events.sort((a, b) => a.index - b.index);
+
+  const calls: HttpCall[] = [];
+  const visit = (node: SyntaxNode, scope: PythonScope): void => {
+    const nested = scopes.get(node.startIndex);
+    const active = nested ?? scope;
+    if (node.type === 'call') {
+      const attr = pythonAttribute(node.childForFieldName('function') ?? node.namedChildren[0]);
+      const args = node.childForFieldName('arguments') ?? node.namedChildren.find(c => c.type === 'argument_list');
+      const values = args?.namedChildren.filter(c => c.type !== 'keyword_argument') ?? [];
+      if (attr) {
+        const binding = resolvePython(active, attr.receiver, node.startIndex);
+        const client = binding?.startsWith('requests') ? 'requests' : binding?.startsWith('httpx') ? 'httpx' : undefined;
+        let method: string | undefined;
+        let urlNode: SyntaxNode | undefined;
+        if (HTTP_METHODS.has(attr.member.toLowerCase())) {
+          method = attr.member.toUpperCase();
+          urlNode = values[0] ?? pythonKeywordArgument(args, 'url');
+        } else if (attr.member === 'request') {
+          method = staticString(values[0] ?? pythonKeywordArgument(args, 'method'), 'Python')?.toUpperCase();
+          urlNode = values[1] ?? pythonKeywordArgument(args, 'url');
+        }
+        const rawUrl = staticString(urlNode, 'Python');
+        if (client && method && HTTP_METHODS.has(method.toLowerCase()) && rawUrl !== undefined) {
+          calls.push({ file: filePath, method, url: rawUrl, normalizedUrl: normalizeUrl(rawUrl), line: node.startPosition.row + 1, offset: node.startIndex, client });
+        }
+      }
+    }
+    for (const child of node.namedChildren) visit(child, active);
+  };
+  visit(root, rootScope);
+  return calls;
+}
+
+function goSelector(node: SyntaxNode | undefined): string[] | undefined {
+  if (!node) return undefined;
+  if (node.type === 'identifier') return [node.text];
+  if (node.type !== 'selector_expression') return undefined;
+  const left = goSelector(node.namedChildren[0]);
+  const right = node.namedChildren.at(-1)?.text;
+  return left && right ? [...left, right] : undefined;
+}
+
+function goHttpImportAliases(root: SyntaxNode): Set<string> {
+  const aliases = new Set<string>();
+  const visit = (node: SyntaxNode): void => {
+    if (node.type === 'import_spec') {
+      const pathNode = node.namedChildren.find(child => staticString(child, 'Go') === 'net/http');
+      if (pathNode) {
+        const explicit = node.namedChildren.find(child => staticString(child, 'Go') !== 'net/http')?.text;
+        const alias = explicit ?? 'http';
+        // Dot imports have no receiver to prove and blank imports expose no symbols.
+        if (alias !== '.' && alias !== '_') aliases.add(alias);
+      }
+    }
+    for (const child of node.namedChildren) visit(child);
+  };
+  visit(root);
+  return aliases;
+}
+
+function goHttpMethod(node: SyntaxNode | undefined, aliases: ReadonlySet<string>): string | undefined {
+  const literal = staticString(node, 'Go')?.toUpperCase();
+  if (literal && HTTP_METHODS.has(literal.toLowerCase())) return literal;
+  const selector = goSelector(node);
+  if (!selector || selector.length !== 2 || !aliases.has(selector[0])) return undefined;
+  const suffix = selector[1].match(/^Method(Get|Post|Put|Patch|Delete|Head|Options)$/)?.[1];
+  return suffix?.toUpperCase();
+}
+
+/** AST-backed net/http extraction. Request construction and Do must be tied in the
+ * same lexical function; dynamic methods, URLs, and request variables are skipped. */
+async function extractGoHttpCalls(filePath: string, content: string, onDegraded?: HttpDegradationObserver): Promise<HttpCall[]> {
+  const parser = await getExceptionParser('Go', filePath);
+  if (!parser) return [];
+  let root: SyntaxNode;
+  try {
+    root = parseWithBudget(parser as unknown as BudgetableParser<Parser.Tree>, content).rootNode;
+  } catch (error) {
+    const budgetMs = parseBudgetOverrunMs((error as Error).message);
+    onDegraded?.({ file: filePath, reason: budgetMs === undefined ? 'parse-failure' : 'budget-exceeded', ...(budgetMs === undefined ? {} : { budgetMs }) });
+    return [];
+  }
+  return extractGoHttpCallsFromRoot(filePath, root);
+}
+
+export function extractGoHttpCallsFromRoot(filePath: string, root: SyntaxNode, onDegraded?: HttpDegradationObserver): HttpCall[] {
+  if (root.hasError) { onDegraded?.({ file: filePath, reason: 'parse-failure' }); return []; }
+  if (!httpAstWithinTraversalBudget(root)) { onDegraded?.({ file: filePath, reason: 'traversal-budget' }); return []; }
+  const importAliases = goHttpImportAliases(root);
+  if (importAliases.size === 0) return [];
+  const calls: HttpCall[] = [];
+  const functions = root.namedChildren.flatMap(function collect(n): SyntaxNode[] {
+    if (n.type === 'function_declaration' || n.type === 'method_declaration') return [n];
+    return n.namedChildren.flatMap(collect);
+  });
+  for (const fn of functions) {
+    // A single function-wide provenance map cannot soundly distinguish two
+    // same-named bindings in nested Go blocks. Refuse those names rather than
+    // letting a static inner request escape its lexical scope and rewrite an
+    // outer dynamic request.
+    const definitionCounts = new Map<string, number>();
+    const countDefinition = (name: string): void => {
+      definitionCounts.set(name, (definitionCounts.get(name) ?? 0) + 1);
+    };
+    const countDefinitions = (node: SyntaxNode): void => {
+      if (node !== fn && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal')) return;
+      if (node.type === 'short_var_declaration' || node.type === 'assignment_statement') {
+        const left = node.childForFieldName('left');
+        for (const child of left?.namedChildren ?? []) if (child.type === 'identifier') countDefinition(child.text);
+      } else if (node.type === 'parameter_declaration' || node.type === 'variadic_parameter_declaration') {
+        const names = node.childForFieldName('name');
+        if (names?.type === 'identifier') countDefinition(names.text);
+        else for (const child of node.namedChildren.slice(0, -1)) if (child.type === 'identifier') countDefinition(child.text);
+      }
+      for (const child of node.namedChildren) countDefinitions(child);
+    };
+    countDefinitions(fn);
+    const availableAliases = new Set([...importAliases].filter(alias => !definitionCounts.has(alias)));
+    const uniqueBinding = (name: string): boolean => definitionCounts.get(name) === 1;
+    const requests = new Map<string, { method: string; url: string; block: number }>();
+    const httpClients = new Map<string, number>();
+    const lexicalBlock = (node: SyntaxNode): number | undefined => {
+      let current: SyntaxNode | null = node;
+      while (current && current !== fn) {
+        if (current.type === 'block') return current.startIndex;
+        current = current.parent;
+      }
+      return fn.childForFieldName('body')?.startIndex;
+    };
+    const walk = (node: SyntaxNode): void => {
+      if (node !== fn && (node.type === 'function_declaration' || node.type === 'method_declaration' || node.type === 'func_literal')) return;
+      if (node.type === 'short_var_declaration' || node.type === 'assignment_statement') {
+        const left = node.childForFieldName('left');
+        const right = node.childForFieldName('right');
+        const names = left?.namedChildren.filter(c => c.type === 'identifier').map(c => c.text) ?? [];
+        const rhs = right?.namedChildren ?? [];
+        for (const name of names) { requests.delete(name); httpClients.delete(name); }
+        const call = rhs.find(c => c.type === 'call_expression');
+        const target = goSelector(call?.childForFieldName('function') ?? call?.namedChildren[0]);
+        const args = call?.childForFieldName('arguments')?.namedChildren ?? [];
+        if (call && target && availableAliases.has(target[0]) && (target.at(-1) === 'NewRequest' || target.at(-1) === 'NewRequestWithContext')) {
+          const offset = target.at(-1) === 'NewRequestWithContext' ? 1 : 0;
+          const method = goHttpMethod(args[offset], availableAliases);
+          const url = staticString(args[offset + 1], 'Go');
+          const reqName = names[0];
+          const block = lexicalBlock(node);
+          if (reqName && block !== undefined && uniqueBinding(reqName) && method && HTTP_METHODS.has(method.toLowerCase()) && url !== undefined) requests.set(reqName, { method, url, block });
+        }
+        const rightText = (right?.text ?? '').replace(/\s/g, '');
+        if (names[0] && uniqueBinding(names[0]) && [...availableAliases].some(alias =>
+          rightText.startsWith(`&${alias}.Client{`) || rightText.startsWith(`${alias}.Client{`) ||
+          rightText === `${alias}.DefaultClient`)) {
+          const block = lexicalBlock(node);
+          if (block !== undefined) httpClients.set(names[0], block);
+        }
+      }
+      if (node.type === 'call_expression') {
+        const target = goSelector(node.childForFieldName('function') ?? node.namedChildren[0]);
+        const args = node.childForFieldName('arguments')?.namedChildren ?? [];
+        if (target?.length === 2 && availableAliases.has(target[0]) && ['Get', 'Head', 'Post', 'PostForm'].includes(target[1])) {
+          const rawUrl = staticString(args[0], 'Go');
+          if (rawUrl !== undefined) {
+            const method = target[1] === 'Get' ? 'GET' : target[1] === 'Head' ? 'HEAD' : 'POST';
+            calls.push({ file: filePath, method, url: rawUrl, normalizedUrl: normalizeUrl(rawUrl), line: node.startPosition.row + 1, offset: node.startIndex, client: 'net/http' });
+          }
+        } else if (target?.at(-1) === 'Do' && args[0]?.type === 'identifier') {
+          const request = requests.get(args[0].text);
+          const owner = target.slice(0, -1).join('.');
+          const defaultClient = [...availableAliases].some(alias => owner === `${alias}.DefaultClient`);
+          const block = lexicalBlock(node);
+          if (request && block === request.block && (defaultClient || httpClients.get(owner) === block)) {
+            calls.push({ file: filePath, method: request.method, url: request.url, normalizedUrl: normalizeUrl(request.url), line: node.startPosition.row + 1, offset: node.startIndex, client: 'net/http' });
+          }
+        }
+      }
+      for (const child of node.namedChildren) walk(child);
+    };
+    walk(fn);
+  }
+  return calls;
+}
+
 // ============================================================================
 // ROUTE DEFINITION EXTRACTION  (Python)
 // ============================================================================
@@ -286,22 +701,37 @@ export async function extractHttpCalls(filePath: string): Promise<HttpCall[]> {
  * Extract all route definitions from a Python source file.
  * Supports FastAPI, Starlette, Flask, and Django (urls.py path/re_path).
  */
-export async function extractRouteDefinitions(filePath: string): Promise<RouteDefinition[]> {
+/**
+ * `residentSource` lets a caller that ALREADY holds the file's text pass it in instead of having
+ * it re-read and re-capped. The call-graph build is exactly that caller: it read every file into
+ * memory before Pass 1, so re-reading here bought nothing and the per-file size cap silently cost
+ * it the route-handler edges of any file above the cap — turning live handlers into `find_dead_code`
+ * candidates, the precise failure the length-preserving masking below exists to prevent
+ * (change: fix-unbounded-file-scan-oom).
+ */
+export async function extractRouteDefinitions(
+  filePath: string,
+  residentSource?: string,
+  onOversized?: OversizedFileObserver,
+): Promise<RouteDefinition[]> {
   const ext = extname(filePath).toLowerCase();
   if (!['.py', '.pyw'].includes(ext)) return [];
 
-  let content: string;
-  try {
-    content = await readFile(filePath, 'utf8');
-  } catch {
-    return [];
-  }
+  const content = residentSource ?? await readSourceCapped(filePath, undefined, onOversized);
+  if (content === null) return [];
 
   const routes: RouteDefinition[] = [];
   const lines = content.split('\n');
 
-  // Remove comments for cleaner matching
-  const clean = content.replace(/#.*$/gm, '');
+  // Mask comments AND triple-quoted strings, length-preservingly, before matching.
+  // Length-preserving is load-bearing: every regex `m.index` below is fed to
+  // getLine(lines, …), which measures against the ORIGINAL line lengths, so the
+  // masked string must stay byte-aligned with `content` or the reported line (and
+  // the handler resolved by scanning forward from it) drifts. Masking docstrings
+  // also stops route patterns embedded in `.. code-block::` examples (e.g. Flask's
+  // sansio/scaffold.py) from being matched as real routes. See the "non-code
+  // masking" regression tests.
+  const clean = maskPythonNonCode(content);
 
   // ── FastAPI / Starlette decorators ─────────────────────────────────────────
   // @app.get("/items/{item_id}")
@@ -400,11 +830,26 @@ export async function extractRouteDefinitions(filePath: string): Promise<RouteDe
   // matched against a Django route will receive confidence='path' at best —
   // never 'exact'. This may produce false-positive edges when multiple HTTP
   // methods share the same URL pattern. Filter by confidence if this matters.
+  // Match `path(...)` (Django 2.0+ simple converters) AND `re_path(...)` / the legacy
+  // `url(...)` (regex routes). `\bpath` alone never matched `re_path` (the `_` blocks
+  // the word boundary), so regex routes were silently unextracted.
   const djangoPathRegex =
-    /\bpath\s*\(\s*r?(['"])(.*?)\1\s*,\s*([\w.]+)/gm;
+    // Bounded, but still `.` rather than `[^'"]`: a Django route legitimately contains
+    // a quote character (`path("it's/")`, or a regex route with a `[^"]+` class), and
+    // excluding quotes dropped those routes entirely. `.` excludes newline and there is
+    // no `s` flag, so an unterminated `path(` rescanned to end-of-LINE from every
+    // opener — quadratic on one long line (measured 68s on 420KB), which the bound is
+    // what actually fixes.
+    /\b(re_path|path|url)\s*\(\s*r?(['"])(.{0,2000}?)\2\s*,\s*([\w.]+)/gm;
   while ((m = djangoPathRegex.exec(clean)) !== null) {
-    const path = '/' + m[2].replace(/\$$/, '').replace(/^\^/, '');
-    const handlerName = m[3].split('.').pop() ?? m[3];
+    const keyword = m[1];
+    const rawPattern = m[3];
+    // `path()` uses simple `<int:pk>` converters (normalizeUrl handles those);
+    // `re_path()`/`url()` use a regex — convert capture groups to a path template.
+    const path = keyword === 'path'
+      ? '/' + rawPattern.replace(/\$$/, '').replace(/^\^/, '')
+      : djangoRegexToTemplate(rawPattern);
+    const handlerName = m[4].split('.').pop() ?? m[4];
     const lineNum = getLine(lines, m.index);
     routes.push({
       file: filePath,
@@ -452,10 +897,21 @@ const JAXRS_METHOD_ANNOTATIONS: Array<[string, string]> = [
  *   ("/foo", method=…) → /foo
  */
 function extractSpringPath(argsBlob: string): string | null {
-  // Positional string: first quoted literal at start, possibly preceded by `{`
-  const positional = argsBlob.match(/^\s*\{?\s*"([^"]*)"/);
+  // Positional string: first quoted literal at start, possibly preceded by `{`.
+  //
+  // The whitespace runs are BOUNDED. `^` without /m anchors at offset 0, which looks
+  // safe, but TWO `\s*` separated by an optional `{` give n x n split points to try
+  // before the required `"` fails — and `argsBlob` is unbounded, because
+  // `scanJavaAnnotations` takes annotation arguments with a balanced-paren scan that
+  // has no length cap. Measured on the real `extractJavaRouteDefinitions` with
+  // `@Path(<N spaces>)`: 8.3 s at 50 KB, 42 s at 100 KB.
+  //
+  // An annotation's `(` and its first string literal are never separated by more than a
+  // few hundred characters of real formatting; past that the annotation is simply not
+  // recognized, which is already the outcome for any other unparseable argument blob.
+  const positional = argsBlob.match(/^\s{0,200}\{?\s{0,200}"([^"]*)"/);
   if (positional) return positional[1];
-  const named = argsBlob.match(/(?:value|path)\s*=\s*\{?\s*"([^"]*)"/);
+  const named = argsBlob.match(/(?:value|path)\s{0,200}=\s{0,200}\{?\s{0,200}"([^"]*)"/);
   if (named) return named[1];
   return null;
 }
@@ -484,26 +940,75 @@ function combineSpringPaths(prefix: string, path: string): string {
   return combined || '/';
 }
 
-/**
- * Scan forward from an annotation line to find the handler method name.
- * Java method signatures: `public ReturnType methodName(args) ...`
- */
-function extractNextJavaMethodName(lines: string[], annotationLine: number): string {
-  const start = annotationLine - 1;
-  const maxLook = Math.min(lines.length, start + 20);
-  const skipNames = new Set(['if', 'for', 'while', 'switch', 'return', 'class', 'interface', 'enum', 'record', 'new']);
-  for (let i = start; i < maxLook; i++) {
-    const l = lines[i] ?? '';
-    // Skip further annotation lines
-    if (l.trim().startsWith('@')) continue;
-    // Match `[modifiers] ReturnType methodName(` — return type can include
-    // generics, arrays, and dotted names.
-    const match = l.match(
-      /\b(?:public|private|protected)\s+(?:static\s+|final\s+|abstract\s+|synchronized\s+|default\s+|native\s+)*(?:<[^>]+>\s+)?[\w<>[\], ?.]+?\s+(\w+)\s*\(/
-    );
-    if (match && !skipNames.has(match[1])) return match[1];
+interface JavaAnnotationMatch {
+  index: number;
+  end: number;
+  args: string;
+  hasArguments: boolean;
+}
+
+/** Scan one Java annotation name without retrying malformed argument suffixes. */
+function* scanJavaAnnotations(content: string, name: string): Generator<JavaAnnotationMatch> {
+  const needle = `@${name}`;
+  let cursor = 0;
+  while (cursor < content.length) {
+    const current = content[cursor];
+    if (current === '"' || current === "'") {
+      const quote = current;
+      cursor++;
+      while (cursor < content.length) {
+        if (content[cursor] === '\\') cursor += 2;
+        else if (content[cursor++] === quote) break;
+      }
+      continue;
+    }
+    if (!content.startsWith(needle, cursor)) {
+      cursor++;
+      continue;
+    }
+    const index = cursor;
+    let i = index + needle.length;
+    if (/[\w$]/.test(content[i] ?? '')) {
+      cursor = i;
+      continue;
+    }
+    while (i < content.length && /\s/.test(content[i])) i++;
+    if (content[i] !== '(') {
+      yield { index, end: i, args: '', hasArguments: false };
+      cursor = Math.max(i, index + 1);
+      continue;
+    }
+
+    const argsStart = ++i;
+    let depth = 1;
+    let quote = '';
+    while (i < content.length && depth > 0) {
+      const char = content[i];
+      if (quote) {
+        if (char === '\\') i += 2;
+        else {
+          i++;
+          if (char === quote) quote = '';
+        }
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        i++;
+      } else if (char === '(') {
+        depth++;
+        i++;
+      } else if (char === ')') {
+        depth--;
+        i++;
+      } else {
+        i++;
+      }
+    }
+    if (depth > 0) return;
+    yield { index, end: i, args: content.slice(argsStart, i - 1), hasArguments: true };
+    cursor = i;
   }
-  return 'unknown';
 }
 
 /**
@@ -511,24 +1016,40 @@ function extractNextJavaMethodName(lines: string[], annotationLine: number): str
  * Supports Spring MVC (@RestController / @Controller + @RequestMapping and the
  * shorthand @GetMapping / @PostMapping / …) and JAX-RS (@Path + @GET / @POST).
  */
-export async function extractJavaRouteDefinitions(filePath: string): Promise<RouteDefinition[]> {
+export async function extractJavaRouteDefinitions(
+  filePath: string,
+  residentSource?: string,
+  onOversized?: OversizedFileObserver,
+): Promise<RouteDefinition[]> {
   const ext = extname(filePath).toLowerCase();
   if (ext !== '.java') return [];
 
-  let content: string;
-  try {
-    content = await readFile(filePath, 'utf8');
-  } catch {
-    return [];
-  }
+  const content = residentSource ?? await readSourceCapped(filePath, undefined, onOversized);
+  if (content === null) return [];
 
   const routes: RouteDefinition[] = [];
   const lines = content.split('\n');
 
   // Strip comments but preserve offsets so line numbers stay accurate.
-  const clean = content
-    .replace(/\/\*[\s\S]*?\*\//g, m => ' '.repeat(m.length))
-    .replace(/\/\/.*$/gm, m => ' '.repeat(m.length));
+  const clean = blankCommentsPreservingLayout(content);
+  const methodDeclarations = scanJavaMethodDeclarations(
+    clean,
+    new Set(['public', 'private', 'protected']),
+  );
+  const handlerNameAfter = (offset: number): string => {
+    let lo = 0;
+    let hi = methodDeclarations.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (methodDeclarations[mid].parameterStart < offset) lo = mid + 1;
+      else hi = mid;
+    }
+    const declaration = methodDeclarations[lo];
+    if (!declaration) return 'unknown';
+    const annotationLine = getLine(lines, offset);
+    const declarationLine = getLine(lines, declaration.start);
+    return declarationLine < annotationLine + 20 ? declaration.name : 'unknown';
+  };
 
   // ── Detect framework and compute class-level path prefix ───────────────────
   // Spring: class-level @RequestMapping(...)  |  JAX-RS: class-level @Path(...)
@@ -539,31 +1060,44 @@ export async function extractJavaRouteDefinitions(filePath: string): Promise<Rou
   const classMatch = clean.match(/\bclass\s+\w+/);
   if (classMatch && classMatch.index !== undefined) {
     const preamble = clean.slice(0, classMatch.index);
-    const springClassMapping = preamble.match(/@RequestMapping\s*\(([^)]*)\)(?![^@]*@RequestMapping)/);
+    const springClassMapping = Array.from(scanJavaAnnotations(preamble, 'RequestMapping')).at(-1);
     if (springClassMapping) {
-      const p = extractSpringPath(springClassMapping[1]);
+      const p = extractSpringPath(springClassMapping.args);
       if (p) springPrefix = '/' + p.replace(/^\//, '');
     }
-    const jaxrsClassPath = preamble.match(/@Path\s*\(\s*"([^"]+)"\s*\)(?![^@]*@Path)/);
+    const jaxrsClassPath = Array.from(scanJavaAnnotations(preamble, 'Path')).at(-1);
     if (jaxrsClassPath) {
-      jaxrsPrefix = '/' + jaxrsClassPath[1].replace(/^\//, '');
+      const p = extractSpringPath(jaxrsClassPath.args);
+      if (p) jaxrsPrefix = '/' + p.replace(/^\//, '');
     }
   }
 
   const isSpring = /@(?:Rest)?Controller\b|@(?:Get|Post|Put|Delete|Patch)Mapping\b|@RequestMapping\b/.test(clean);
-  const isJaxrs = /@Path\b/.test(clean) && /@(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/.test(clean);
+  // JAX-RS server annotations come from javax/jakarta.ws.rs. Require that import
+  // so we don't mistake an HTTP CLIENT library for a server: Retrofit interfaces
+  // use identically-named @GET/@POST/@Path from retrofit2.http (client request
+  // templates, not server endpoints) and would otherwise yield phantom routes.
+  const hasJaxrsImport = /\bimport\s+(?:static\s+)?(?:javax|jakarta)\.ws\.rs\b/.test(clean);
+  const jaxrsAnnotations = new Map(
+    JAXRS_METHOD_ANNOTATIONS.map(([annotation]) => [
+      annotation,
+      Array.from(scanJavaAnnotations(clean, annotation)).filter(m => !m.hasArguments),
+    ]),
+  );
+  const hasJaxrsPath = scanJavaAnnotations(clean, 'Path').next().done === false;
+  const isJaxrs = hasJaxrsImport
+    && hasJaxrsPath
+    && Array.from(jaxrsAnnotations.values()).some(matches => matches.length > 0);
 
   // ── Spring: shorthand mappings (@GetMapping, @PostMapping, …) ──────────────
   if (isSpring) {
     for (const [annotation, method] of SPRING_METHOD_ANNOTATIONS) {
-      const re = new RegExp(`@${annotation}\\s*(?:\\(([^)]*)\\))?`, 'g');
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(clean)) !== null) {
-        const argsBlob = m[1] ?? '';
+      for (const m of scanJavaAnnotations(clean, annotation)) {
+        const argsBlob = m.args;
         const path = extractSpringPath(argsBlob) ?? '';
         const fullPath = combineSpringPaths(springPrefix, path);
         const lineNum = getLine(lines, m.index);
-        const handlerName = extractNextJavaMethodName(lines, lineNum);
+        const handlerName = handlerNameAfter(m.end);
         routes.push({
           file: filePath,
           method,
@@ -581,17 +1115,16 @@ export async function extractJavaRouteDefinitions(filePath: string): Promise<Rou
     // The class-level @RequestMapping is skipped because the class declaration
     // immediately follows it — we detect that by checking whether the nearest
     // forward token after the annotation is `class`.
-    const reqMappingRegex = /@RequestMapping\s*\(([^)]*)\)/g;
-    let m: RegExpExecArray | null;
-    while ((m = reqMappingRegex.exec(clean)) !== null) {
-      const argsBlob = m[1];
+    for (const m of scanJavaAnnotations(clean, 'RequestMapping')) {
+      const argsBlob = m.args;
+      if (!argsBlob) continue;
       const methods = extractSpringMethods(argsBlob);
       if (methods.length === 0) continue; // no method= → class-level or unhandled
 
       // Ensure this annotation is on a method, not on the class. Peek forward
       // past any subsequent annotations and check that we don't hit `class`
       // before a method-like signature.
-      const afterIdx = m.index + m[0].length;
+      const afterIdx = m.end;
       const ahead = clean.slice(afterIdx, afterIdx + 400);
       const nextClass = ahead.search(/\bclass\s+\w+/);
       const nextMethod = ahead.search(
@@ -602,7 +1135,7 @@ export async function extractJavaRouteDefinitions(filePath: string): Promise<Rou
       const path = extractSpringPath(argsBlob) ?? '';
       const fullPath = combineSpringPaths(springPrefix, path);
       const lineNum = getLine(lines, m.index);
-      const handlerName = extractNextJavaMethodName(lines, lineNum);
+      const handlerName = handlerNameAfter(m.end);
       for (const method of methods) {
         routes.push({
           file: filePath,
@@ -627,20 +1160,21 @@ export async function extractJavaRouteDefinitions(filePath: string): Promise<Rou
     for (const [annotation, method] of JAXRS_METHOD_ANNOTATIONS) {
       // Bare annotation with no argument list; path comes from class @Path
       // prefix combined with any @Path on the same method.
-      const re = new RegExp(`@${annotation}\\b\\s*(?!\\()`, 'g');
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(clean)) !== null) {
+      for (const m of jaxrsAnnotations.get(annotation) ?? []) {
         // Only look for a method-level @Path *within this method's annotation
         // block* — i.e. between the @GET and the next method signature.
-        const afterIdx = m.index + m[0].length;
+        const afterIdx = m.end;
         const ahead = clean.slice(afterIdx, afterIdx + 400);
         const sigMatch = methodSigRegex.exec(ahead);
         const window = sigMatch ? ahead.slice(0, sigMatch.index) : ahead;
-        const methodPathMatch = window.match(/@Path\s*\(\s*"([^"]+)"\s*\)/);
-        const methodPath = methodPathMatch ? '/' + methodPathMatch[1].replace(/^\//, '') : '';
+        const methodPathAnnotation = Array.from(scanJavaAnnotations(window, 'Path')).at(-1);
+        const extractedMethodPath = methodPathAnnotation
+          ? extractSpringPath(methodPathAnnotation.args)
+          : null;
+        const methodPath = extractedMethodPath ? '/' + extractedMethodPath.replace(/^\//, '') : '';
         const fullPath = combineSpringPaths(jaxrsPrefix, methodPath);
         const lineNum = getLine(lines, m.index);
-        const handlerName = extractNextJavaMethodName(lines, lineNum);
+        const handlerName = handlerNameAfter(m.end);
         routes.push({
           file: filePath,
           method,
@@ -661,6 +1195,20 @@ export async function extractJavaRouteDefinitions(filePath: string): Promise<Rou
 // ============================================================================
 // EDGE BUILDER
 // ============================================================================
+
+/**
+ * Extract server route definitions from one file, dispatching by extension to the
+ * language's route extractor (Python / Java / TS-JS). Returns `[]` for a file no
+ * route extractor handles. Used to recover the route key a single handler serves —
+ * e.g. to drive cross-repo client→handler matching under federation.
+ */
+export async function extractRoutesFromFile(filePath: string): Promise<RouteDefinition[]> {
+  const ext = extname(filePath).toLowerCase();
+  if (['.py', '.pyw'].includes(ext)) return extractRouteDefinitions(filePath);
+  if (ext === '.java') return extractJavaRouteDefinitions(filePath);
+  if (['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'].includes(ext)) return extractTsRouteDefinitions(filePath);
+  return [];
+}
 
 /**
  * Match HTTP calls from JS/TS files against route definitions from Python files
@@ -693,17 +1241,25 @@ export function buildHttpEdges(
       if (!matchingRoutes) continue;
 
       for (const route of matchingRoutes) {
-        // Determine confidence
-        let confidence: HttpEdge['confidence'];
         const methodsKnown = call.method !== 'UNKNOWN' && route.method !== 'UNKNOWN';
         const methodsMatch = call.method === route.method;
 
+        // Both methods known and different → genuinely different endpoints (a client
+        // `GET /users` and a `POST /users` handler are distinct operations, usually
+        // distinct functions). Emit NOTHING rather than a phantom 'path' edge that
+        // would mis-link the client to the wrong handler. A match still requires only
+        // method compatibility (equal, or at least one UNKNOWN — a bare `fetch`, or a
+        // Django route that dispatches methods internally).
+        if (methodsKnown && !methodsMatch) continue;
+
+        // Determine confidence.
+        let confidence: HttpEdge['confidence'];
         if (methodsKnown && methodsMatch && candidate === call.normalizedUrl) {
           confidence = 'exact';
-        } else if (!methodsKnown || !methodsMatch) {
-          confidence = candidate !== call.normalizedUrl ? 'fuzzy' : 'path';
+        } else if (candidate !== call.normalizedUrl) {
+          confidence = 'fuzzy';
         } else {
-          confidence = candidate !== call.normalizedUrl ? 'fuzzy' : 'exact';
+          confidence = 'path';
         }
 
         edges.push({
@@ -730,6 +1286,9 @@ export function buildHttpEdges(
         );
         if (!allMatch) continue;
         for (const route of routeList) {
+          // Same method-compatibility rule as the exact/prefix path above: both
+          // methods known and different → not a match, even on a fuzzy segment hit.
+          if (call.method !== 'UNKNOWN' && route.method !== 'UNKNOWN' && call.method !== route.method) continue;
           edges.push({
             callerFile: call.file,
             handlerFile: route.file,
@@ -744,10 +1303,13 @@ export function buildHttpEdges(
     }
   }
 
-  // Deduplicate: same caller file + handler file + method + path
+  // Deduplicate one projected edge per call site. The line is essential: collapsing
+  // at file granularity drops the second of two functions that call the same route
+  // before call-graph synthesis has a chance to resolve their enclosing functions.
   const seen = new Set<string>();
   return edges.filter(e => {
-    const key = `${e.callerFile}|${e.handlerFile}|${e.method}|${e.path}`;
+    const site = e.call.offset !== undefined ? `offset:${e.call.offset}` : `line:${e.call.line}`;
+    const key = `${e.callerFile}|${site}|${e.handlerFile}|${e.method}|${e.path}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -763,46 +1325,126 @@ export function buildHttpEdges(
  * Intended to be called once per graph build and its result merged into
  * the DependencyGraphResult edges.
  */
-export async function extractAllHttpEdges(filePaths: string[]): Promise<{
+export type HttpEdgeSource = string | { path: string; content: string };
+
+export async function extractAllHttpEdges(
+  filePaths: HttpEdgeSource[],
+  precomputedCalls?: ReadonlyMap<string, readonly HttpCall[]>,
+): Promise<{
   calls: HttpCall[];
   routes: RouteDefinition[];
   edges: HttpEdge[];
+  degradations: HttpExtractionDegradation[];
 }> {
-  const allCalls: HttpCall[] = [];
-  const allRoutes: RouteDefinition[] = [];
-
-  await Promise.all(
-    filePaths.map(async fp => {
+  // Collect per-file results over a BOUNDED scan and flatten in filePaths order.
+  // `mapFilesBounded` resolves in INPUT order regardless of completion order (and
+  // regardless of its concurrency), so the aggregated calls/routes (and therefore the
+  // edges) are a deterministic function of the file list — NOT of filesystem I/O timing.
+  // Pushing into shared arrays inside the callbacks would append in completion order, a
+  // latent byte-determinism hazard the spec forbids (and the shareable-bundle digest
+  // relies on).
+  const perFile = await mapFilesBounded(
+    filePaths,
+    async (source): Promise<{ calls: HttpCall[]; routes: RouteDefinition[]; degradations: HttpExtractionDegradation[] }> => {
+      const fp = typeof source === 'string' ? source : source.path;
+      const resident = typeof source === 'string' ? undefined : source.content;
       const ext = extname(fp).toLowerCase();
+      const degradations: HttpExtractionDegradation[] = [];
+      const observe = (degradation: HttpExtractionDegradation): void => { degradations.push(degradation); };
+      const cachedCalls = precomputedCalls?.get(fp);
+      try {
       if (['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'].includes(ext)) {
-        const calls = await extractHttpCalls(fp);
-        allCalls.push(...calls);
+        // A JS/TS file can be a client (fetch/axios calls), a server (route
+        // registrations), or both (a full-stack monorepo). Extract BOTH so a
+        // SAME-LANGUAGE client→server link (TS frontend → TS Express/NestJS/Next
+        // backend) is matched — not only the cross-language JS/TS→Python/Java
+        // case. Routes in .py/.java files are already extracted below.
+        //
+        // Sequentially, not as a nested `Promise.all`: both passes read the SAME file, so
+        // running them together held two copies of it per scan slot and doubled the bound
+        // this scan exists to enforce.
+        const calls = cachedCalls ? [...cachedCalls] : await extractHttpCalls(fp, resident, observe);
+        const routes = await extractTsRouteDefinitions(fp, resident);
+        return { calls, routes, degradations };
       } else if (['.py', '.pyw'].includes(ext)) {
-        const routes = await extractRouteDefinitions(fp);
-        allRoutes.push(...routes);
+        return { calls: cachedCalls ? [...cachedCalls] : await extractHttpCalls(fp, resident, observe), routes: await extractRouteDefinitions(fp, resident), degradations };
+      } else if (ext === '.go') {
+        return { calls: cachedCalls ? [...cachedCalls] : await extractHttpCalls(fp, resident, observe), routes: [], degradations };
       } else if (ext === '.java') {
-        const routes = await extractJavaRouteDefinitions(fp);
-        allRoutes.push(...routes);
+        return { calls: [], routes: await extractJavaRouteDefinitions(fp, resident), degradations };
       }
-    })
+      return { calls: [], routes: [], degradations };
+      } catch {
+        observe({ file: fp, reason: 'parse-failure' });
+        return { calls: cachedCalls ? [...cachedCalls] : [], routes: [], degradations };
+      }
+    },
   );
+  const allCalls: HttpCall[] = perFile.flatMap(r => r.calls);
+  const allRoutes: RouteDefinition[] = perFile.flatMap(r => r.routes);
+  const degradations = perFile.flatMap(r => r.degradations);
 
   const edges = buildHttpEdges(allCalls, allRoutes);
-  return { calls: allCalls, routes: allRoutes, edges };
+  return { calls: allCalls, routes: allRoutes, edges, degradations };
 }
 
 // ============================================================================
 // PRIVATE UTILITIES
 // ============================================================================
 
-/** Convert a character offset in `content` to a 1-based line number */
+/**
+ * Convert a Django `re_path`/`url` regex pattern to a comparable path template:
+ * strip the `^`/`$` anchors, replace each capture group (named `(?P<pk>…)`,
+ * non-capturing `(?:…)`, or plain `(…)`) with a `:param` placeholder, and unescape
+ * `\.`/`\/`. e.g. `^api/items/(?P<pk>[0-9]+)/$` → `/api/items/:param/`. Best-effort:
+ * a nested-group pattern degrades to a partial template (over-masking only drops a
+ * potential match, never invents one).
+ */
+function djangoRegexToTemplate(re: string): string {
+  let p = re.replace(/^\^/, '').replace(/\$$/, '');
+  p = p.replace(/\(\?P<[^>]{0,200}>[^)]{0,500}\)/g, ':param'); // named group
+  p = p.replace(/\(\?:[^)]{0,500}\)/g, ':param');   // non-capturing group
+  p = p.replace(/\([^)]{0,500}\)/g, ':param');      // plain group
+  p = p.replace(/\\([./])/g, '$1');                // unescape \. and \/
+  return '/' + p.replace(/^\/+/, '');
+}
+
+/** Replace every non-newline char of `match` with a space (length- and line-preserving). */
+function blankKeepNewlines(match: string): string {
+  return match.replace(/[^\n]/g, ' ');
+}
+
+/**
+ * Length-preserving mask of Python triple-quoted strings and `#` line comments.
+ * Triple-quoted strings are masked first (a docstring can contain `#` and route
+ * patterns), then `#` comments on what remains. Masked regions become spaces with
+ * newlines kept, so the result is byte-aligned with `content`: route regexes can
+ * neither match inside docstrings/comments nor shift the offsets getLine() turns
+ * into line numbers. Over-masking (e.g. a stray `"""` inside a comment) only ever
+ * drops a potential match — never invents one — which matches the false-negatives-
+ * over-false-positives bias of the route-handler synthesis that consumes this.
+ */
+function maskPythonNonCode(content: string): string {
+  const stringsMasked = content.replace(/'''[\s\S]*?'''|"""[\s\S]*?"""/g, blankKeepNewlines);
+  return stringsMasked.replace(/#[^\n]*/g, blankKeepNewlines);
+}
+
+const LINE_INDEX_CACHE = new WeakMap<string[], number[]>();
+
+/** Convert a character offset in `content` to a 1-based line number. */
 function getLine(lines: string[], charOffset: number): number {
-  let accumulated = 0;
-  for (let i = 0; i < lines.length; i++) {
-    accumulated += lines[i].length + 1; // +1 for newline
-    if (accumulated > charOffset) return i + 1;
+  let lineIndex = LINE_INDEX_CACHE.get(lines);
+  if (!lineIndex) {
+    lineIndex = [];
+    let offset = 0;
+    for (let i = 0; i < lines.length - 1; i++) {
+      offset += lines[i].length;
+      lineIndex.push(offset);
+      offset++;
+    }
+    LINE_INDEX_CACHE.set(lines, lineIndex);
   }
-  return lines.length;
+  return lineFromIndex(lineIndex, charOffset);
 }
 
 /**
@@ -904,8 +1546,12 @@ function extractContractFromHandler(
 //   app.get('/path', handler)
 //   router.post('/path', ...)
 //   app.use('/prefix', router)     ← prefix accumulation
-const EXPRESS_ROUTE_RE = /(?:^|[\s;(,])(?:app|router|server|api|r)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"`]([^'"`]+)['"`]/gm;
-const EXPRESS_USE_RE = /(?:^|[\s;(,])(?:app|router|server|api|r)\.use\s*\(\s*['"`]([^'"`]+)['"`]/gm;
+// `fastify` is included because the Fastify plugin idiom names the instance `fastify`
+// (the closure param) and registers routes as `fastify.get('/path', …)` — the standard
+// in Fastify's own docs/demo. The receiver allowlist stays explicit (not `\w+`) to avoid
+// matching unrelated `.get(...)` calls (e.g. an axios `instance.get(url)`).
+const EXPRESS_ROUTE_RE = /(?:^|[\s;(,])(?:app|router|server|api|fastify|r)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"`]([^'"`]+)['"`]/gm;
+const EXPRESS_USE_RE = /(?:^|[\s;(,])(?:app|router|server|api|fastify|r)\.use\s*\(\s*['"`]([^'"`]+)['"`]/gm;
 
 // NestJS decorator-based:
 //   @Controller('prefix')  →  class methods with @Get / @Post etc.
@@ -922,7 +1568,9 @@ function detectTsFramework(source: string, filePath: string): string {
   if (/app\/.*\/route\.[jt]sx?$/.test(filePath.replace(/\\/g, '/'))) return 'nextjs-app';
   if (/pages\/api\//.test(filePath.replace(/\\/g, '/'))) return 'nextjs-pages';
   if (/from\s+['"]hono['"]/.test(source) || /new\s+Hono\s*[(<]/.test(source)) return 'hono';
-  if (/from\s+['"]fastify['"]/.test(source) || /fastify\s*\(/.test(source)) return 'fastify';
+  // Match bare `fastify` AND scoped `@fastify/*` imports (e.g. @fastify/type-provider-typebox):
+  // Fastify route plugins routinely import only the scoped helpers, not the bare package.
+  if (/from\s+['"](?:fastify|@fastify\/[^'"]+)['"]/.test(source) || /require\s*\(\s*['"](?:fastify|@fastify\/[^'"]+)['"]\s*\)/.test(source) || /fastify\s*\(/.test(source)) return 'fastify';
   if (/from\s+['"]express['"]/.test(source) || /require\s*\(\s*['"]express['"]\s*\)/.test(source)) return 'express';
   if (/from\s+['"]koa['"]/.test(source)) return 'koa';
   if (/from\s+['"]elysia['"]/.test(source)) return 'elysia';
@@ -934,14 +1582,33 @@ function detectTsFramework(source: string, filePath: string): string {
  * Extract HTTP route definitions from a TypeScript/JavaScript server file.
  * Handles Express-style, NestJS decorators, and Next.js App Router.
  */
-export async function extractTsRouteDefinitions(filePath: string): Promise<RouteDefinition[]> {
+export async function extractTsRouteDefinitions(
+  filePath: string,
+  residentSource?: string,
+  onOversized?: OversizedFileObserver,
+): Promise<RouteDefinition[]> {
+  const raw = residentSource ?? await readSourceCapped(filePath, undefined, onOversized);
+  if (raw === null) return [];
+  // Mask comments LENGTH-PRESERVINGLY (blank to spaces, keep newlines) rather than
+  // skeletonizing. The skeleton REMOVES pure-comment/log/blank lines and shrinks the
+  // text, so every `route.line` was computed in a coordinate system offset from the
+  // ORIGINAL file that synthesizeRouteHandlerEdges (call-graph.ts) and find_dead_code
+  // consume it against — silently dropping or mis-attributing route-handler edges and
+  // surfacing live handlers as false dead-code. Blanking keeps the string byte-aligned
+  // with the original, so `route.line` is exact by construction while route pattern
+  // strings inside comments still never match. Same length-preserving discipline as
+  // extractHttpCalls (:193-195) and maskPythonNonCode (:906-908).
+  //
+  // Masking stays INSIDE a guard. Before the bounded reader existed, this and the read shared one
+  // `try` and any failure here yielded `[]`; narrowing the guard to the read alone would let a
+  // throw from these regexes (a `RangeError` on a pathological string, say) propagate into
+  // `buildRouteInventory`, which does not catch per file. Today's per-file size cap makes that
+  // hard to reach — but the guard costs nothing and the cap is a tunable constant.
   let source: string;
   try {
-    const { readFile } = await import('node:fs/promises');
-    // Use skeleton to strip comments — prevents false positives from comment
-    // examples inside parser/extractor files that contain route pattern strings.
-    // Line numbers in the result are approximate (skeleton line positions).
-    source = getSkeletonContent(await readFile(filePath, 'utf-8'), detectLanguage(filePath));
+    source = raw
+      .replace(/\/\*[\s\S]*?\*\//g, blankKeepNewlines)
+      .replace(/(^|[\s,;()[\]{}])(\/\/.*)$/gm, (_m, prefix, comment) => prefix + ' '.repeat(comment.length));
   } catch {
     return [];
   }
@@ -956,8 +1623,12 @@ export async function extractTsRouteDefinitions(filePath: string): Promise<Route
 
   // ── Next.js App Router ────────────────────────────────────────────────────
   if (framework === 'nextjs-app') {
-    // Derive path from file location: app/users/route.ts → /users
-    const rel = filePath.replace(/\\/g, '/');
+    // Derive path from file location: app/users/route.ts → /users.
+    // Force a leading slash first: the analyze pipeline passes REPO-RELATIVE paths
+    // (e.g. `app/api/posts/route.ts`), and `lastIndexOf('/app/')` would miss the
+    // leading `app/` segment — collapsing the route to `/` and breaking both the
+    // route inventory and the cross-service edge. The absolute form is unaffected.
+    const rel = '/' + filePath.replace(/\\/g, '/').replace(/^\/+/, '');
     const appIdx = rel.lastIndexOf('/app/');
     let routePath = '/';
     if (appIdx >= 0) {
@@ -1046,8 +1717,18 @@ export async function extractTsRouteDefinitions(filePath: string): Promise<Route
       path = `${prefixes[0]}/${path}`;
     }
 
-    // Find the handler name from the same line
-    const lineText = lines[lineOf(m.index) - 1] ?? '';
+    // EXPRESS_ROUTE_RE opens with `(?:^|[\s;(,])` so the match can start on the
+    // character BEFORE the receiver — and when a route registration begins a line
+    // (the common top-level `app.get(...)` idiom), that leading char is the prior
+    // line's newline, so `m.index` lands one line early. Advance to the actual
+    // receiver token before computing the line, or the handler-name lookup reads
+    // the previous line (e.g. a `function h(req, res)` def → grabs `res`) and the
+    // cross-service edge / route-handler synthesis silently fails to wire.
+    const recOffset = Math.max(0, m[0].search(/(?:app|router|server|api|fastify|r)\s*\./));
+    const routeLine = lineOf(m.index + recOffset);
+
+    // Find the handler name from the route registration line
+    const lineText = lines[routeLine - 1] ?? '';
     const handlerMatch = lineText.match(/,\s*(?:async\s+)?(?:function\s+)?(\w+)\s*[,)]/);
     const handlerName = handlerMatch?.[1] ?? 'handler';
 
@@ -1062,7 +1743,7 @@ export async function extractTsRouteDefinitions(filePath: string): Promise<Route
       normalizedPath: normalizeUrl(path),
       handlerName,
       framework,
-      line: lineOf(m.index),
+      line: routeLine,
       ...contract,
     });
   }
@@ -1100,24 +1781,31 @@ export interface RouteInventory {
  */
 export async function buildRouteInventory(
   filePaths: string[],
-  rootDir: string
+  rootDir: string,
+  onOversized?: OversizedFileObserver,
 ): Promise<RouteInventory> {
   const { relative } = await import('node:path');
 
-  const allRoutes: RouteDefinition[] = [];
-
-  await Promise.all(
-    filePaths.map(async fp => {
-      const ext = extname(fp).toLowerCase();
-      if (['.py', '.pyw'].includes(ext)) {
-        allRoutes.push(...await extractRouteDefinitions(fp));
-      } else if (['.ts', '.tsx', '.js', '.jsx', '.mjs'].includes(ext)) {
-        allRoutes.push(...await extractTsRouteDefinitions(fp));
-      } else if (ext === '.java') {
-        allRoutes.push(...await extractJavaRouteDefinitions(fp));
-      }
-    })
-  );
+  // Collect per-file routes over a BOUNDED scan and flatten in filePaths order.
+  // `mapFilesBounded` resolves in INPUT order regardless of completion order (and
+  // regardless of its concurrency), so the inventory is a deterministic function of the
+  // file list — pushing into a shared array inside the callbacks would append in
+  // I/O-completion order (the byte-determinism hazard `extractAllHttpEdges` documents
+  // and fixes above).
+  const perFile = await mapFilesBounded(filePaths, async (fp): Promise<RouteDefinition[]> => {
+    // Routes declared inside test files (e.g. a `fastify.get('/error')` set up by a
+    // test harness) are fixtures, not the app's real API surface — exclude them so the
+    // inventory doesn't report phantom endpoints.
+    if (isTestFile(fp)) return [];
+    const ext = extname(fp).toLowerCase();
+    if (['.py', '.pyw'].includes(ext)) return extractRouteDefinitions(fp, undefined, onOversized);
+    if (['.ts', '.tsx', '.js', '.jsx', '.mjs'].includes(ext)) {
+      return extractTsRouteDefinitions(fp, undefined, onOversized);
+    }
+    if (ext === '.java') return extractJavaRouteDefinitions(fp, undefined, onOversized);
+    return [];
+  });
+  const allRoutes: RouteDefinition[] = perFile.flat();
 
   const byMethod: Record<string, number> = {};
   const byFramework: Record<string, number> = {};

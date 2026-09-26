@@ -12,15 +12,16 @@ import {
   DECISIONS_DIFF_MAX_CHARS,
   DECISIONS_CONSOLIDATION_MAX_TOKENS,
 } from '../../constants.js';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { getChangedFiles, getFileDiff, resolveBaseRef } from '../drift/git-diff.js';
-const execFileAsync = promisify(execFile);
+import { gitPathArgs } from '../../utils/git-args.js';
 import { matchFileToDomains, getSpecContent } from '../drift/spec-mapper.js';
 import type { LLMService } from '../services/llm-service.js';
-import type { PendingDecision, SpecMap } from '../../types/index.js';
+import type { PendingDecision, SpecMap, DecisionScope } from '../../types/index.js';
 import { makeDecisionId } from './store.js';
 import { parseJSON } from '../../utils/misc.js';
+import { createPromptBoundary } from '../../utils/prompt-boundary.js';
+import { logger } from '../../utils/logger.js';
+import { execFileGit as execFileAsync } from '../../utils/git-exec.js';
 
 const SYSTEM_PROMPT = `You are an architectural decision extractor for a software project.
 
@@ -34,13 +35,23 @@ Rules:
 - For trivial changes return []
 - proposedRequirement: one sentence in imperative form ("The system SHALL …"), or null
 
+SCOPE CLASSIFICATION (required):
+Each extraction call processes one spec domain at a time, so cross-domain scope cannot be
+determined here. Classify only within the local/component axis:
+- "local": single file, no cross-cutting concern (refactors, extractions, renames)
+- "component": this component/service/module, may affect its public interface
+
+Scope upgrade to "cross-domain" or "system" happens at consolidation time when the full
+session context across all domains is visible.
+
 Respond with a JSON array only. Each element:
 {
   "title": string,
   "rationale": string,
   "consequences": string,
   "affectedFiles": string[],
-  "proposedRequirement": string | null
+  "proposedRequirement": string | null,
+  "scope": string
 }`;
 
 interface ExtractedRaw {
@@ -49,6 +60,20 @@ interface ExtractedRaw {
   consequences: string;
   affectedFiles: string[];
   proposedRequirement: string | null;
+  scope?: DecisionScope;
+}
+
+const EXTRACTOR_SCOPES = new Set<DecisionScope>(['local', 'component']);
+
+function isExtractedRaw(value: unknown): value is ExtractedRaw {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.title === 'string'
+    && typeof item.rationale === 'string'
+    && typeof item.consequences === 'string'
+    && Array.isArray(item.affectedFiles) && item.affectedFiles.every((file) => typeof file === 'string')
+    && (item.proposedRequirement === null || typeof item.proposedRequirement === 'string')
+    && (item.scope === undefined || EXTRACTOR_SCOPES.has(item.scope as DecisionScope));
 }
 
 export interface ExtractFromDiffOptions {
@@ -64,7 +89,7 @@ export interface ExtractFromDiffOptions {
 function isRelevantStagedFile(filePath: string): boolean {
   const ext = filePath.includes('.') ? filePath.slice(filePath.lastIndexOf('.')) : '';
   if (ext === '.md' || ext === '.txt' || ext === '.json' || ext === '.lock') return false;
-  if (filePath.startsWith('openspec/') || filePath.startsWith('.spec-gen/')) return false;
+  if (filePath.startsWith('openspec/') || filePath.startsWith('.openlore/')) return false;
   if (filePath.includes('.test.') || filePath.includes('.spec.') || filePath.includes('/__tests__/')) return false;
   if (filePath.includes('/dist/') || filePath.includes('/node_modules/')) return false;
   return true;
@@ -72,7 +97,7 @@ function isRelevantStagedFile(filePath: string): boolean {
 
 async function getStagedFiles(rootPath: string): Promise<Array<{ path: string; status: string }>> {
   const { stdout } = await execFileAsync(
-    'git', ['diff', '--cached', '--name-status', '--diff-filter=ACDMR'],
+    'git', gitPathArgs('diff', '--cached', '--name-status', '--diff-filter=ACDMR'),
     { cwd: rootPath },
   );
   return stdout.trim().split('\n').filter(Boolean).map((line) => {
@@ -142,15 +167,40 @@ export async function extractFromDiff(options: ExtractFromDiffOptions): Promise<
       '',
       ...domainFiles.map((f, i) => `=== ${f.path} ===\n${diffs[i]}`),
     ].filter(Boolean).join('\n\n');
+    const boundary = createPromptBoundary();
 
     const response = await llm.complete({
-      systemPrompt: SYSTEM_PROMPT,
-      userPrompt: userContent,
+      systemPrompt: `${SYSTEM_PROMPT}\n\n${boundary.instruction}`,
+      userPrompt: boundary.wrap(userContent),
       maxTokens: DECISIONS_CONSOLIDATION_MAX_TOKENS,
       temperature: 0.1,
     });
 
-    const extracted = parseJSON<ExtractedRaw[]>(response.content, []);
+    if (response.finishReason === 'length') {
+      throw new Error(
+        `decision extraction response truncated at ${DECISIONS_CONSOLIDATION_MAX_TOKENS.toLocaleString('en-US')} tokens — ` +
+        'decisions may be lost; raise the cap or reduce scope',
+      );
+    }
+    if (response.finishReason === 'error') {
+      throw new Error('decision extraction response ended with a provider error; no decisions were accepted');
+    }
+
+    const parsed = parseJSON<unknown>(response.content, null);
+    if (!Array.isArray(parsed)) {
+      if (response.usage?.outputTokens >= DECISIONS_CONSOLIDATION_MAX_TOKENS) {
+        throw new Error(
+          `decision extraction response truncated at ${DECISIONS_CONSOLIDATION_MAX_TOKENS.toLocaleString('en-US')} tokens — ` +
+          'decisions may be lost; raise the cap or reduce scope',
+        );
+      }
+      throw new Error('decision extraction returned invalid structured output');
+    }
+    const extracted = parsed.filter(isExtractedRaw);
+    const malformedCount = parsed.length - extracted.length;
+    if (malformedCount > 0) {
+      logger.warning(`decision extraction skipped ${malformedCount} malformed decision ${malformedCount === 1 ? 'entry' : 'entries'}`);
+    }
 
     for (const e of extracted) {
       const id = makeDecisionId(sessionId, domain, e.title);
@@ -161,12 +211,14 @@ export async function extractFromDiff(options: ExtractFromDiffOptions): Promise<
         rationale: e.rationale,
         consequences: e.consequences,
         proposedRequirement: e.proposedRequirement,
+        scope: e.scope ?? 'component',
         affectedDomains: [domain],
         affectedFiles: e.affectedFiles.length ? e.affectedFiles : domainFiles.map((f) => f.path),
         sessionId,
         recordedAt: now,
         consolidatedAt: now,
         confidence: 'medium',
+        contentOrigin: 'llm-extracted',
         syncedToSpecs: [],
       });
     }

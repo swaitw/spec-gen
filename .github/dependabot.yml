@@ -1,0 +1,100 @@
+# Dependabot configuration.
+#
+# Dependabot SECURITY updates (advisory-driven) are enabled in repo settings and are
+# deliberately NOT grouped below — each arrives as its own PR so a fix can be reviewed
+# and landed fast. What this file adds is scheduled VERSION updates, grouped to keep the
+# routine noise to a few reviewable PRs a week.
+#
+# The `github-actions` ecosystem is the important half. Every action in this repo is
+# pinned to an immutable commit SHA (a tag can be moved to point at new code, a SHA
+# cannot), and a pinned SHA only stays safe if something keeps proposing the upgrade.
+# That something is this file.
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------- npm
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    versioning-strategy: increase-if-necessary
+    groups:
+      # The ABI-sensitive parser/vector stack, in its own PR. These are NOT ignored
+      # (see the note below) — they are separated, because bundling them with routine
+      # drift is what stalled #429: seven grammar majors broke 34 analyzer tests and
+      # held six harmless bumps hostage for the whole cycle. Grouping only changes
+      # which PR they arrive in, so advisory-driven security updates are unaffected.
+      parser-stack:
+        applies-to: version-updates
+        patterns:
+          - 'tree-sitter'
+          - 'tree-sitter-*'
+          - 'web-tree-sitter'
+          # Scoped grammar packages: a bare `tree-sitter-*` glob does not match a name
+          # that starts with `@scope/`, so each scope is listed. `@repomix/…` carries the
+          # Dart WASM binaries and `@tree-sitter-grammars/…` the native Lua grammar —
+          # both belong in this PR, not in routine drift (issue #472).
+          - '@repomix/tree-sitter-wasms'
+          - '@tree-sitter-grammars/*'
+          - '@lancedb/lancedb'
+      # The Pi host packages, in their own PR — same reasoning as parser-stack, a
+      # different cause. Every `@earendil-works/pi-*` release so far ships an
+      # npm-shrinkwrap.json whose nested entries carry no `integrity` field. npm copies
+      # them verbatim, the lockfile loses those SRI digests, and CI fails until someone
+      # runs `npm run lock:integrity` — which Dependabot cannot do. While these sat in
+      # dev-dependencies, every pi bump held four unrelated harmless updates hostage
+      # behind that fixup. Separated, the fixup is one small PR; the rest lands untouched.
+      pi-host:
+        applies-to: version-updates
+        patterns:
+          - '@earendil-works/pi-*'
+      # One PR for routine dev-tooling drift (eslint, vitest, tsx, types).
+      dev-dependencies:
+        applies-to: version-updates
+        dependency-type: development
+        update-types: [minor, patch]
+      # One PR for low-risk runtime drift. Majors stay individual: they are the ones
+      # that can change behavior, so they deserve their own review and CI run.
+      production-minor-patch:
+        applies-to: version-updates
+        dependency-type: production
+        update-types: [minor, patch]
+    # Do not use `ignore` for the ABI-sensitive parser/vector stack. Dependabot
+    # applies ignores to security updates too, so suppressing routine version PRs
+    # here would also suppress advisory fixes on the highest-risk native input
+    # surface. Review those updates individually and close incompatible version
+    # bumps after the parser/ABI fixtures run.
+
+  # ------------------------------------------------------- github actions
+  # Two entries, because one does not cover both places actions are referenced.
+  #
+  # `directory: /` covers `.github/workflows/*` ONLY. The composite action at
+  # `.github/actions/openlore-review/action.yml` is a separate Dependabot directory and
+  # was silently unmonitored — the first github-actions PR (#270) bumped every workflow
+  # to checkout v7 / setup-node v7 and left the composite action on setup-node v4.4.0
+  # and github-script v7.1.0. Actions there are pinned to commit SHAs like everywhere
+  # else, and a pinned SHA with nothing proposing upgrades just freezes.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /.github/actions/openlore-review
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      composite-action:
+        applies-to: version-updates
+        patterns: ['*']

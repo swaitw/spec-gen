@@ -5,12 +5,25 @@
  * retry logic, token management, and cost tracking.
  */
 
-import { writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readdir, stat, unlink, realpath, open } from 'node:fs/promises';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import logger from '../../utils/logger.js';
+import { redactSecretsWithReport, redactSecretTextWithKnownValues } from './secret-redaction.js';
+import { protectPrompt } from '../../utils/prompt-boundary.js';
+import { LLM_TLS_ENV, announceInsecureTls, envTlsOptOut, withRelaxedTls } from './tls-scope.js';
+import { safeJoin } from '../../utils/path-confinement.js';
+import { acquireLockAt, isLockHeld } from '../runtime/advisory-lock.js';
 import {
   CLAUDE_MAX_CONTEXT_TOKENS,
   CLAUDE_MAX_OUTPUT_TOKENS,
+  ANTHROPIC_MAX_OUTPUT_TOKENS,
+  OPENAI_MAX_OUTPUT_TOKENS,
+  OPENAI_COMPAT_MAX_OUTPUT_TOKENS,
+  COPILOT_MAX_OUTPUT_TOKENS,
+  GEMINI_MAX_OUTPUT_TOKENS,
   MISTRAL_VIBE_MAX_CONTEXT_TOKENS,
   MISTRAL_VIBE_MAX_OUTPUT_TOKENS,
   LLM_CLI_MAX_BUFFER_BYTES,
@@ -26,9 +39,158 @@ import {
   DEFAULT_LLM_TIMEOUT_MS,
   DEFAULT_LLM_COST_WARNING_THRESHOLD,
   CONTEXT_LIMIT_WARNING_RATIO,
-  SPEC_GEN_DIR,
-  SPEC_GEN_LOGS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_LOGS_SUBDIR,
+  LLM_LOG_RETENTION_MAX_BYTES,
+  LLM_LOG_RETENTION_MAX_FILES,
 } from '../../constants.js';
+
+export interface LlmLogRetentionOptions {
+  maxTotalBytes?: number;
+  maxFiles?: number;
+}
+
+const LLM_LOG_TIMESTAMP = '\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z';
+const LLM_LOG_UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const OWNED_LLM_LOG = new RegExp(
+  `^llm-log-${LLM_LOG_TIMESTAMP}(?:-\\d+-${LLM_LOG_UUID})?\\.json$`,
+  'i',
+);
+const LLM_LOG_LOCK_WAIT_MS = 1_000;
+
+interface DirectoryIdentity {
+  dev: number;
+  ino: number;
+}
+
+async function assertDirectoryIdentity(path: string, expected: DirectoryIdentity): Promise<void> {
+  const current = await stat(path);
+  if (current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new Error('LLM log directory identity changed during persistence; refusing filesystem mutation');
+  }
+}
+
+function retentionBounds(options: LlmLogRetentionOptions): { maxTotalBytes: number; maxFiles: number } {
+  const maxTotalBytes = options.maxTotalBytes ?? LLM_LOG_RETENTION_MAX_BYTES;
+  const maxFiles = options.maxFiles ?? LLM_LOG_RETENTION_MAX_FILES;
+  if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < 0) {
+    throw new RangeError('LLM log retention maxTotalBytes must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 0) {
+    throw new RangeError('LLM log retention maxFiles must be a non-negative safe integer');
+  }
+  return { maxTotalBytes, maxFiles };
+}
+
+export function validateLlmLogSize(
+  content: string,
+  maxBytes = LLM_LOG_RETENTION_MAX_BYTES,
+): number {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError('LLM log size limit must be a non-negative safe integer');
+  }
+  const bytes = Buffer.byteLength(content);
+  if (bytes > maxBytes) {
+    throw new Error(`LLM log is ${bytes} bytes, exceeding the ${maxBytes}-byte retention limit; no log was written`);
+  }
+  return bytes;
+}
+
+/**
+ * Remove oldest OpenLore LLM logs until both retention bounds hold.
+ * Unrelated files and symlinks are deliberately outside this function's scope.
+ */
+export async function pruneLlmLogs(
+  logDir: string,
+  options: LlmLogRetentionOptions = {},
+  assertDirectory: () => Promise<void> = async () => {},
+): Promise<void> {
+  const { maxTotalBytes, maxFiles } = retentionBounds(options);
+  const entries = await readdir(logDir, { withFileTypes: true });
+  const candidates = entries.filter(entry =>
+    entry.isFile() && OWNED_LLM_LOG.test(entry.name)
+  );
+  const logs = (await Promise.all(candidates.map(async entry => {
+    try {
+      const details = await stat(join(logDir, entry.name));
+      return { name: entry.name, size: details.size, mtimeMs: details.mtimeMs };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }))).filter((entry): entry is { name: string; size: number; mtimeMs: number } => entry !== null)
+    .sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+
+  let totalBytes = logs.reduce((sum, entry) => sum + entry.size, 0);
+  while (logs.length > maxFiles || totalBytes > maxTotalBytes) {
+    const oldest = logs.shift();
+    if (!oldest) break;
+    try {
+      await assertDirectory();
+      await unlink(join(logDir, oldest.name));
+      await assertDirectory();
+      totalBytes -= oldest.size;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      totalBytes -= oldest.size;
+    }
+  }
+}
+
+/**
+ * Strip NUL bytes from a CLI prompt. Node's `child_process` rejects arguments
+ * that contain a NUL ("must be a string without null bytes"), and a prompt built
+ * from a git diff or file content can carry one (binary-ish content, a stray
+ * control byte in source). Every CLI-based provider applies this before spawning,
+ * so one bad byte never aborts an otherwise-valid call (e.g. the decisions
+ * extractor consolidating a diff).
+ */
+export function sanitizeCliPrompt(prompt: string): string {
+  return prompt.includes('\0') ? prompt.replace(/\0/g, '') : prompt;
+}
+
+/**
+ * Env vars that can hold the credential this process sends to a provider. Enumerated so a
+ * provider's own diagnostic can be matched against the EXACT value we hold, not only
+ * against a provider-shaped pattern.
+ */
+const PROVIDER_CREDENTIAL_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_COMPAT_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'COPILOT_API_KEY',
+] as const;
+
+/**
+ * Redact a provider-supplied diagnostic before it becomes an error message or a line in
+ * `.openlore/llm-logs/*.json`.
+ *
+ * Pattern-only redaction is not enough here: a gateway that answers
+ * `unknown credential corp-gw-9f21c` carries no `sk-` / `AIza` / `Bearer` framing at all,
+ * so the credential we just sent it went verbatim into a file on disk and onto stderr.
+ * Passing the value we HOLD closes that, the way `doctor` already does for its checks
+ * (mcp-security: Secret Confinement Across All Output Paths).
+ *
+ * Values shorter than 8 characters are not matched: `CopilotProvider`'s placeholder key is
+ * the literal `copilot`, and redacting a word that common would corrupt the diagnostic
+ * without protecting anything.
+ */
+function redactProviderDetail(text: string, heldCredential?: string): string {
+  const known = [...PROVIDER_CREDENTIAL_ENV_VARS.map(name => process.env[name]), heldCredential]
+    .filter((value): value is string => typeof value === 'string' && value.length >= 8);
+  return redactSecretTextWithKnownValues(text, known).value;
+}
+
+function withIsolatedCliCwd<T>(run: (cwd: string) => T): T {
+  const cwd = mkdtempSync(join(tmpdir(), 'openlore-llm-'));
+  try {
+    return run(cwd);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
 
 // ============================================================================
 // CLAUDE CODE PROVIDER (uses local `claude` CLI, no API key required)
@@ -57,12 +219,19 @@ export class ClaudeCodeProvider implements LLMProvider {
   async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
     const { execFileSync } = await import('child_process');
 
-    // Claude Code CLI takes a single prompt; combine system + user prompts
-    const fullPrompt = request.systemPrompt
-      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
-      : request.userPrompt;
-
-    const args = ['-p', fullPrompt, '--output-format', 'json'];
+    const fullPrompt = request.systemPrompt + request.userPrompt;
+    const args = [
+      '-p', sanitizeCliPrompt(request.userPrompt),
+      '--system-prompt', sanitizeCliPrompt(request.systemPrompt),
+      '--output-format', 'json',
+      '--tools', '',
+      '--strict-mcp-config',
+      '--mcp-config', '{"mcpServers":{}}',
+      '--disable-slash-commands',
+      '--no-chrome',
+      '--setting-sources', '',
+      '--no-session-persistence',
+    ];
     if (this.model) args.push('--model', this.model);
 
     // Remove Claude Code session env vars so the CLI can run inside an existing session
@@ -74,15 +243,16 @@ export class ClaudeCodeProvider implements LLMProvider {
 
     let raw: string;
     try {
-      raw = execFileSync('claude', args, {
+      raw = withIsolatedCliCwd((cwd) => execFileSync('claude', args, {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
         env,
-      });
+        cwd,
+      }));
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
-      const detail = e.stderr || e.stdout || e.message || String(err);
+      const detail = redactProviderDetail(e.stderr || e.stdout || e.message || String(err));
       throw Object.assign(new Error(`claude CLI failed: ${detail}`), { retryable: false });
     }
 
@@ -104,6 +274,73 @@ export class ClaudeCodeProvider implements LLMProvider {
       content: parsed.result ?? '',
       usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
       model: this.model ?? 'claude-code',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
+// CODEX CLI PROVIDER (uses local `codex` CLI, no cloud API key)
+// ============================================================================
+
+export class CodexCLIProvider implements LLMProvider {
+  name = 'codex-cli';
+  maxContextTokens = 1_000_000;
+  maxOutputTokens = 8_192;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    this.model = model && model !== 'codex-cli' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+    const bin = process.env.CODEX_CLI ?? 'codex';
+
+    let content: string;
+    try {
+      content = withIsolatedCliCwd((cwd) => {
+        const outputPath = join(cwd, 'response.txt');
+        const args = [
+          'exec',
+          '--sandbox', 'read-only',
+          '--ignore-user-config',
+          '--ignore-rules',
+          '--ephemeral',
+          '--skip-git-repo-check',
+          '--color', 'never',
+          '--output-last-message', outputPath,
+          '--cd', cwd,
+        ];
+        if (this.model) args.push('--model', this.model);
+        args.push(sanitizeCliPrompt(fullPrompt));
+        execFileSync(bin, args, {
+          encoding: 'utf8',
+          maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+          timeout: LLM_CLI_TIMEOUT_MS,
+          cwd,
+        });
+        return readFileSync(outputPath, 'utf8').trim();
+      });
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+      const detail = redactProviderDetail(e.stderr ?? e.stdout ?? e.message ?? String(err));
+      throw Object.assign(new Error(`codex CLI failed: ${detail}`), { retryable: false });
+    }
+
+    const inputTokens = estimateTokens(fullPrompt);
+    const outputTokens = estimateTokens(content);
+    return {
+      content,
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'codex-cli',
       finishReason: 'stop',
     };
   }
@@ -145,7 +382,7 @@ export class MistralVibeProvider implements LLMProvider {
       : request.userPrompt;
 
     // vibe CLI: -p for prompt, --output json for JSON, --agent for model/agent name
-    const args = ['-p', fullPrompt, '--output', 'json'];
+    const args = ['-p', sanitizeCliPrompt(fullPrompt), '--output', 'json', '--enabled-tools', ''];
     if (this.model) args.push('--agent', this.model);
 
     // Use MISTRAL_VIBE_CLI if set (standalone install not on PATH), else 'vibe'
@@ -153,14 +390,15 @@ export class MistralVibeProvider implements LLMProvider {
 
     let raw: string;
     try {
-      raw = execFileSync(mistralVibeBin, args, {
+      raw = withIsolatedCliCwd((cwd) => execFileSync(mistralVibeBin, args, {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
-      });
+        cwd,
+      }));
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
-      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      const detail = redactProviderDetail(e.stderr ?? e.stdout ?? e.message ?? String(err));
       throw Object.assign(new Error(`mistral-vibe CLI failed: ${detail}`), { retryable: false });
     }
 
@@ -244,18 +482,24 @@ export interface CompletionResponse {
   finishReason: 'stop' | 'length' | 'error';
 }
 
+/** Parsed structured output together with the completion that produced it. */
+export interface StructuredCompletion<T> {
+  data: T;
+  response: CompletionResponse;
+}
+
 /**
  * LLM provider interface
  */
 export interface LLMProvider {
   name: string;
-  generateCompletion(request: CompletionRequest): Promise<CompletionResponse>;
+  generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse>;
   countTokens(text: string): number;
   maxContextTokens: number;
   maxOutputTokens: number;
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'antigravity-cli' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'cursor-agent';
 
 /**
  * Token usage tracking
@@ -302,6 +546,8 @@ export interface LLMServiceOptions {
   costWarningThreshold?: number;
   /** Log directory for prompts/responses */
   logDir?: string;
+  /** Confinement root for OpenLore-owned log paths; omit only for a trusted explicit logDir. */
+  logRoot?: string;
   /** Enable prompt logging */
   enableLogging?: boolean;
   /** Disable response_format field in requests (for endpoints that don't support it) */
@@ -323,22 +569,12 @@ interface RetryConfig {
 // ============================================================================
 
 /**
- * Disable TLS certificate verification for all fetch requests in this process.
- *
- * Node.js native fetch does not support per-request TLS configuration.
- * The only reliable cross-version approach is the NODE_TLS_REJECT_UNAUTHORIZED
- * environment variable, which is process-global.  This is set once and logged
- * prominently so the user is aware.
+ * Record the user's TLS opt-out. The relaxation itself is applied per request by
+ * `withRelaxedTls` around each `fetch`, so verification is not left off for the
+ * lifetime of the process (see tls-scope.ts).
  */
 function disableSslVerification(): void {
-  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') return; // already disabled
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  // Warn prominently: this is process-global and affects all fetch calls.
-  console.warn(
-    '[spec-gen] WARNING: TLS certificate verification is DISABLED for this process.' +
-    ' All HTTPS connections (including LLM API calls) are vulnerable to MITM attacks.' +
-    ' Only use --insecure on trusted private networks with self-signed certificates.'
-  );
+  announceInsecureTls('--insecure, LLM_SKIP_SSL_VERIFY, or llm.sslVerify=false');
 }
 
 /**
@@ -474,8 +710,16 @@ const PRICING: Record<string, Record<string, { input: number; output: number }>>
     // No per-token cost: covered by Google account free tier
     default: { input: 0, output: 0 },
   },
+  'antigravity-cli': {
+    // No per-token cost in openlore: Google account / Antigravity subscription
+    default: { input: 0, output: 0 },
+  },
+  'codex-cli': {
+    // No per-token cost in openlore: ChatGPT subscription / CLI auth
+    default: { input: 0, output: 0 },
+  },
   'cursor-agent': {
-    // No per-token cost in spec-gen: Cursor subscription / CLI auth
+    // No per-token cost in openlore: Cursor subscription / CLI auth
     default: { input: 0, output: 0 },
   },
   copilot: {
@@ -516,6 +760,41 @@ export function lookupPricing(
   return table.default ?? { input: 3.0, output: 15.0 };
 }
 
+/** Exact priced model ids for consistency checks and fallback catalog construction. */
+export function pricedModelIds(providerName: string): string[] {
+  return Object.keys(PRICING[providerName] ?? {}).filter((id) => id !== 'default');
+}
+
+/**
+ * Return only fallback model ids that have an exact entry in the pricing table
+ * for the endpoint. Unknown endpoints stay empty instead of guessing.
+ */
+export function knownModelsForEndpoint(baseUrl: string): string[] {
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return [];
+  }
+  const compatible = pricedModelIds('openai-compat');
+
+  if (hostname === 'codestral.mistral.ai') {
+    return compatible.filter((id) => id.startsWith('codestral-'));
+  }
+  if (hostname === 'api.mistral.ai') {
+    return compatible.filter((id) => id.startsWith('mistral-') || id.startsWith('codestral-'));
+  }
+  if (hostname === 'api.openai.com') {
+    // OpenAICompatibleProvider accounts against the openai-compat table. Its
+    // generic fallback pricing cannot honestly certify OpenAI catalog entries.
+    return [];
+  }
+  if (hostname === 'api.groq.com') {
+    return compatible.filter((id) => id.startsWith('llama-'));
+  }
+  return [];
+}
+
 // ============================================================================
 // TOKEN ESTIMATION
 // ============================================================================
@@ -535,6 +814,16 @@ export function estimateTokens(text: string): number {
   return Math.ceil(regularCharCount / 4 + codeCharCount / 2);
 }
 
+/**
+ * Coerce an untrusted token count from a provider's `usage` block to a finite,
+ * non-negative number. Many OpenAI-compatible gateways (Ollama, LM Studio, some
+ * proxies) omit `usage` entirely; without this a missing field throws (object
+ * undefined) or poisons cost tracking with NaN (every later `+= NaN` stays NaN).
+ */
+function tokenCount(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
 // ============================================================================
 // ANTHROPIC PROVIDER
 // ============================================================================
@@ -545,16 +834,18 @@ export function estimateTokens(text: string): number {
 export class AnthropicProvider implements LLMProvider {
   name = 'anthropic';
   maxContextTokens = 200000;
-  maxOutputTokens = 4096;
+  maxOutputTokens = ANTHROPIC_MAX_OUTPUT_TOKENS;
 
   private apiKey: string;
   private model: string;
   private baseUrl: string;
+  private relaxTls: boolean;
 
   constructor(apiKey: string, model = DEFAULT_ANTHROPIC_MODEL, baseUrl?: string, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl ? normalizeApiBase(baseUrl) : 'https://api.anthropic.com/v1';
+    this.relaxTls = !sslVerify;
     if (!sslVerify) disableSslVerification();
   }
 
@@ -562,8 +853,8 @@ export class AnthropicProvider implements LLMProvider {
     return estimateTokens(text);
   }
 
-  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
-    const response = await fetch(`${this.baseUrl}/messages`, {
+  async generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse> {
+    const response = await withRelaxedTls(() => fetch(`${this.baseUrl}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -580,7 +871,15 @@ export class AnthropicProvider implements LLMProvider {
         ],
         stop_sequences: request.stopSequences,
       }),
-    });
+      signal,
+      // Never follow a redirect. The fetch spec strips only Authorization, Cookie and
+      // Proxy-Authorization when a redirect crosses origins — `x-api-key` survives, and a
+      // 307/308 replays the body as well. A followed redirect would therefore hand the
+      // operator's key (and the prompt built from their source) to whatever host the first
+      // one names, which is exactly what repo-config-trust's loopback exemption assumes
+      // cannot happen: a loopback listener would otherwise be a one-hop redirector.
+      redirect: 'error',
+    }), this.relaxTls);
 
     if (!response.ok) {
       const error = await response.text();
@@ -595,17 +894,20 @@ export class AnthropicProvider implements LLMProvider {
       stop_reason: string;
     };
 
-    const content = data.content
+    // `content` may be absent on a malformed/error-shaped 200 (some gateways do this).
+    const content = (Array.isArray(data.content) ? data.content : [])
       .filter(c => c.type === 'text')
       .map(c => c.text)
       .join('');
 
+    const inputTokens = tokenCount(data.usage?.input_tokens);
+    const outputTokens = tokenCount(data.usage?.output_tokens);
     return {
       content,
       usage: {
-        inputTokens: data.usage.input_tokens,
-        outputTokens: data.usage.output_tokens,
-        totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
       },
       model: data.model,
       finishReason: data.stop_reason === 'end_turn' ? 'stop' : data.stop_reason === 'max_tokens' ? 'length' : 'error',
@@ -613,7 +915,7 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   private parseError(error: string, status: number, retryAfterHeader?: string | null): Error & { status?: number; retryable?: boolean; retryAfterMs?: number } {
-    const detail = error.trim() || '(empty response body)';
+    const detail = redactProviderDetail(error, this.apiKey).trim() || '(empty response body)';
     const err = new Error(`HTTP ${status}: ${detail}`) as Error & { status?: number; retryable?: boolean; retryAfterMs?: number };
     err.status = status;
     err.retryable = status === 429 || status >= 500;
@@ -731,16 +1033,18 @@ function normalizeOpenAIResponseSchema(schema: object): object {
 export class OpenAIProvider implements LLMProvider {
   name = 'openai';
   maxContextTokens = 128000;
-  maxOutputTokens = 4096;
+  maxOutputTokens = OPENAI_MAX_OUTPUT_TOKENS;
 
   private apiKey: string;
   private model: string;
   private baseUrl: string;
+  private relaxTls: boolean;
 
   constructor(apiKey: string, model = DEFAULT_OPENAI_MODEL, baseUrl?: string, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl ? normalizeApiBase(baseUrl) : 'https://api.openai.com/v1';
+    this.relaxTls = !sslVerify;
     if (!sslVerify) disableSslVerification();
   }
 
@@ -748,7 +1052,7 @@ export class OpenAIProvider implements LLMProvider {
     return estimateTokens(text);
   }
 
-  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+  async generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse> {
     const messages: Array<{ role: string; content: string }> = [
       { role: 'system', content: request.systemPrompt },
       { role: 'user', content: request.userPrompt },
@@ -777,14 +1081,21 @@ export class OpenAIProvider implements LLMProvider {
       body.response_format = { type: 'json_object' };
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const response = await withRelaxedTls(() => fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`,
       },
+      // INTENTIONAL EGRESS: this provider sends the request to the operator-selected LLM.
+      // codeql[js/file-access-to-http]
       body: JSON.stringify(body),
-    });
+      signal,
+      // Never follow a redirect: the credential travels in a header (or, for Gemini, the
+      // URL) that a cross-origin redirect does not strip, and a 307/308 replays this body.
+      // Same reason as AnthropicProvider.generateCompletion above.
+      redirect: 'error',
+    }), this.relaxTls);
 
     if (!response.ok) {
       const error = await response.text();
@@ -798,12 +1109,14 @@ export class OpenAIProvider implements LLMProvider {
       model: string;
     };
 
+    const inputTokens = tokenCount(data.usage?.prompt_tokens);
+    const outputTokens = tokenCount(data.usage?.completion_tokens);
     return {
       content: data.choices[0]?.message?.content ?? '',
       usage: {
-        inputTokens: data.usage.prompt_tokens,
-        outputTokens: data.usage.completion_tokens,
-        totalTokens: data.usage.total_tokens,
+        inputTokens,
+        outputTokens,
+        totalTokens: tokenCount(data.usage?.total_tokens) || inputTokens + outputTokens,
       },
       model: data.model,
       finishReason: data.choices[0]?.finish_reason === 'stop' ? 'stop' : data.choices[0]?.finish_reason === 'length' ? 'length' : 'error',
@@ -811,7 +1124,7 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   private parseError(error: string, status: number, retryAfterHeader?: string | null): Error & { status?: number; retryable?: boolean; retryAfterMs?: number } {
-    const detail = error.trim() || '(empty response body)';
+    const detail = redactProviderDetail(error, this.apiKey).trim() || '(empty response body)';
     const err = new Error(`HTTP ${status}: ${detail}`) as Error & { status?: number; retryable?: boolean; retryAfterMs?: number };
     err.status = status;
     err.retryable = status === 429 || status >= 500;
@@ -844,18 +1157,21 @@ interface ModelInfo {
 export class OpenAICompatibleProvider implements LLMProvider {
   name = 'openai-compat';
   maxContextTokens = 128000;
-  maxOutputTokens = 4096;
+  maxOutputTokens = OPENAI_COMPAT_MAX_OUTPUT_TOKENS;
 
   private apiKey: string;
   private model: string;
   private baseUrl: string;
   private disableResponseFormat: boolean;
+  private relaxTls: boolean;
 
-  constructor(apiKey: string, baseUrl: string, model = DEFAULT_OPENAI_COMPAT_MODEL, disableResponseFormat = false) {
+  constructor(apiKey: string, baseUrl: string, model = DEFAULT_OPENAI_COMPAT_MODEL, disableResponseFormat = false, sslVerify = true) {
     this.apiKey = apiKey;
     this.baseUrl = normalizeApiBase(baseUrl);
     this.model = model;
     this.disableResponseFormat = disableResponseFormat;
+    this.relaxTls = !sslVerify;
+    if (!sslVerify) disableSslVerification();
   }
 
   countTokens(text: string): number {
@@ -867,13 +1183,16 @@ export class OpenAICompatibleProvider implements LLMProvider {
    */
   private async fetchAvailableModels(): Promise<string[]> {
     try {
-      const response = await fetch(`${this.baseUrl}/models`, {
+      const response = await withRelaxedTls(() => fetch(`${this.baseUrl}/models`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
         },
-      });
+        // Never follow a redirect: a cross-origin hop would re-send this request, and the
+        // bearer token with it on a same-site redirect. Same reason as generateCompletion.
+        redirect: 'error',
+      }), this.relaxTls);
 
       if (!response.ok) {
         return [];
@@ -890,46 +1209,10 @@ export class OpenAICompatibleProvider implements LLMProvider {
    * Get known models for common API endpoints when /models is not available
    */
   private getKnownModelsForEndpoint(): string[] {
-    const url = this.baseUrl.toLowerCase();
-
-    if (url.includes('codestral.mistral.ai')) {
-      return ['codestral-2508', 'codestral-latest'];
-    }
-
-    if (url.includes('api.mistral.ai')) {
-      return [
-        'mistral-large-3-25-12',
-        'mistral-medium-3-1-25-08',
-        'mistral-small-4-0-26-03',
-        'mistral-nemo-12b-24-07',
-        'codestral-2508',
-        'devstral-2-25-12'
-      ];
-    }
-
-    if (url.includes('api.openai.com')) {
-      return [
-        'gpt-4o',
-        'gpt-4o-mini',
-        'gpt-4-turbo',
-        'gpt-4',
-        'gpt-3.5-turbo'
-      ];
-    }
-
-    if (url.includes('api.groq.com')) {
-      return [
-        'llama-3.1-70b-versatile',
-        'llama-3.1-8b-instant',
-        'mixtral-8x7b-32768'
-      ];
-    }
-
-    // For unknown endpoints, return empty array
-    return [];
+    return knownModelsForEndpoint(this.baseUrl);
   }
 
-  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+  async generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse> {
     const body: Record<string, unknown> = {
       model: this.model,
       messages: [
@@ -957,18 +1240,25 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const response = await withRelaxedTls(() => fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`,
       },
+      // INTENTIONAL EGRESS: this provider sends the request to the operator-selected LLM.
+      // codeql[js/file-access-to-http]
       body: JSON.stringify(body),
-    });
+      signal,
+      // Never follow a redirect: the credential travels in a header (or, for Gemini, the
+      // URL) that a cross-origin redirect does not strip, and a 307/308 replays this body.
+      // Same reason as AnthropicProvider.generateCompletion above.
+      redirect: 'error',
+    }), this.relaxTls);
 
     if (!response.ok) {
       const error = await response.text();
-      const detail = error.trim() || '(empty response body)';
+      const detail = redactProviderDetail(error, this.apiKey).trim() || '(empty response body)';
       const err = new Error(`HTTP ${response.status}: ${detail}`) as Error & { status?: number; retryable?: boolean; retryAfterMs?: number };
       err.status = response.status;
       err.retryable = response.status === 429 || response.status >= 500;
@@ -986,38 +1276,61 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let reachedTransportEof = false;
+    let cancelPromise: Promise<void> | undefined;
+    const cancelReader = (reason?: unknown) => {
+      cancelPromise ??= reader.cancel(reason).catch(() => undefined);
+      return cancelPromise;
+    };
+    const abortStream = () => {
+      void cancelReader(signal?.reason);
+    };
+    signal?.addEventListener('abort', abortStream, { once: true });
 
-    outer: while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+    try {
+      outer: while (true) {
+        signal?.throwIfAborted();
+        const { done, value } = await reader.read();
+        signal?.throwIfAborted();
+        if (done) {
+          reachedTransportEof = true;
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') break outer;
-        try {
-          const chunk = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>;
-            usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-            model?: string;
-          };
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) content += delta;
-          const fr = chunk.choices?.[0]?.finish_reason;
-          if (fr) finishReason = fr === 'length' ? 'length' : 'stop';
-          if (chunk.model) model = chunk.model;
-          if (chunk.usage) {
-            usage = {
-              inputTokens: chunk.usage.prompt_tokens,
-              outputTokens: chunk.usage.completion_tokens,
-              totalTokens: chunk.usage.total_tokens,
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') break outer;
+          try {
+            const chunk = JSON.parse(data) as {
+              choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>;
+              usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+              model?: string;
             };
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) content += delta;
+            const fr = chunk.choices?.[0]?.finish_reason;
+            if (fr) finishReason = fr === 'length' ? 'length' : 'stop';
+            if (chunk.model) model = chunk.model;
+            if (chunk.usage) {
+              const inputTokens = tokenCount(chunk.usage.prompt_tokens);
+              const outputTokens = tokenCount(chunk.usage.completion_tokens);
+              usage = {
+                inputTokens,
+                outputTokens,
+                totalTokens: tokenCount(chunk.usage.total_tokens) || inputTokens + outputTokens,
+              };
+            }
+          } catch { /* ignore malformed SSE chunks */ }
           }
-        } catch { /* ignore malformed SSE chunks */ }
       }
+    } finally {
+      signal?.removeEventListener('abort', abortStream);
+      if (!reachedTransportEof) await cancelReader(signal?.reason);
+      reader.releaseLock();
     }
 
     return { content, usage, model, finishReason };
@@ -1042,23 +1355,26 @@ export class OpenAICompatibleProvider implements LLMProvider {
 export class CopilotProvider implements LLMProvider {
   name = 'copilot';
   maxContextTokens = 128000;
-  maxOutputTokens = 4096;
+  maxOutputTokens = COPILOT_MAX_OUTPUT_TOKENS;
 
   private apiKey: string;
   private model: string;
   private baseUrl: string;
+  private relaxTls: boolean;
 
-  constructor(baseUrl: string, model = DEFAULT_COPILOT_MODEL, apiKey = 'copilot') {
+  constructor(baseUrl: string, model = DEFAULT_COPILOT_MODEL, apiKey = 'copilot', sslVerify = true) {
     this.apiKey = apiKey;
     this.baseUrl = normalizeApiBase(baseUrl);
     this.model = model;
+    this.relaxTls = !sslVerify;
+    if (!sslVerify) disableSslVerification();
   }
 
   countTokens(text: string): number {
     return estimateTokens(text);
   }
 
-  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+  async generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse> {
     const body: Record<string, unknown> = {
       model: this.model,
       messages: [
@@ -1082,18 +1398,25 @@ export class CopilotProvider implements LLMProvider {
       body.response_format = { type: 'json_object' };
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const response = await withRelaxedTls(() => fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`,
       },
+      // INTENTIONAL EGRESS: this provider sends the request to the operator-selected LLM.
+      // codeql[js/file-access-to-http]
       body: JSON.stringify(body),
-    });
+      signal,
+      // Never follow a redirect: the credential travels in a header (or, for Gemini, the
+      // URL) that a cross-origin redirect does not strip, and a 307/308 replays this body.
+      // Same reason as AnthropicProvider.generateCompletion above.
+      redirect: 'error',
+    }), this.relaxTls);
 
     if (!response.ok) {
       const error = await response.text();
-      const detail = error.trim() || '(empty response body)';
+      const detail = redactProviderDetail(error, this.apiKey).trim() || '(empty response body)';
       const err = new Error(`HTTP ${response.status}: ${detail}`) as Error & { status?: number; retryable?: boolean; retryAfterMs?: number };
       err.status = response.status;
       err.retryable = response.status === 429 || response.status >= 500;
@@ -1110,12 +1433,14 @@ export class CopilotProvider implements LLMProvider {
       model: string;
     };
 
+    const inputTokens = tokenCount(data.usage?.prompt_tokens);
+    const outputTokens = tokenCount(data.usage?.completion_tokens);
     return {
       content: data.choices[0]?.message?.content ?? '',
       usage: {
-        inputTokens: data.usage.prompt_tokens,
-        outputTokens: data.usage.completion_tokens,
-        totalTokens: data.usage.total_tokens,
+        inputTokens,
+        outputTokens,
+        totalTokens: tokenCount(data.usage?.total_tokens) || inputTokens + outputTokens,
       },
       model: data.model ?? this.model,
       finishReason: data.choices[0]?.finish_reason === 'stop' ? 'stop' : data.choices[0]?.finish_reason === 'length' ? 'length' : 'error',
@@ -1152,27 +1477,39 @@ export class GeminiCLIProvider implements LLMProvider {
       ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
       : request.userPrompt;
 
-    // gemini CLI: -p for prompt, --output-format json, -m for model
-    const args = ['-p', fullPrompt, '--output-format', 'json'];
-    if (this.model) args.push('-m', this.model);
-
+    // Gemini has no tool-disable flag. Its default approval mode is the
+    // restricted fail-closed mode for headless calls; no tool is pre-approved,
+    // and extensions are disabled so project configuration cannot add tools.
     const geminiCLIBin = process.env.GEMINI_CLI ?? 'gemini';
 
     let raw: string;
     try {
-      raw = execFileSync(geminiCLIBin, args, {
-        encoding: 'utf8',
-        maxBuffer: 50 * 1024 * 1024,
-        timeout: 300_000,
+      raw = withIsolatedCliCwd((cwd) => {
+        const policyPath = join(cwd, 'deny-all-tools.toml');
+        writeFileSync(policyPath, '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n');
+        const args = [
+          '-p', sanitizeCliPrompt(fullPrompt),
+          '--output-format', 'json',
+          '--approval-mode', 'default',
+          '--admin-policy', policyPath,
+          '--extensions', 'none',
+        ];
+        if (this.model) args.push('-m', this.model);
+        return execFileSync(geminiCLIBin, args, {
+          encoding: 'utf8',
+          maxBuffer: 50 * 1024 * 1024,
+          timeout: 300_000,
+          cwd,
+        });
       });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
-      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      const detail = redactProviderDetail(e.stderr ?? e.stdout ?? e.message ?? String(err));
       throw Object.assign(new Error(`gemini CLI failed: ${detail}`), { retryable: false });
     }
 
     // Format: {response: string, stats: {models: {[name]: {tokens: {input, candidates, total}}}}}
-    let content = '';
+    let content: string;
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
     let modelUsed = this.model ?? 'gemini-cli';
@@ -1216,6 +1553,58 @@ export class GeminiCLIProvider implements LLMProvider {
 }
 
 // ============================================================================
+// ANTIGRAVITY CLI PROVIDER (Google Gemini agent family)
+// ============================================================================
+
+export class AntigravityCLIProvider implements LLMProvider {
+  name = 'antigravity-cli';
+  maxContextTokens = 1_000_000;
+  maxOutputTokens = 8_192;
+  private model: string | undefined;
+
+  constructor(model?: string) {
+    this.model = model && model !== 'antigravity-cli' ? model : undefined;
+  }
+
+  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+    const { execFileSync } = await import('child_process');
+    const fullPrompt = request.systemPrompt
+      ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
+      : request.userPrompt;
+    const args = ['--sandbox', '-p', sanitizeCliPrompt(fullPrompt)];
+    if (this.model) args.push('--model', this.model);
+    const bin = process.env.ANTIGRAVITY_CLI ?? 'agy';
+
+    let content: string;
+    try {
+      content = withIsolatedCliCwd((cwd) => execFileSync(bin, args, {
+        encoding: 'utf8',
+        maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
+        timeout: LLM_CLI_TIMEOUT_MS,
+        cwd,
+      }).trim());
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+      const detail = redactProviderDetail(e.stderr ?? e.stdout ?? e.message ?? String(err));
+      throw Object.assign(new Error(`antigravity CLI failed: ${detail}`), { retryable: false });
+    }
+
+    const inputTokens = estimateTokens(fullPrompt);
+    const outputTokens = estimateTokens(content);
+    return {
+      content,
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: this.model ?? 'antigravity-cli',
+      finishReason: 'stop',
+    };
+  }
+
+  countTokens(text: string): number {
+    return estimateTokens(text);
+  }
+}
+
+// ============================================================================
 // CURSOR AGENT CLI PROVIDER (uses local `cursor-agent` CLI, no cloud API key)
 // ============================================================================
 
@@ -1224,7 +1613,7 @@ export class GeminiCLIProvider implements LLMProvider {
  *
  * Routes LLM calls through the Cursor Agent CLI in print mode (`-p`, JSON output).
  * Authentication is handled by Cursor (see Cursor CLI headless documentation) —
- * e.g. `cursor auth login` or `CURSOR_API_KEY` — not ANTHROPIC_API_KEY / OPENAI_API_KEY.
+ * e.g. `cursor-agent login` or `CURSOR_API_KEY` — not ANTHROPIC_API_KEY / OPENAI_API_KEY.
  * If the binary is not on PATH, set `CURSOR_AGENT_CLI` to its full path.
  */
 export class CursorAgentProvider implements LLMProvider {
@@ -1244,25 +1633,28 @@ export class CursorAgentProvider implements LLMProvider {
       ? `${request.systemPrompt}\n\n---\n\n${request.userPrompt}`
       : request.userPrompt;
 
-    const args = ['-p', fullPrompt, '--output-format', 'json'];
+    // Ask mode is Cursor's read-only restricted-permission mode. Print mode
+    // otherwise has full write and shell access.
+    const args = ['-p', sanitizeCliPrompt(fullPrompt), '--output-format', 'json', '--mode=ask'];
     if (this.model) args.push('--model', this.model);
 
     const bin = process.env.CURSOR_AGENT_CLI ?? 'cursor-agent';
 
     let raw: string;
     try {
-      raw = execFileSync(bin, args, {
+      raw = withIsolatedCliCwd((cwd) => execFileSync(bin, args, {
         encoding: 'utf8',
         maxBuffer: LLM_CLI_MAX_BUFFER_BYTES,
         timeout: LLM_CLI_TIMEOUT_MS,
-      });
+        cwd,
+      }));
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string; status?: number };
-      const detail = e.stderr ?? e.stdout ?? e.message ?? String(err);
+      const detail = redactProviderDetail(e.stderr ?? e.stdout ?? e.message ?? String(err));
       throw Object.assign(new Error(`cursor-agent CLI failed: ${detail}`), { retryable: false });
     }
 
-    let content = '';
+    let content: string;
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
 
@@ -1318,22 +1710,25 @@ export class CursorAgentProvider implements LLMProvider {
 export class GeminiProvider implements LLMProvider {
   name = 'gemini';
   maxContextTokens = 1000000;
-  maxOutputTokens = 8192;
+  maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS;
 
   private apiKey: string;
   private model: string;
   private baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
+  private relaxTls: boolean;
 
-  constructor(apiKey: string, model = DEFAULT_GEMINI_MODEL) {
+  constructor(apiKey: string, model = DEFAULT_GEMINI_MODEL, sslVerify = true) {
     this.apiKey = apiKey;
     this.model = model;
+    this.relaxTls = !sslVerify;
+    if (!sslVerify) disableSslVerification();
   }
 
   countTokens(text: string): number {
     return estimateTokens(text);
   }
 
-  async generateCompletion(request: CompletionRequest): Promise<CompletionResponse> {
+  async generateCompletion(request: CompletionRequest, signal?: AbortSignal): Promise<CompletionResponse> {
     const body: Record<string, unknown> = {
       contents: [
         { role: 'user', parts: [{ text: request.userPrompt }] },
@@ -1350,16 +1745,23 @@ export class GeminiProvider implements LLMProvider {
       },
     };
 
-    const url = `${this.baseUrl}/${this.model}:generateContent?key=${this.apiKey}`;
-    const response = await fetch(url, {
+    const url = `${this.baseUrl}/${encodeURIComponent(this.model)}:generateContent?key=${this.apiKey}`;
+    const response = await withRelaxedTls(() => fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      // INTENTIONAL EGRESS: this provider sends the request to the operator-selected LLM.
+      // codeql[js/file-access-to-http]
       body: JSON.stringify(body),
-    });
+      signal,
+      // Never follow a redirect: the credential travels in a header (or, for Gemini, the
+      // URL) that a cross-origin redirect does not strip, and a 307/308 replays this body.
+      // Same reason as AnthropicProvider.generateCompletion above.
+      redirect: 'error',
+    }), this.relaxTls);
 
     if (!response.ok) {
       const error = await response.text();
-      const detail = error.trim() || '(empty response body)';
+      const detail = redactProviderDetail(error, this.apiKey).trim() || '(empty response body)';
       const err = new Error(`HTTP ${response.status}: ${detail}`) as Error & { status?: number; retryable?: boolean; retryAfterMs?: number };
       err.status = response.status;
       err.retryable = response.status === 429 || response.status >= 500;
@@ -1384,12 +1786,14 @@ export class GeminiProvider implements LLMProvider {
     const content = data.candidates[0]?.content?.parts?.map(p => p.text).join('') ?? '';
     const finishReason = data.candidates[0]?.finishReason;
 
+    const inputTokens = tokenCount(data.usageMetadata?.promptTokenCount);
+    const outputTokens = tokenCount(data.usageMetadata?.candidatesTokenCount);
     return {
       content,
       usage: {
-        inputTokens: data.usageMetadata.promptTokenCount,
-        outputTokens: data.usageMetadata.candidatesTokenCount,
-        totalTokens: data.usageMetadata.totalTokenCount,
+        inputTokens,
+        outputTokens,
+        totalTokens: tokenCount(data.usageMetadata?.totalTokenCount) || inputTokens + outputTokens,
       },
       model: this.model,
       finishReason: finishReason === 'STOP' ? 'stop' : finishReason === 'MAX_TOKENS' ? 'length' : 'error',
@@ -1485,9 +1889,18 @@ export class LLMService {
   private options: Required<LLMServiceOptions>;
   private tokenUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, requests: 0 };
   private costTracking: CostTracking = { estimatedCost: 0, currency: 'USD', byProvider: {} };
-  private requestLog: Array<{ timestamp: string; request: CompletionRequest; response?: CompletionResponse; error?: string }> = [];
+  private requestLog: Array<{
+    timestamp: string;
+    request: CompletionRequest;
+    response?: CompletionResponse;
+    error?: string;
+    redactions: { count: number; kinds: string[] };
+  }> = [];
 
   constructor(provider: LLMProvider, options: LLMServiceOptions = {}) {
+    if (options.enableLogging && !options.logRoot && !options.logDir) {
+      throw new Error('LLM logging requires logRoot or an explicit trusted logDir');
+    }
     this.provider = provider;
     this.options = {
       provider: options.provider ?? 'anthropic',
@@ -1500,7 +1913,8 @@ export class LLMService {
       maxDelay: options.maxDelay ?? DEFAULT_LLM_MAX_DELAY_MS,
       timeout: options.timeout ?? DEFAULT_LLM_TIMEOUT_MS,
       costWarningThreshold: options.costWarningThreshold ?? DEFAULT_LLM_COST_WARNING_THRESHOLD,
-      logDir: options.logDir ?? `${SPEC_GEN_DIR}/${SPEC_GEN_LOGS_SUBDIR}`,
+      logDir: options.logDir ?? `${OPENLORE_DIR}/${OPENLORE_LOGS_SUBDIR}`,
+      logRoot: options.logRoot ?? '',
       enableLogging: options.enableLogging ?? false,
       disableResponseFormat: options.disableResponseFormat ?? false,
     };
@@ -1583,6 +1997,12 @@ export class LLMService {
 
         const response = await this.executeWithTimeout(request);
 
+        if (response.finishReason === 'length') {
+          const purpose = request.responseFormat === 'json' ? 'JSON completion' : 'text completion';
+          const cap = request.maxTokens ?? this.provider.maxOutputTokens;
+          logger.warning(`LLM ${purpose} was truncated at the ${cap}-token output cap`);
+        }
+
         // Update tracking
         this.updateTracking(response);
 
@@ -1632,6 +2052,15 @@ export class LLMService {
    * Generate a completion expecting JSON response
    */
   async completeJSON<T>(request: CompletionRequest, schema?: object): Promise<T> {
+    return (await this.completeJSONWithMetadata<T>(request, schema)).data;
+  }
+
+  /**
+   * Generate a JSON completion while retaining provider metadata such as the
+   * actual model id. Consumers that publish LLM-derived judgments use this to
+   * attribute the result instead of presenting model opinion as measurement.
+   */
+  async completeJSONWithMetadata<T>(request: CompletionRequest, schema?: object): Promise<StructuredCompletion<T>> {
     const jsonRequest = { ...request, responseFormat: 'json' as const, jsonSchema: schema };
 
     // Add JSON instruction to prompt if not already present
@@ -1646,7 +2075,14 @@ export class LLMService {
       jsonRequest.systemPrompt += `\n\nYour response MUST conform to this JSON Schema:\n${JSON.stringify(schema)}`;
     }
 
-    const response = await this.complete(jsonRequest);
+    let response = await this.complete(jsonRequest);
+    if (response.finishReason === 'length') {
+      const cap = request.maxTokens ?? this.provider.maxOutputTokens;
+      throw new Error(`LLM JSON completion was truncated at the ${cap}-token output cap; structured output may be incomplete`);
+    }
+    if (response.finishReason === 'error') {
+      throw new Error('LLM JSON completion ended with a provider error; structured output was not accepted');
+    }
     let content = response.content;
 
     // Extract JSON from markdown code blocks if present
@@ -1663,15 +2099,33 @@ export class LLMService {
       // Retry with correction prompt for parse errors
       logger.warning('JSON parse failed, attempting correction');
 
+      const correctionPrompt = protectPrompt(
+        'Fix the invalid JSON in the untrusted data block and return only valid JSON. Do not include any explanation.',
+        `Invalid JSON:\n${content}\n\nError: ${(parseError as Error).message}`,
+      );
       const correctionRequest: CompletionRequest = {
-        systemPrompt: 'Fix the following invalid JSON and return only valid JSON. Do not include any explanation.',
-        userPrompt: `Invalid JSON:\n${content}\n\nError: ${(parseError as Error).message}\n\nReturn the corrected JSON:`,
+        ...correctionPrompt,
         temperature: 0.1,
+        maxTokens: request.maxTokens,
         responseFormat: 'json',
+        jsonSchema: schema,
       };
 
-      const correctionResponse = await this.complete(correctionRequest);
-      let correctedContent = correctionResponse.content;
+      response = await this.complete(correctionRequest);
+      if (response.finishReason === 'length') {
+        const cap = correctionRequest.maxTokens ?? this.provider.maxOutputTokens;
+        throw new Error(
+          `LLM JSON correction was truncated at the ${cap}-token output cap; structured output may be incomplete`,
+          { cause: parseError },
+        );
+      }
+      if (response.finishReason === 'error') {
+        throw new Error(
+          'LLM JSON correction ended with a provider error; structured output was not accepted',
+          { cause: parseError },
+        );
+      }
+      let correctedContent = response.content;
 
       // Extract from code blocks again
       const correctedMatch = correctedContent.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -1703,7 +2157,7 @@ export class LLMService {
       this.validateSchema(parsed, schema);
     }
 
-    return parsed;
+    return { data: parsed, response };
   }
 
   /**
@@ -1711,15 +2165,31 @@ export class LLMService {
    */
   private async executeWithTimeout(request: CompletionRequest): Promise<CompletionResponse> {
     const timeoutMs = this.retryConfig.timeout;
+    const controller = new AbortController();
 
-    const result = await Promise.race([
-      this.provider.generateCompletion(request),
-      new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error(`LLM request timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
-
-    return result;
+    // change: fix-process-exit-lifecycle
+    // The timeout timer MUST be cleared once the race settles. Without this, a
+    // request that fails fast (e.g. an unreachable provider rejecting in <1s)
+    // leaves the setTimeout pending for the full request timeout — keeping the
+    // event loop alive so the whole command hangs until the timer fires at the
+    // 120s mark, long after it reported the failure. `unref` is defence in depth:
+    // even a missed clear degrades to an early exit rather than a hang.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.provider.generateCompletion(request, controller.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const timeoutError = new Error(`LLM request timed out after ${timeoutMs}ms`);
+            reject(timeoutError);
+            controller.abort(timeoutError);
+          }, timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1751,34 +2221,25 @@ export class LLMService {
    * Log request/response
    */
   private logRequest(request: CompletionRequest, response?: CompletionResponse, error?: string): void {
-    const logEntry = {
+    // Scrub the WHOLE entry, not just the request. `error` is the provider's response
+    // body verbatim (`HTTP ${status}: ${detail}`), and an OpenAI-compatible gateway
+    // that echoes the inbound request in its diagnostics puts the Authorization /
+    // x-api-key header we just sent into that text — which then lands in a file on
+    // disk. This is the channel mcp-security's "Secret Confinement Across All Output
+    // Paths" names ("or written artifact"), so it uses the shared redactor rather
+    // than a private, request-only copy that had drifted from it.
+    // The deep walker matches PATTERNS only, so it cannot recognise a credential the
+    // gateway echoed in its own vocabulary (`unknown credential corp-gw-9f21c`). Run the
+    // provider text through the known-value redactor first — it matches the exact key this
+    // process holds — and let the walker scrub the rest of the entry as before.
+    const { value, redactions } = redactSecretsWithReport({
       timestamp: new Date().toISOString(),
-      request: this.redactSecrets(request),
+      request,
       response,
-      error,
-    };
+      error: error === undefined ? undefined : redactProviderDetail(error),
+    }, false);
 
-    this.requestLog.push(logEntry);
-  }
-
-  /**
-   * Redact potential secrets from request
-   */
-  private redactSecrets(request: CompletionRequest): CompletionRequest {
-    const secretPatterns = [
-      /(?:api[_-]?key|password|secret|token|auth)['":\s]*[=:]\s*['"]?[\w-]{20,}['"]?/gi,
-      /['"]?[a-zA-Z0-9]{32,}['"]?/g, // Long alphanumeric strings
-    ];
-
-    let systemPrompt = request.systemPrompt;
-    let userPrompt = request.userPrompt;
-
-    for (const pattern of secretPatterns) {
-      systemPrompt = systemPrompt.replace(pattern, '[REDACTED]');
-      userPrompt = userPrompt.replace(pattern, '[REDACTED]');
-    }
-
-    return { ...request, systemPrompt, userPrompt };
+    this.requestLog.push({ ...value, redactions });
   }
 
   /**
@@ -1815,23 +2276,95 @@ export class LLMService {
   /**
    * Save logs to disk
    */
-  async saveLogs(): Promise<void> {
-    if (this.requestLog.length === 0) return;
+  async saveLogs(): Promise<boolean> {
+    if (this.requestLog.length === 0) return false;
 
-    await mkdir(this.options.logDir, { recursive: true });
+    const configuredLogDir = this.options.logDir;
+    if (this.options.logRoot) {
+      safeJoin(resolve(this.options.logRoot), configuredLogDir);
+    }
+    await mkdir(configuredLogDir, { recursive: true, mode: 0o700 });
+    const logDir = await realpath(configuredLogDir);
+    if (this.options.logRoot) {
+      safeJoin(await realpath(resolve(this.options.logRoot)), logDir);
+    }
+    const directoryStat = await stat(logDir);
+    const directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+    const assertLogDirectory = async (): Promise<void> => {
+      await assertDirectoryIdentity(configuredLogDir, directoryIdentity);
+      if (this.options.logRoot) {
+        const current = await realpath(configuredLogDir);
+        safeJoin(await realpath(resolve(this.options.logRoot)), current);
+      }
+    };
 
-    const filename = `llm-log-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    const filepath = join(this.options.logDir, filename);
-
-    await writeFile(filepath, JSON.stringify({
+    // 0600: the log holds the full prompt corpus (i.e. the repository's source) and
+    // provider diagnostics. Redaction is the first defense; not leaving it
+    // world-readable to every other local process is the second.
+    const content = JSON.stringify({
       summary: {
         tokenUsage: this.tokenUsage,
         costTracking: this.costTracking,
       },
       requests: this.requestLog,
-    }, null, 2));
+    }, null, 2);
+    const contentBytes = validateLlmLogSize(content);
+    await assertLogDirectory();
+    const lock = await acquireLockAt(logDir, '.llm-log-retention.lock', {
+      onContended: 'wait',
+      maxWaitMs: LLM_LOG_LOCK_WAIT_MS,
+      namespaceGateMaxWaitMs: LLM_LOG_LOCK_WAIT_MS,
+    });
+    if (isLockHeld(lock)) throw new Error('LLM log retention lock is held by another writer');
+    let filepath: string | undefined;
+    try {
+      await assertLogDirectory();
+      // Reclaim capacity BEFORE publication. If cleanup fails, no new sensitive
+      // artifact is made visible and repeated best-effort callers cannot grow the set.
+      await pruneLlmLogs(logDir, {
+        maxTotalBytes: LLM_LOG_RETENTION_MAX_BYTES - contentBytes,
+        maxFiles: LLM_LOG_RETENTION_MAX_FILES - 1,
+      }, assertLogDirectory);
+
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const filename = `llm-log-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}-${randomUUID()}.json`;
+        const candidate = join(logDir, filename);
+        await assertLogDirectory();
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        let createdIdentity: DirectoryIdentity | undefined;
+        try {
+          // The random final path is exclusively created. A crash may expose a
+          // partial artifact, but it remains an exact-owned file already reserved
+          // inside both retention bounds and will be handled by the next prune.
+          handle = await open(candidate, 'wx', 0o600);
+          const created = await handle.stat();
+          createdIdentity = { dev: created.dev, ino: created.ino };
+          await handle.writeFile(content);
+          await handle.close();
+          handle = undefined;
+          await assertLogDirectory();
+          filepath = candidate;
+          break;
+        } catch (error) {
+          await handle?.close().catch(() => {});
+          if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
+          if (createdIdentity) {
+            const current = await stat(candidate).catch(() => null);
+            if (current?.dev === createdIdentity.dev && current.ino === createdIdentity.ino) {
+              await assertLogDirectory();
+              await unlink(candidate).catch(() => {});
+            }
+          }
+          throw error;
+        }
+      }
+      if (!filepath) throw new Error('Unable to allocate a unique LLM log filename after 10 attempts');
+    } finally {
+      await lock.release();
+    }
 
     logger.debug(`Saved LLM logs to ${filepath}`);
+    return true;
   }
 
   /**
@@ -1851,7 +2384,11 @@ export class LLMService {
  */
 export function createLLMService(options: LLMServiceOptions = {}): LLMService {
   const providerName = options.provider ?? 'anthropic';
-  const sslVerify = options.sslVerify ?? true;
+  // Callers that resolve the flag themselves pass `sslVerify` explicitly (see
+  // `resolveTrustedSslVerify`, which already folds the env in). This fallback covers
+  // the callers that pass nothing at all — the mcp daemon and the embedded API —
+  // which is where the operator previously had no lever whatsoever.
+  const sslVerify = options.sslVerify ?? !envTlsOptOut(LLM_TLS_ENV);
   let provider: LLMProvider;
 
   if (providerName === 'anthropic') {
@@ -1877,27 +2414,31 @@ export function createLLMService(options: LLMServiceOptions = {}): LLMService {
     if (!baseUrl) {
       throw new Error('openaiCompatBaseUrl must be set in config or OPENAI_COMPAT_BASE_URL env var (e.g. https://api.mistral.ai/v1)');
     }
-    provider = new OpenAICompatibleProvider(apiKey, baseUrl, options.model ?? DEFAULT_OPENAI_COMPAT_MODEL, options.disableResponseFormat ?? false);
+    provider = new OpenAICompatibleProvider(apiKey, baseUrl, options.model ?? DEFAULT_OPENAI_COMPAT_MODEL, options.disableResponseFormat ?? false, sslVerify);
   } else if (providerName === 'copilot') {
     const baseUrl = options.openaiCompatBaseUrl ?? options.apiBase ?? process.env.COPILOT_API_BASE_URL ?? 'http://localhost:4141/v1';
     const apiKey = process.env.COPILOT_API_KEY ?? 'copilot';
-    provider = new CopilotProvider(baseUrl, options.model ?? DEFAULT_COPILOT_MODEL, apiKey);
+    provider = new CopilotProvider(baseUrl, options.model ?? DEFAULT_COPILOT_MODEL, apiKey, sslVerify);
   } else if (providerName === 'gemini') {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error('GEMINI_API_KEY environment variable is not set');
     }
-    provider = new GeminiProvider(apiKey, options.model ?? DEFAULT_GEMINI_MODEL);
+    provider = new GeminiProvider(apiKey, options.model ?? DEFAULT_GEMINI_MODEL, sslVerify);
   } else if (providerName === 'claude-code') {
     provider = new ClaudeCodeProvider(options.model);
+  } else if (providerName === 'codex-cli') {
+    provider = new CodexCLIProvider(options.model);
   } else if (providerName === 'mistral-vibe') {
     provider = new MistralVibeProvider(options.model);
   } else if (providerName === 'gemini-cli') {
     provider = new GeminiCLIProvider(options.model);
+  } else if (providerName === 'antigravity-cli') {
+    provider = new AntigravityCLIProvider(options.model);
   } else if (providerName === 'cursor-agent') {
     provider = new CursorAgentProvider(options.model);
   } else {
-    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, claude-code, mistral-vibe, cursor-agent`);
+    throw new Error(`Unknown provider: ${providerName}. Supported: anthropic, openai, openai-compat, copilot, gemini, gemini-cli, antigravity-cli, claude-code, codex-cli, mistral-vibe, cursor-agent`);
   }
 
   if (!sslVerify) {

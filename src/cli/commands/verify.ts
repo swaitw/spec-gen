@@ -1,29 +1,33 @@
 /**
- * spec-gen verify command
+ * openlore verify command
  *
  * Tests generated spec accuracy against actual source code.
  * Samples files and validates that specs accurately describe behavior.
  */
 
 import { Command } from 'commander';
-import { join } from 'node:path';
+import { sanitizeForTerminal as safe } from '../../utils/misc.js';
+import { join, relative } from 'node:path';
 import { logger } from '../../utils/logger.js';
+import { resolveTrustedApiBase, resolveTrustedSslVerify } from '../../core/services/repo-config-trust.js';
+import { redirectConsoleToStderr } from '../../utils/quiet-stdout.js';
 import { fileExists, formatDuration, parseList, readJsonFile, resolveLLMProvider } from '../../utils/command-helpers.js';
 import {
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
-  SPEC_GEN_LOGS_SUBDIR,
-  SPEC_GEN_VERIFICATION_SUBDIR,
-  SPEC_GEN_OUTPUTS_SUBDIR,
-  SPEC_GEN_CONFIG_REL_PATH,
   OPENSPEC_DIR,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
+  OPENLORE_LOGS_SUBDIR,
+  OPENLORE_VERIFICATION_SUBDIR,
+  OPENLORE_OUTPUTS_SUBDIR,
+  OPENLORE_CONFIG_REL_PATH,
   OPENSPEC_SPECS_SUBDIR,
   ARTIFACT_DEPENDENCY_GRAPH,
   ARTIFACT_GENERATION_REPORT,
 } from '../../constants.js';
 import type { VerifyOptions } from '../../types/index.js';
-import { readSpecGenConfig } from '../../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../../core/services/config-manager.js';
 import { createLLMService, type LLMService } from '../../core/services/llm-service.js';
+import { isLlmLoggingEnabled } from '../../core/services/llm-logging-policy.js';
 import {
   SpecVerificationEngine,
   type VerificationReport,
@@ -31,6 +35,7 @@ import {
 } from '../../core/verifier/verification-engine.js';
 import type { DependencyGraphResult } from '../../core/analyzer/dependency-graph.js';
 import type { GenerationReport } from '../../core/generator/openspec-writer.js';
+import { resolveOpenspecDir } from '../../utils/openspec-dir.js';
 
 // ============================================================================
 // TYPES
@@ -50,7 +55,8 @@ interface ExtendedVerifyOptions extends VerifyOptions {
  * Format score as bar
  */
 function formatScoreBar(score: number, width: number = 10): string {
-  const filled = Math.round(score * width);
+  const boundedScore = Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 0;
+  const filled = Math.round(boundedScore * width);
   const empty = width - filled;
   return '■'.repeat(filled) + '□'.repeat(empty);
 }
@@ -84,7 +90,7 @@ async function loadDependencyGraph(analysisPath: string): Promise<DependencyGrap
 async function loadGenerationReport(rootPath: string): Promise<GenerationReport | null> {
   try {
     return await readJsonFile<GenerationReport>(
-      join(rootPath, SPEC_GEN_DIR, SPEC_GEN_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
+      join(rootPath, OPENLORE_DIR, OPENLORE_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
       ARTIFACT_GENERATION_REPORT,
     );
   } catch {
@@ -95,7 +101,7 @@ async function loadGenerationReport(rootPath: string): Promise<GenerationReport 
 /**
  * Display individual verification result
  */
-function displayResult(
+export function displayResult(
   result: VerificationResult,
   index: number,
   total: number,
@@ -104,36 +110,58 @@ function displayResult(
 ): void {
   const status = getStatusEmoji(result.overallScore, threshold);
   console.log('');
-  console.log(`   [${index}/${total}] ${result.filePath}`);
+  console.log(`   [${index}/${total}] ${safe(result.filePath)}`);
 
   // Purpose match
   const purposeStatus = result.purposeMatch.similarity >= 0.5 ? '✓' : '⚠';
-  console.log(`         Purpose: ${purposeStatus} ${result.purposeMatch.similarity >= 0.5 ? 'Correctly identified' : 'Partially matched'}`);
+  const purposeEvidence = result.purposeMatch.provenance?.source === 'llm-judged'
+    ? `LLM-judged by ${safe(result.purposeMatch.provenance.model)}`
+    : result.purposeMatch.provenance?.source === 'keyword-fallback'
+      ? 'deterministic keyword fallback'
+      : 'provenance unavailable';
+  console.log(`         Purpose: ${purposeStatus} ${result.purposeMatch.similarity >= 0.5 ? 'Correctly identified' : 'Partially matched'} (${purposeEvidence})`);
 
   // Import match
   const importPercent = (result.importMatch.f1Score * 100).toFixed(0);
-  console.log(`         Imports: ${result.importMatch.predicted.length}/${result.importMatch.actual.length} predicted (${importPercent}%)`);
+  const importEvidence = result.importMatch.provenance?.source === 'deterministic'
+    ? 'deterministic'
+    : 'provenance unavailable';
+  console.log(`         Imports: ${result.importMatch.predicted.length}/${result.importMatch.actual.length} covered (${importPercent}%; ${importEvidence})`);
 
   // Export match
   const exportPercent = (result.exportMatch.f1Score * 100).toFixed(0);
-  console.log(`         Exports: ${result.exportMatch.predicted.length}/${result.exportMatch.actual.length} predicted (${exportPercent}%)`);
+  const exportEvidence = result.exportMatch.provenance?.source === 'llm-prediction-compared-deterministically'
+    ? `deterministic comparison over ${safe(result.exportMatch.provenance.model)} prediction`
+    : 'provenance unavailable';
+  console.log(`         Exports: ${result.exportMatch.predicted.length}/${result.exportMatch.actual.length} predicted (${exportPercent}%; ${exportEvidence})`);
 
   // Requirement coverage
-  if (result.requirementCoverage.relatedRequirements.length > 0) {
+  if (result.requirementCoverage.evidence === 'llm-score') {
+    const model = result.requirementCoverage.provenance?.source === 'llm-judged'
+      ? ` by ${safe(result.requirementCoverage.provenance.model)}`
+      : ' (model provenance unavailable)';
+    console.log(`         Requirements: ${(result.requirementCoverage.coverage * 100).toFixed(0)}% coverage (LLM-judged${model}; no per-requirement claims)`);
+  } else if (result.requirementCoverage.relatedRequirements.length > 0) {
     const reqMatches = result.requirementCoverage.actuallyImplements.join(', ') || 'None';
-    console.log(`         Requirements: ${reqMatches}`);
+    const evidence = result.requirementCoverage.provenance?.source === 'keyword-fallback'
+      ? 'deterministic keyword fallback'
+      : 'provenance unavailable';
+    console.log(`         Requirements: ${safe(reqMatches)} (${evidence})`);
   } else {
     console.log(`         Requirements: Not in specs`);
   }
 
   // Overall score
-  console.log(`         Score: ${(result.overallScore).toFixed(2)} ${status}`);
+  const scoreBasis = result.scoreComposition
+    ? 'weighted mixed-evidence composite: purpose 50%, requirements 35%, imports 5%, exports 10%'
+    : 'provenance unavailable';
+  console.log(`         Composite score: ${(result.overallScore).toFixed(2)} ${status} (${scoreBasis})`);
 
   // Verbose output
   if (verbose && result.feedback.length > 0) {
     console.log('         Feedback:');
     for (const fb of result.feedback) {
-      console.log(`           - ${fb}`);
+      console.log(`           - ${safe(fb)}`);
     }
   }
 }
@@ -141,7 +169,7 @@ function displayResult(
 /**
  * Display verification summary
  */
-function displaySummary(report: VerificationReport, _threshold: number): void {
+export function displaySummary(report: VerificationReport, _threshold: number): void {
   console.log('');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('');
@@ -153,20 +181,36 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
     ? ((report.passedFiles / report.sampledFiles) * 100).toFixed(0)
     : '0';
 
-  console.log(`   Overall Confidence: ${confidencePercent}%`);
-  console.log(`   Passed: ${report.passedFiles}/${report.sampledFiles} files (${passedPercent}%)`);
+  const confidenceBasis = report.overallConfidenceBasis
+    ? 'mean of weighted mixed-evidence file composites'
+    : 'provenance unavailable';
+  console.log(`   Overall Composite Confidence: ${confidencePercent}% (${confidenceBasis})`);
+  console.log(`   Attempted: ${report.attemptedFiles} files`);
+  console.log(`   Verified successfully: ${report.sampledFiles} files`);
+  console.log(`   Failed verification: ${report.failedFiles} files`);
+  console.log(`   Passed among successful verifications: ${report.passedFiles}/${report.sampledFiles} files (${passedPercent}%)`);
+  if (report.recommendationQualification) {
+    console.log(`   Qualification: ${safe(report.recommendationQualification)}`);
+  }
+  if (report.failures.length > 0) {
+    console.log('   Verification failures:');
+    for (const failure of report.failures) {
+      console.log(`   - ${safe(failure.filePath)}: ${safe(failure.reason)}`);
+    }
+  }
   console.log('');
 
   // Domain accuracy
   if (report.domainBreakdown.length > 0) {
-    console.log('   Domain Accuracy:');
+    console.log('   Domain Composite Scores:');
     for (let i = 0; i < report.domainBreakdown.length; i++) {
       const domain = report.domainBreakdown[i];
       const scorePercent = (domain.averageScore * 100).toFixed(0);
       const bar = formatScoreBar(domain.averageScore);
       const prefix = i === report.domainBreakdown.length - 1 ? '└─' : '├─';
-      const paddedName = `${domain.domain}/spec.md:`.padEnd(20);
-      console.log(`   ${prefix} ${paddedName} ${scorePercent}% ${bar}`);
+      const paddedName = `${safe(domain.domain)}/spec.md:`.padEnd(20);
+      const basis = domain.averageScoreBasis ?? 'provenance unavailable';
+      console.log(`   ${prefix} ${paddedName} ${scorePercent}% ${bar} (${basis})`);
     }
     console.log('');
   }
@@ -175,7 +219,7 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
   if (report.commonGaps.length > 0) {
     console.log('⚠️ Identified Gaps:');
     for (let i = 0; i < report.commonGaps.length; i++) {
-      console.log(`   ${i + 1}. ${report.commonGaps[i]}`);
+      console.log(`   ${i + 1}. ${safe(report.commonGaps[i])}`);
     }
     console.log('');
   }
@@ -183,8 +227,8 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
   // Suggested improvements
   if (report.suggestedImprovements.length > 0) {
     for (const improvement of report.suggestedImprovements) {
-      console.log(`   ${improvement.domain}: ${improvement.issue}`);
-      console.log(`      → ${improvement.suggestion}`);
+      console.log(`   ${safe(improvement.domain)}: ${safe(improvement.issue)}`);
+      console.log(`      → ${safe(improvement.suggestion)}`);
     }
     console.log('');
   }
@@ -192,9 +236,13 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
   // Recommendation
   let recommendationIcon = '✅';
   let recommendationText = 'READY';
-  let recommendationDetail = 'Specifications accurately describe the codebase.';
+  let recommendationDetail = 'The weighted mixed-evidence composite meets the configured readiness threshold.';
 
-  if (report.recommendation === 'needs-review') {
+  if (report.failedFiles > 0) {
+    recommendationIcon = '⚠️';
+    recommendationText = report.recommendation === 'regenerate' ? 'INCOMPLETE' : 'NEEDS REVIEW';
+    recommendationDetail = 'Verification was incomplete; review the failed files before relying on this result.';
+  } else if (report.recommendation === 'needs-review') {
     recommendationIcon = '⚠️';
     recommendationText = 'NEEDS REVIEW';
     recommendationDetail = 'The specs cover core functionality but may miss some areas.';
@@ -206,8 +254,9 @@ function displaySummary(report: VerificationReport, _threshold: number): void {
 
   console.log(`📝 Recommendation: ${recommendationIcon} ${recommendationText}`);
   console.log(`   ${recommendationDetail}`);
+  console.log(`   Basis: ${report.recommendationBasis ?? 'provenance unavailable'}`);
   console.log('');
-  console.log(`   Full report: ${SPEC_GEN_DIR}/${SPEC_GEN_VERIFICATION_SUBDIR}/REPORT.md`);
+  console.log(`   Full report: ${OPENLORE_DIR}/${OPENLORE_VERIFICATION_SUBDIR}/REPORT.md`);
   console.log('');
 }
 
@@ -251,13 +300,13 @@ export const verifyCommand = new Command('verify')
     'after',
     `
 Examples:
-  $ spec-gen verify                  Verify with defaults (5 samples, 0.7 threshold)
-  $ spec-gen verify --samples 10     Sample more files for higher confidence
-  $ spec-gen verify --threshold 0.8  Require higher accuracy
-  $ spec-gen verify --verbose        Show detailed comparisons
-  $ spec-gen verify --domains user,order
+  $ openlore verify                  Verify with defaults (5 samples, 0.7 threshold)
+  $ openlore verify --samples 10     Sample more files for higher confidence
+  $ openlore verify --threshold 0.8  Require higher accuracy
+  $ openlore verify --verbose        Show detailed comparisons
+  $ openlore verify --domains user,order
                                      Only verify specific domains
-  $ spec-gen verify --json           Output JSON for automation
+  $ openlore verify --json           Output JSON for automation
 
 Verification process:
   1. Loads generated specs from openspec/specs/
@@ -284,7 +333,7 @@ A score >= threshold indicates specs are production-ready.
 
     const opts: ExtendedVerifyOptions = {
       samples: typeof options.samples === 'string'
-        ? parseInt(options.samples, 10)
+        ? Number(options.samples)
         : options.samples ?? 5,
       threshold: typeof options.threshold === 'string'
         ? parseFloat(options.threshold)
@@ -295,10 +344,10 @@ A score >= threshold indicates specs are production-ready.
       json: options.json ?? false,
       quiet: false,
       noColor: false,
-      config: SPEC_GEN_CONFIG_REL_PATH,
+      config: OPENLORE_CONFIG_REL_PATH,
     };
 
-    if (isNaN(opts.samples) || opts.samples < 1) {
+    if (!Number.isInteger(opts.samples) || opts.samples < 1) {
       logger.error('--samples must be a positive integer');
       process.exitCode = 1;
       return;
@@ -311,6 +360,11 @@ A score >= threshold indicates specs are production-ready.
       return;
     }
 
+    // --json: keep stdout pure. Pipeline stages log progress ("[analyze]",
+    // "[scan]") to stdout via the logger; redirect those to stderr so the only
+    // thing on stdout is the report JSON the host parses.
+    const restoreStdout = opts.json ? redirectConsoleToStderr() : null;
+
     try {
       // ========================================================================
       // PHASE 1: VALIDATION
@@ -319,27 +373,27 @@ A score >= threshold indicates specs are production-ready.
         logger.section('Verifying Specifications');
       }
 
-      // Load spec-gen config
-      const specGenConfig = await readSpecGenConfig(rootPath);
-      if (!specGenConfig) {
-        logger.error('No spec-gen configuration found. Run "spec-gen init" first.');
+      // Load openlore config
+      const openloreConfig = await readOpenLoreConfig(rootPath);
+      if (!openloreConfig) {
+        logger.error('No openlore configuration found. Run "openlore init" first.');
         process.exitCode = 1;
         return;
       }
 
       // Determine openspec path
-      const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+      const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
       const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
 
       // Check if specs exist
       if (!(await fileExists(specsPath))) {
-        logger.error('No specs found. Run "spec-gen generate" first.');
+        logger.error('No specs found. Run "openlore generate" first.');
         process.exitCode = 1;
         return;
       }
 
       if (!opts.json) {
-        logger.discovery(`Loading generated specs from ${specGenConfig.openspecPath}/specs/`);
+        logger.discovery(`Loading generated specs from ${relative(rootPath, openspecPath) || OPENSPEC_DIR}/specs/`);
       }
 
       // Load generation report to get context files
@@ -347,11 +401,11 @@ A score >= threshold indicates specs are production-ready.
       const generationContext = generationReport?.filesWritten ?? [];
 
       // Load dependency graph
-      const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+      const analysisPath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
       const depGraph = await loadDependencyGraph(analysisPath);
 
       if (!depGraph) {
-        logger.error('No analysis found. Run "spec-gen analyze" first.');
+        logger.error('No analysis found. Run "openlore analyze" first.');
         process.exitCode = 1;
         return;
       }
@@ -364,7 +418,7 @@ A score >= threshold indicates specs are production-ready.
       // ========================================================================
       // PHASE 2: CHECK LLM API
       // ========================================================================
-      const resolved = resolveLLMProvider(specGenConfig);
+      const resolved = resolveLLMProvider(openloreConfig);
       if (!resolved) {
         logger.error('No LLM API key found.');
         logger.discovery('Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY + OPENAI_COMPAT_BASE_URL.');
@@ -376,13 +430,14 @@ A score >= threshold indicates specs are production-ready.
       try {
         llm = createLLMService({
           provider: resolved.provider,
-          model: specGenConfig.generation?.model,
+          model: openloreConfig.generation?.model,
           openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
-          apiBase: globalOpts.apiBase ?? specGenConfig.llm?.apiBase,
-          sslVerify: globalOpts.insecure != null ? !globalOpts.insecure : specGenConfig.llm?.sslVerify ?? true,
-          timeout: globalOpts.timeout ?? specGenConfig.generation?.timeout,
-          enableLogging: true,
-          logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
+          apiBase: resolveTrustedApiBase(globalOpts.apiBase, openloreConfig?.llm?.apiBase),
+          sslVerify: resolveTrustedSslVerify(globalOpts.insecure, openloreConfig?.llm?.sslVerify),
+          timeout: globalOpts.timeout ?? openloreConfig.generation?.timeout,
+          enableLogging: isLlmLoggingEnabled(),
+          logDir: join(rootPath, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR),
+          logRoot: rootPath,
         });
       } catch (error) {
         logger.error(`Failed to create LLM service: ${(error as Error).message}`);
@@ -393,13 +448,13 @@ A score >= threshold indicates specs are production-ready.
       // ========================================================================
       // PHASE 3: RUN VERIFICATION
       // ========================================================================
-      const verificationDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_VERIFICATION_SUBDIR);
+      const verificationDir = join(rootPath, OPENLORE_DIR, OPENLORE_VERIFICATION_SUBDIR);
 
       const engine = new SpecVerificationEngine(llm, {
         rootPath,
         openspecPath,
         outputDir: verificationDir,
-        filesPerDomain: Math.ceil(opts.samples / 4), // Distribute across domains
+        filesPerDomain: opts.samples,
         passThreshold: opts.threshold,
         generationContext,
       });
@@ -410,17 +465,14 @@ A score >= threshold indicates specs are production-ready.
       }
 
       // Get candidates first to show selection
-      const candidates = engine.selectCandidates(depGraph);
+      const selectedCandidates = await engine.prepareCandidates(depGraph, opts.samples);
 
-      if (candidates.length === 0) {
+      if (selectedCandidates.length === 0) {
         logger.error('No suitable verification candidates found.');
         logger.discovery('Try running with a lower --samples value or check that analysis includes non-test files.');
         process.exitCode = 1;
         return;
       }
-
-      // Limit to requested sample size
-      const selectedCandidates = candidates.slice(0, opts.samples);
 
       if (!opts.json) {
         logger.discovery(`Files selected for verification:`);
@@ -436,7 +488,7 @@ A score >= threshold indicates specs are production-ready.
       // Run verification
       let report: VerificationReport;
       try {
-        report = await engine.verify(depGraph, specGenConfig.version);
+        report = await engine.verify(depGraph, openloreConfig.version, selectedCandidates);
       } catch (error) {
         logger.error(`Verification failed: ${(error as Error).message}`);
         process.exitCode = 1;
@@ -447,8 +499,9 @@ A score >= threshold indicates specs are production-ready.
       // PHASE 4: DISPLAY RESULTS
       // ========================================================================
       if (opts.json) {
-        // JSON-only output
-        console.log(JSON.stringify(report, null, 2));
+        // JSON-only output, written straight to stdout (bypasses the redirected
+        // console.log) so it is the sole thing on the stream.
+        process.stdout.write(JSON.stringify(report, null, 2) + '\n');
       } else {
         // Display individual results
         for (let i = 0; i < report.results.length; i++) {
@@ -463,14 +516,16 @@ A score >= threshold indicates specs are production-ready.
         logger.info('Total time', formatDuration(duration));
         logger.blank();
 
-        // Exit status based on recommendation
-        if (report.recommendation === 'regenerate') {
-          process.exitCode = 1;
-        } else if (report.recommendation === 'needs-review') {
-          process.exitCode = 0; // Warning but not failure
-        } else {
+        if (report.recommendation !== 'regenerate' && report.recommendation !== 'needs-review') {
           logger.success('Verification passed!');
         }
+      }
+
+      // Exit status based on recommendation — applied for BOTH json and text output
+      // so `verify --json` is usable as a CI gate (it previously always exited 0).
+      // 'needs-review' is a warning, not a failure (exit 0).
+      if (report.recommendation === 'regenerate') {
+        process.exitCode = 1;
       }
 
       // Save LLM logs
@@ -486,5 +541,7 @@ A score >= threshold indicates specs are production-ready.
         console.error(error);
       }
       process.exitCode = 1;
+    } finally {
+      restoreStdout?.();
     }
   });

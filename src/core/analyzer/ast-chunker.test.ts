@@ -2,8 +2,9 @@
  * Tests for ast-chunker — blankLineChunk and astChunkContent
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { blankLineChunk, astChunkContent } from './ast-chunker.js';
+import { PARSE_BUDGET_ENV } from '../../constants.js';
 
 // ── blankLineChunk ────────────────────────────────────────────────────────────
 
@@ -112,6 +113,36 @@ describe('astChunkContent', () => {
       // Non-first chunks should contain some import from the header
       expect(chunks[1]).toMatch(/^import /m);
     }
+  });
+
+  it('keeps TSX declarations intact instead of chunking parser-error fragments', async () => {
+    const content = [
+      "import React from 'react';",
+      'export const A = () => <section>{items.map(x => <span>{x}</span>)}</section>;',
+      'export const B = () => <main/>;',
+    ].join('\n');
+
+    const chunks = await astChunkContent(content, 'src/View.tsx', 80);
+
+    expect(chunks).toEqual([
+      "import React from 'react';",
+      "import React from 'react';\n\nexport const A = () => <section>{items.map(x => <span>{x}</span>)}</section>;",
+      "import React from 'react';\n\nexport const B = () => <main/>;",
+    ]);
+  });
+
+  // Regression for change: fix-language-detection-single-source. The `.mts`/`.cts`/`.jsx`
+  // extension variants were absent from the (now-deleted) code-shaper detection map that fed
+  // this chunker, so they resolved to 'unknown' → generic blank-line fallback. With the single
+  // canonical detector they resolve to TypeScript/JavaScript and take the AST path — the tell
+  // is the import-block header prepended to non-first chunks (generic chunking never does that).
+  it.each([
+    ['src/utils.mts', /^import /m],
+    ['src/utils.cts', /^import /m],
+  ])('formerly-missed %s now takes the AST path (header on non-first chunks)', async (path, headerRe) => {
+    const chunks = await astChunkContent(TS_CONTENT_LARGE, path, 200);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks[1]).toMatch(headerRe);
   });
 
   it('falls back to blank-line chunking for unsupported file types', async () => {
@@ -240,4 +271,45 @@ end
     const joined = chunks.join('\n');
     expect(joined).toContain('def one');
   });
+});
+
+// ── per-file parse budget (change: fix-analyze-native-abort-and-file-cost-budget) ─────────────
+
+describe('astChunkContent under the per-file parse budget', () => {
+  /** The payload that reproduced the abort: a 300 KB unterminated block comment. */
+  const HOSTILE_TS = '/*x'.repeat(100_000);
+
+  afterEach(() => { delete process.env[PARSE_BUDGET_ENV]; });
+
+  it('falls back to blank-line chunking when the parse hits the budget, instead of throwing', async () => {
+    // This chunker only parses content ALREADY over the chunk size, so it is exactly where a
+    // pathological file shows up — and it runs at TOOL time, where an unbounded parse would wedge
+    // the daemon rather than one build. On the budget it must degrade to the grammar-free chunker,
+    // which is a worse chunking, never a failed call.
+    process.env[PARSE_BUDGET_ENV] = '300';
+    const started = Date.now();
+    const chunks = await astChunkContent(HOSTILE_TS, 'src/hostile.ts', 50_000);
+    const elapsed = Date.now() - started;
+
+    // Exactly the grammar-free fallback. NOTE: this alone does not prove the budget ran — measured
+    // against a deliberately unbounded build, the fallback is reached either way (the pathological
+    // tree yields no usable top-level nodes). It pins the OUTPUT shape.
+    expect(chunks).toEqual(blankLineChunk(HOSTILE_TS, 50_000, 10));
+    // THIS is the assertion that pins the bound: unbounded, the same call measured 85.7 s.
+    expect(elapsed).toBeLessThan(20_000);
+  }, 60_000);
+
+  it('CONTROL: ordinary content is still chunked by the grammar, unaffected by the budget', async () => {
+    // A bound that quietly demoted every file to blank-line chunking would be a silent quality
+    // regression with no symptom.
+    const content = Array.from(
+      { length: 400 },
+      (_, i) => `export function fn${i}(): number {\n  return ${i};\n}\n`,
+    ).join('\n');
+    const withBudget = await astChunkContent(content, 'src/ok.ts', 2_000);
+    process.env[PARSE_BUDGET_ENV] = '0';
+    const withoutBudget = await astChunkContent(content, 'src/ok.ts', 2_000);
+    expect(withBudget).toEqual(withoutBudget);
+    expect(withBudget.length).toBeGreaterThan(1);
+  }, 60_000);
 });

@@ -15,6 +15,12 @@ import {
 } from '../constants.js';
 import { lookupPricing } from '../core/services/llm-service.js';
 import type { LLMContext } from '../core/analyzer/artifact-generator.js';
+import {
+  resolveGenerationProvider,
+  type ProviderName,
+} from '../core/runtime/llm-provider-resolution.js';
+
+export type { ProviderName };
 
 /**
  * Check whether a file or directory exists at the given path.
@@ -63,41 +69,19 @@ export function parseList(value: string): string[] {
   return value.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-export type ProviderName = 'anthropic' | 'openai' | 'openai-compat' | 'gemini' | 'claude-code' | 'mistral-vibe' | 'copilot' | 'gemini-cli' | 'cursor-agent';
-
 /**
  * Resolve the LLM provider and base URL from environment variables.
  * Returns null when no key is found, allowing callers to handle the error their own way.
  *
  * Priority: ANTHROPIC_API_KEY > GEMINI_API_KEY > OPENAI_COMPAT_API_KEY > OPENAI_API_KEY
  */
-export function resolveLLMProvider(specGenConfig?: {
-  generation?: { provider?: string; openaiCompatBaseUrl?: string };
+export function resolveLLMProvider(openloreConfig?: {
+  generation?: { provider?: string; model?: string; openaiCompatBaseUrl?: string };
 }): { provider: ProviderName; openaiCompatBaseUrl?: string } | null {
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  const geminiKey = process.env.GEMINI_API_KEY;
-  const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
-  const openaiKey = process.env.OPENAI_API_KEY;
-
-  const configProvider = specGenConfig?.generation?.provider as ProviderName | undefined;
-
-  // These providers don't need an API key
-  if (configProvider === 'claude-code' || configProvider === 'mistral-vibe' || configProvider === 'copilot' || configProvider === 'gemini-cli' || configProvider === 'cursor-agent') {
-    return { provider: configProvider };
-  }
-
-  if (!anthropicKey && !geminiKey && !openaiCompatKey && !openaiKey) return null;
-
-  const envProvider: ProviderName = anthropicKey ? 'anthropic'
-    : geminiKey ? 'gemini'
-    : openaiCompatKey ? 'openai-compat'
-    : 'openai';
-
-  const provider = configProvider ?? envProvider;
-  const openaiCompatBaseUrl = process.env.OPENAI_COMPAT_BASE_URL
-    ?? specGenConfig?.generation?.openaiCompatBaseUrl;
-
-  return { provider, openaiCompatBaseUrl };
+  const resolved = resolveGenerationProvider(openloreConfig);
+  return resolved
+    ? { provider: resolved.provider, openaiCompatBaseUrl: resolved.openaiCompatBaseUrl }
+    : null;
 }
 
 /**
@@ -119,7 +103,7 @@ export async function readJsonFile<T>(filePath: string, label: string): Promise<
   try {
     return JSON.parse(raw) as T;
   } catch {
-    throw new Error(`Failed to parse ${label} — the file may be corrupted. Re-run spec-gen analyze to regenerate.`);
+    throw new Error(`Failed to parse ${label} — the file may be corrupted. Re-run openlore analyze to regenerate.`);
   }
 }
 

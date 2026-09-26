@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { inferTypesFromSource } from './type-inference-engine.js';
+import { inferReceiverTypeAt, inferTypesFromSource } from './type-inference-engine.js';
 
 describe('Python', () => {
   it('direct instantiation', () =>
@@ -58,11 +58,74 @@ describe('Java', () => {
     expect(inferTypesFromSource('MyService svc = new MyService();', 'Java').get('svc')).toBe('MyService'));
   it('interface var = new ConcreteClass — prefers concrete', () =>
     expect(inferTypesFromSource('IService svc = new MyService();', 'Java').get('svc')).toBe('MyService'));
+  it('var x = new T() — Java 10+ local-variable type inference', () =>
+    expect(inferTypesFromSource('var svc = new MyService();', 'Java').get('svc')).toBe('MyService'));
+});
+
+describe('C#', () => {
+  it('explicit declaration', () =>
+    expect(inferTypesFromSource('MyService svc = new MyService();', 'C#').get('svc')).toBe('MyService'));
+  it('interface var = new ConcreteClass — prefers concrete', () =>
+    expect(inferTypesFromSource('IService svc = new MyService();', 'C#').get('svc')).toBe('MyService'));
+  it('var x = new T() — implicitly-typed local', () =>
+    expect(inferTypesFromSource('var svc = new MyService();', 'C#').get('svc')).toBe('MyService'));
 });
 
 describe('Ruby', () => {
   it('.new call', () =>
     expect(inferTypesFromSource('svc = MyService.new', 'Ruby').get('svc')).toBe('MyService'));
+});
+
+describe('Kotlin', () => {
+  it('explicit local annotation', () =>
+    expect(inferTypesFromSource('val svc: MyService = provide()', 'Kotlin').get('svc')).toBe('MyService'));
+  it('constructor assignment', () =>
+    expect(inferTypesFromSource('val svc = MyService()', 'Kotlin').get('svc')).toBe('MyService'));
+  it('constructor assignment prefers the concrete type', () =>
+    expect(inferTypesFromSource('val svc: IService = MyService()', 'Kotlin').get('svc')).toBe('MyService'));
+  it('ignores declarations in strings and nested comments', () => {
+    const source = `val svc = RealService()\n"val svc = StringService()"\n/* outer /* val svc = NestedService() */ val svc = CommentService() */`;
+    expect(inferTypesFromSource(source, 'Kotlin').get('svc')).toBe('RealService');
+  });
+  it('refuses a receiver name declared at multiple lexical sites', () => {
+    const source = 'val p = A()\nrun { val p = B() }';
+    expect(inferTypesFromSource(source, 'Kotlin').has('p')).toBe(false);
+  });
+});
+
+describe('Dart', () => {
+  it('explicit final local annotation', () =>
+    expect(inferTypesFromSource('final MyService svc = provide();', 'Dart').get('svc')).toBe('MyService'));
+  it('inferred final constructor assignment', () =>
+    expect(inferTypesFromSource('final svc = MyService();', 'Dart').get('svc')).toBe('MyService'));
+  it('constructor assignment prefers the concrete type', () =>
+    expect(inferTypesFromSource('final IService svc = MyService();', 'Dart').get('svc')).toBe('MyService'));
+  it('ignores declarations in strings and comments', () => {
+    const source = `final svc = RealService();\n'final svc = StringService();'\n// final svc = LineService();\n/* final svc = BlockService(); */`;
+    expect(inferTypesFromSource(source, 'Dart').get('svc')).toBe('RealService');
+  });
+  it('refuses a receiver name declared at multiple lexical sites', () => {
+    const source = 'final p = A();\n{ final p = B(); }';
+    expect(inferTypesFromSource(source, 'Dart').has('p')).toBe(false);
+  });
+});
+
+describe('point-sensitive Kotlin/Dart receiver inference', () => {
+  for (const language of ['Kotlin', 'Dart']) {
+    const declaration = language === 'Kotlin' ? 'val p = Parser()' : 'final p = Parser();';
+    it(`${language} does not use a declaration after the call`, () => {
+      const source = `p.run(); ${declaration}`;
+      expect(inferReceiverTypeAt(source, language, 'p', source.indexOf('p.run'))).toBeUndefined();
+    });
+    it(`${language} does not leak a nested binding after its block`, () => {
+      const source = `{ ${declaration} } p.run();`;
+      expect(inferReceiverTypeAt(source, language, 'p', source.indexOf('p.run'))).toBeUndefined();
+    });
+    it(`${language} refuses a receiver after reassignment`, () => {
+      const source = `${declaration} p = Other(); p.run();`;
+      expect(inferReceiverTypeAt(source, language, 'p', source.indexOf('p.run'))).toBeUndefined();
+    });
+  }
 });
 
 describe('unknown language', () => {

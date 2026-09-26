@@ -9,27 +9,55 @@
  * so the LLM always has module-level context.
  */
 
-import Parser from 'tree-sitter';
-import { detectLanguage } from './code-shaper.js';
+import type Parser from 'tree-sitter';
+import { detectLanguage, usesTsxGrammar } from './language-detection.js';
+import { parseWithBudget, type BudgetableParser } from './parse-budget.js';
 
 // ── Lazy parser singletons (one per language, created on first use) ─────────
 
 let _tsParser: Parser | undefined;
+let _tsxParser: Parser | undefined;
 let _pyParser: Parser | undefined;
 let _goParser: Parser | undefined;
 let _rustParser: Parser | undefined;
 let _rubyParser: Parser | undefined;
 let _javaParser: Parser | undefined;
 
-async function getParserForLanguage(lang: string): Promise<Parser | null> {
+// null = tried and unavailable; undefined = not yet tried
+let _NativeParser: (typeof Parser) | null | undefined;
+
+async function loadNativeParser(): Promise<typeof Parser | null> {
+  if (_NativeParser === undefined) {
+    try {
+      _NativeParser = ((await import('tree-sitter')).default) as typeof Parser;
+    } catch {
+      _NativeParser = null;
+    }
+  }
+  return _NativeParser;
+}
+
+async function getParserForLanguage(lang: string, filePath?: string): Promise<Parser | null> {
   try {
+    const NP = await loadNativeParser();
+    if (!NP) return null;
     switch (lang.toLowerCase()) {
       case 'typescript':
       case 'javascript': {
+        if (usesTsxGrammar(filePath)) {
+          if (!_tsxParser) {
+            const m = await import('tree-sitter-typescript');
+            _tsxParser = new NP();
+            _tsxParser.setLanguage(
+              ((m.default ?? m) as { tsx: object }).tsx as Parser.Language
+            );
+          }
+          return _tsxParser!;
+        }
         if (!_tsParser) {
           const m = await import('tree-sitter-typescript');
-          _tsParser = new Parser();
-          (_tsParser as Parser).setLanguage(
+          _tsParser = new NP();
+          _tsParser.setLanguage(
             ((m.default ?? m) as { typescript: object }).typescript as Parser.Language
           );
         }
@@ -38,40 +66,40 @@ async function getParserForLanguage(lang: string): Promise<Parser | null> {
       case 'python': {
         if (!_pyParser) {
           const m = await import('tree-sitter-python');
-          _pyParser = new Parser();
-          (_pyParser as Parser).setLanguage((m.default ?? m) as Parser.Language);
+          _pyParser = new NP();
+          _pyParser.setLanguage((m.default ?? m) as Parser.Language);
         }
         return _pyParser!;
       }
       case 'go': {
         if (!_goParser) {
           const m = await import('tree-sitter-go');
-          _goParser = new Parser();
-          (_goParser as Parser).setLanguage((m.default ?? m) as Parser.Language);
+          _goParser = new NP();
+          _goParser.setLanguage((m.default ?? m) as Parser.Language);
         }
         return _goParser!;
       }
       case 'rust': {
         if (!_rustParser) {
           const m = await import('tree-sitter-rust');
-          _rustParser = new Parser();
-          (_rustParser as Parser).setLanguage((m.default ?? m) as Parser.Language);
+          _rustParser = new NP();
+          _rustParser.setLanguage((m.default ?? m) as Parser.Language);
         }
         return _rustParser!;
       }
       case 'ruby': {
         if (!_rubyParser) {
           const m = await import('tree-sitter-ruby');
-          _rubyParser = new Parser();
-          (_rubyParser as Parser).setLanguage((m.default ?? m) as Parser.Language);
+          _rubyParser = new NP();
+          _rubyParser.setLanguage((m.default ?? m) as Parser.Language);
         }
         return _rubyParser!;
       }
       case 'java': {
         if (!_javaParser) {
           const m = await import('tree-sitter-java');
-          _javaParser = new Parser();
-          (_javaParser as Parser).setLanguage((m.default ?? m) as Parser.Language);
+          _javaParser = new NP();
+          _javaParser.setLanguage((m.default ?? m) as Parser.Language);
         }
         return _javaParser!;
       }
@@ -160,12 +188,16 @@ export async function astChunkContent(
   if (content.length <= maxChars) return [content];
 
   const language = detectLanguage(filePath);
-  const parser = await getParserForLanguage(language);
+  const parser = await getParserForLanguage(language, filePath);
   if (!parser) return blankLineChunk(content, maxChars, overlapLines);
 
   let tree: Parser.Tree;
   try {
-    tree = parser.parse(content);
+    // Bounded like every other parse (change: fix-analyze-native-abort-and-file-cost-budget). This
+    // one only runs on content ALREADY over the chunk size, so it is exactly where a pathological
+    // file shows up; on the budget it falls through to the blank-line chunker below, which needs
+    // no grammar. Degraded chunking, never a stalled run.
+    tree = parseWithBudget(parser as unknown as BudgetableParser<Parser.Tree>, content);
   } catch {
     return blankLineChunk(content, maxChars, overlapLines);
   }

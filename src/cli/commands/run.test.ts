@@ -1,9 +1,15 @@
 /**
- * Tests for spec-gen run command (full pipeline)
+ * Tests for openlore run command (full pipeline)
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runCommand } from './run.js';
+import { openloreRun } from '../../api/run.js';
+import { confirm } from '@inquirer/prompts';
+import { confirmRunGeneration } from './run.js';
+
+vi.mock('../../api/run.js', () => ({ openloreRun: vi.fn() }));
+vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
 
 vi.mock('../../utils/logger.js', () => ({
   logger: {
@@ -25,7 +31,7 @@ describe('run command', () => {
   describe('command configuration', () => {
     it('should have correct name and description', () => {
       expect(runCommand.name()).toBe('run');
-      expect(runCommand.description()).toContain('full spec-gen pipeline');
+      expect(runCommand.description()).toContain('full openlore pipeline');
     });
 
     it('should have --force option', () => {
@@ -43,7 +49,7 @@ describe('run command', () => {
     it('should have --model option with default', () => {
       const modelOption = runCommand.options.find(o => o.long === '--model');
       expect(modelOption).toBeDefined();
-      expect(modelOption?.defaultValue).toBe('claude-sonnet-4-20250514');
+      expect(modelOption?.defaultValue).toBe('claude-sonnet-4-6');
     });
 
     it('should have --dry-run option', () => {
@@ -308,7 +314,7 @@ describe('run command', () => {
 
     it('should include version in banner', () => {
       const version = '1.0.0';
-      const banner = `  spec-gen v${version}`;
+      const banner = `  openlore v${version}`;
       expect(banner).toContain('v1.0.0');
     });
   });
@@ -348,6 +354,55 @@ describe('run command', () => {
       await runCommand.parseAsync(['--max-files', 'abc'], { from: 'user' });
       expect(logger.error).toHaveBeenCalledWith('--max-files must be a positive integer');
       expect(process.exitCode).toBe(1);
+    });
+  });
+
+  describe('shared pipeline delegation', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      process.exitCode = undefined;
+      vi.mocked(openloreRun).mockResolvedValue({
+        dryRun: false,
+        init: {} as never,
+        analysis: {} as never,
+        generation: { dryRun: false, report: { filesWritten: [] } as never, pipelineResult: {} as never, duration: 0 },
+        duration: 1,
+      });
+    });
+
+    it('delegates force, analysis, generation, and transport options to the shared run API', async () => {
+      await runCommand.parseAsync([
+        '--force', '--reanalyze', '--model', 'configured-model', '--max-files', '42', '--adr',
+      ], { from: 'user' });
+
+      expect(openloreRun).toHaveBeenCalledWith(expect.objectContaining({
+        force: true,
+        reanalyze: true,
+        model: 'configured-model',
+        maxFiles: 42,
+        adr: true,
+        quiet: false,
+        confirmGeneration: expect.any(Function),
+      }));
+    });
+  });
+
+  describe('paid generation consent', () => {
+    it('does not prompt below the shared cost threshold', async () => {
+      await expect(confirmRunGeneration({ cost: 0.01 }, false, true)).resolves.toBe(true);
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it('requires --yes for an expensive non-interactive run', async () => {
+      await expect(confirmRunGeneration({ cost: 1.25 }, false, false)).resolves.toBe(false);
+      await expect(confirmRunGeneration({ cost: 1.25 }, true, false)).resolves.toBe(true);
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it('prompts interactively with the estimated cost', async () => {
+      vi.mocked(confirm).mockResolvedValue(true);
+      await expect(confirmRunGeneration({ cost: 1.25 }, false, true)).resolves.toBe(true);
+      expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('$1.25') }));
     });
   });
 });

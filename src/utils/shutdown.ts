@@ -1,10 +1,10 @@
 /**
- * Graceful shutdown handling for spec-gen CLI
+ * Graceful shutdown handling for openlore CLI
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { SPEC_GEN_DIR, ARTIFACT_SHUTDOWN_STATE } from '../constants.js';
+import { OPENLORE_DIR, ARTIFACT_SHUTDOWN_STATE } from '../constants.js';
 
 export interface ShutdownState {
   /** Current phase when interrupted */
@@ -31,7 +31,7 @@ export class ShutdownManager {
   private handlersAttached = false;
 
   constructor(projectPath: string = process.cwd(), options?: { skipHandlers?: boolean }) {
-    this.stateFile = path.join(projectPath, SPEC_GEN_DIR, ARTIFACT_SHUTDOWN_STATE);
+    this.stateFile = path.join(projectPath, OPENLORE_DIR, ARTIFACT_SHUTDOWN_STATE);
     // Skip handlers in test environment or when explicitly disabled
     if (!options?.skipHandlers && process.env.NODE_ENV !== 'test') {
       this.setupHandlers();
@@ -203,22 +203,22 @@ export class ShutdownManager {
 
     switch (this.state.phase) {
       case 'init':
-        console.log('   Run: spec-gen init');
+        console.log('   Run: openlore init');
         break;
       case 'analyze':
-        console.log('   Run: spec-gen analyze');
+        console.log('   Run: openlore analyze');
         if (this.state.savedResults) {
           console.log(`   Partial analysis saved to: ${this.state.savedResults}`);
         }
         break;
       case 'generate':
-        console.log('   Run: spec-gen generate');
+        console.log('   Run: openlore generate');
         if (this.state.savedResults) {
           console.log(`   Partial specs saved to: ${this.state.savedResults}`);
         }
         break;
       case 'verify':
-        console.log('   Run: spec-gen verify');
+        console.log('   Run: openlore verify');
         break;
     }
 
@@ -231,6 +231,86 @@ export class ShutdownManager {
   isInProgress(): boolean {
     return this.isShuttingDown;
   }
+}
+
+// ============================================================================
+// Transport-lifetime coordinator (change: fix-process-exit-lifecycle)
+// ============================================================================
+
+/**
+ * A single idempotent teardown path for a surface whose lifetime is bound to a
+ * transport — the MCP stdio server, whose lifetime is its stdin. Distinct from
+ * {@link ShutdownManager}, which is the analyze/generate pipeline's interrupt
+ * handler (resume state, banner, exit 130). This one has no state file and no
+ * banner: a closed transport is ordinary end-of-work, so it exits 0 by default.
+ *
+ * Every way the surface can end — stdin EOF, `SIGINT`, `SIGTERM` — routes
+ * through one `shutdown()`, so no signal implements a partial teardown of its
+ * own and running it twice is harmless. Teardown is bounded: a handle that hangs
+ * on close cannot turn "exit on EOF" back into a hang, because the process
+ * exits once the grace window elapses regardless.
+ */
+export interface ShutdownCoordinator {
+  /** Register a teardown to run once, on the first shutdown. */
+  register(teardown: CleanupCallback): void;
+  /** Run every teardown once (bounded), then exit. Idempotent. */
+  shutdown(code?: number): Promise<void>;
+  /** True once shutdown has begun. */
+  readonly isShuttingDown: boolean;
+}
+
+export function createShutdownCoordinator(
+  options: {
+    /** Exit hook — defaults to process.exit; injected in tests. */
+    exit?: (code: number) => void;
+    /** Max ms to wait for teardowns before exiting anyway (default 2000). */
+    graceMs?: number;
+  } = {},
+): ShutdownCoordinator {
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  const graceMs = options.graceMs ?? 2_000;
+  const teardowns: CleanupCallback[] = [];
+  let shuttingDown = false;
+
+  return {
+    get isShuttingDown(): boolean {
+      return shuttingDown;
+    },
+    register(teardown: CleanupCallback): void {
+      if (shuttingDown) {
+        // Shutdown already snapshotted its teardowns. A late registrant — e.g. a
+        // watcher started by a tool call that was in flight when stdin EOF began
+        // the shutdown — would otherwise be silently dropped. Run it now so the
+        // "every registered teardown runs once" contract holds even when `exit`
+        // is injected (tests) or non-terminating. Errors swallowed, matching the
+        // allSettled path in shutdown().
+        void Promise.resolve().then(teardown).catch(() => { /* best-effort */ });
+        return;
+      }
+      teardowns.push(teardown);
+    },
+    async shutdown(code = 0): Promise<void> {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      // Bound teardown: a watcher/store handle that hangs on close must not
+      // reintroduce the very hang this coordinator exists to prevent. The grace
+      // timer is unref'd so it never by itself keeps the loop alive.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const grace = new Promise<void>((resolve) => {
+        graceTimer = setTimeout(resolve, graceMs);
+        graceTimer.unref?.();
+      });
+      try {
+        await Promise.race([
+          Promise.allSettled(teardowns.map((t) => Promise.resolve().then(t))),
+          grace,
+        ]);
+      } finally {
+        if (graceTimer) clearTimeout(graceTimer);
+      }
+      exit(code);
+    },
+  };
 }
 
 // Global shutdown manager instance

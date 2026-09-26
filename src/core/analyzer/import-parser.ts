@@ -6,8 +6,13 @@
  * Supports JavaScript/TypeScript, Python, and Java.
  */
 
-import { readFile } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { dirname, join, resolve, extname } from 'node:path';
+
+import { buildLineIndex, lineFromIndex } from './line-index.js';
+import { blankCommentsPreservingLayout } from './comment-blanking.js';
+import { readSourceCapped } from './bounded-file-scan.js';
+import { scanJavaMethodDeclarations } from './java-method-scanner.js';
 
 // ============================================================================
 // TYPES
@@ -22,11 +27,25 @@ export interface ImportInfo {
   isPackage: boolean;
   isBuiltin: boolean;
   importedNames: string[];
+  /**
+   * Exact names bound from the source module for statically named imports.
+   * Unlike importedNames, aliases retain their source identity (`X as Y` -> X).
+   * Absent for default, namespace, star, dynamic, and otherwise uncertain forms.
+   */
+  importedSourceNames?: string[];
+  /** Python only: true when the import is module-level and therefore may re-export a binding. */
+  isTopLevel?: boolean;
   hasDefault: boolean;
   hasNamespace: boolean;
   isTypeOnly: boolean;
   isDynamic: boolean;
   line: number;
+  /**
+   * Set when this import is an HTML asset reference (`<script src>` /
+   * `<link rel=stylesheet href>`) rather than a code import, so the dependency
+   * graph can label the edge. Absent for ordinary code imports.
+   */
+  assetKind?: 'script' | 'stylesheet';
 }
 
 /**
@@ -115,11 +134,53 @@ function isBuiltinModule(source: string): boolean {
 }
 
 /**
- * Get line number for a match position in content
+ * Most recently indexed file, so the ~29 call sites below — spread across the per-language parse
+ * functions, several of which run over the SAME content — share one index instead of each
+ * rebuilding it.
+ *
+ * One entry is enough: parsing is per-file and sequential, so the hit rate is effectively total.
+ * It retains the last file's content and its newline offsets; both are bounded by one file (the
+ * scan already refuses anything over `SOURCE_SCAN_MAX_FILE_BYTES`), which is why this is a memo
+ * rather than an unbounded cache keyed by content.
+ */
+let _lastContent: string | undefined;
+let _lastLineIndex: number[] | undefined;
+
+/**
+ * Get line number for a match position in content.
+ *
+ * Was `content.substring(0, position).split('\n').length`, which copies the whole prefix and
+ * allocates an array of every line in it — per match. A file with many matches therefore paid its
+ * own length once per match, and on a 2 MB single-file fixture this one expression was 50% of the
+ * entire analyze run (see `line-index.ts`).
  */
 function getLineNumber(content: string, position: number): number {
-  return content.substring(0, position).split('\n').length;
+  if (_lastContent !== content) {
+    _lastContent = content;
+    _lastLineIndex = buildLineIndex(content);
+  }
+  return lineFromIndex(_lastLineIndex!, position);
 }
+
+/**
+ * Whitespace separating the two halves of an `X as Y` rename.
+ *
+ * BOUNDED deliberately. The brace body feeding these helpers is unbounded by design
+ * (see the rationale on `namedImportRegex` below), so an unbounded `\s+` here is a
+ * quadratic blow-up on attacker-controlled source: in `a<N spaces>b`, `\s+` eats the
+ * whole run, fails to find `a`, and gives back one character at a time — from every
+ * start offset. Measured on the real `parseJSImports`: 50,000 spaces cost 7.3 s and
+ * 200,000 spaces 322 s, on a regex that runs on EVERY JS/TS file in the repo.
+ *
+ * 200 is far past any real formatting (`X as Y` is normally one space, at most a line
+ * of alignment padding). A rename separated by more than 200 whitespace characters is
+ * simply not recognized as a rename — it falls through to the same handling as an
+ * unparseable name, which is what the `!name.includes(' ')` / identifier-shape filters
+ * already do for junk. That is the only behavioral difference, and it is unreachable
+ * from code a human wrote.
+ */
+const AS_SEPARATOR = /\s{1,200}as\s{1,200}/;
+const AS_RENAME = /(\w+)\s{1,200}as\s{1,200}(\w+)/;
 
 /**
  * Parse named imports from a string like "X, Y as Z, W"
@@ -130,7 +191,7 @@ function parseNamedImports(namesStr: string): string[] {
     .map(name => {
       const trimmed = name.trim();
       // Handle "X as Y" - we want the local name Y
-      const asMatch = trimmed.match(/(\w+)\s+as\s+(\w+)/);
+      const asMatch = trimmed.match(AS_RENAME);
       if (asMatch) {
         return asMatch[2];
       }
@@ -143,6 +204,14 @@ function parseNamedImports(namesStr: string): string[] {
     .filter(name => name && !name.includes(' '));
 }
 
+/** Source-module identity for exact named bindings (`X as Y` -> X). */
+function parseNamedImportSources(namesStr: string): string[] {
+  return namesStr
+    .split(',')
+    .map(name => name.trim().replace(/^type\s+/, '').split(AS_SEPARATOR)[0]?.trim())
+    .filter((name): name is string => !!name && /^[$A-Z_a-z][$\w]*$/.test(name));
+}
+
 // ============================================================================
 // JAVASCRIPT/TYPESCRIPT PARSER
 // ============================================================================
@@ -150,13 +219,16 @@ function parseNamedImports(namesStr: string): string[] {
 /**
  * Parse imports from JavaScript/TypeScript content
  */
-function parseJSImports(content: string): ImportInfo[] {
+export function parseJSImports(content: string): ImportInfo[] {
   const imports: ImportInfo[] = [];
 
-  // Remove comments to avoid false matches
+  // Blank comments with same-length whitespace (newlines kept) so `match.index`
+  // offsets and `getLineNumber(content, …)` agree with the original file — the
+  // `parseHtmlAssetImports` discipline. Stripping them outright would shift every
+  // recorded import line upward past a block-comment header.
   const cleanContent = content
-    .replace(/\/\*[\s\S]*?\*\//g, '') // Block comments
-    .replace(/\/\/.*$/gm, '');        // Line comments
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' ')) // Block comments
+    .replace(/\/\/.*$/gm, (m) => ' '.repeat(m.length));            // Line comments
 
   // ES Module: import X from 'module'
   let match: RegExpExecArray | null;
@@ -178,7 +250,7 @@ function parseJSImports(content: string): ImportInfo[] {
   }
 
   // ES Module: import X, { Y, Z } from 'module' (mixed import - default + named)
-  const mixedImportRegex = /import\s+(\w+)\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+  const mixedImportRegex = /import\s+(\w+)\s*,\s*\{([^{}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
   while ((match = mixedImportRegex.exec(cleanContent)) !== null) {
     const source = match[3];
     const names = [match[1], ...parseNamedImports(match[2])];
@@ -188,6 +260,7 @@ function parseJSImports(content: string): ImportInfo[] {
       isPackage: !isRelativeImport(source) && !isBuiltinModule(source),
       isBuiltin: isBuiltinModule(source),
       importedNames: names,
+      importedSourceNames: parseNamedImportSources(match[2]),
       hasDefault: true,
       hasNamespace: false,
       isTypeOnly: false,
@@ -197,7 +270,18 @@ function parseJSImports(content: string): ImportInfo[] {
   }
 
   // ES Module: import { X, Y } from 'module'
-  const namedImportRegex = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+  // The brace body EXCLUDES `{`. A plain `[^}]+` rescans to end-of-file from every one
+  // of O(n) start positions when no `}` ever arrives, so a file of repeated `import {`
+  // costs quadratic time — and this regex runs on every JS/TS file in the repo, making
+  // it the cheapest denial-of-service to plant in an analyzed repository. Excluding `{`
+  // fixes that completely: a named-import body cannot legally contain a brace, so the
+  // scan stops at the next opener instead of running to EOF.
+  //
+  // Deliberately NOT also length-bounded. A generated icon/barrel re-export of a few
+  // hundred names runs past any bound worth setting, and a bound that misses drops the
+  // whole re-export from the graph silently (false dead code, missing edges) — a real
+  // recall loss for no measurable safety: the brace exclusion alone is already linear.
+  const namedImportRegex = /import\s+\{([^{}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
   while ((match = namedImportRegex.exec(cleanContent)) !== null) {
     const source = match[2];
     const names = parseNamedImports(match[1]);
@@ -207,6 +291,7 @@ function parseJSImports(content: string): ImportInfo[] {
       isPackage: !isRelativeImport(source) && !isBuiltinModule(source),
       isBuiltin: isBuiltinModule(source),
       importedNames: names,
+      importedSourceNames: parseNamedImportSources(match[1]),
       hasDefault: false,
       hasNamespace: false,
       isTypeOnly: false,
@@ -252,7 +337,7 @@ function parseJSImports(content: string): ImportInfo[] {
   }
 
   // Type-only imports: import type { X } from 'module'
-  const typeImportRegex = /import\s+type\s+(?:\{([^}]+)\}|(\w+))\s+from\s+['"]([^'"]+)['"]/g;
+  const typeImportRegex = /import\s+type\s+(?:\{([^{}]+)\}|(\w+))\s+from\s+['"]([^'"]+)['"]/g;
   while ((match = typeImportRegex.exec(cleanContent)) !== null) {
     const source = match[3];
     const names = match[1] ? parseNamedImports(match[1]) : [match[2]];
@@ -262,6 +347,7 @@ function parseJSImports(content: string): ImportInfo[] {
       isPackage: !isRelativeImport(source) && !isBuiltinModule(source),
       isBuiltin: isBuiltinModule(source),
       importedNames: names,
+      ...(match[1] ? { importedSourceNames: parseNamedImportSources(match[1]) } : {}),
       hasDefault: !!match[2],
       hasNamespace: false,
       isTypeOnly: true,
@@ -271,7 +357,7 @@ function parseJSImports(content: string): ImportInfo[] {
   }
 
   // CommonJS: require('module')
-  const requireRegex = /(?:const|let|var)\s+(?:(\w+)|\{([^}]+)\})\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const requireRegex = /(?:const|let|var)\s+(?:(\w+)|\{([^{}]+)\})\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
   while ((match = requireRegex.exec(cleanContent)) !== null) {
     const source = match[3];
     const names = match[1] ? [match[1]] : parseNamedImports(match[2]);
@@ -281,6 +367,7 @@ function parseJSImports(content: string): ImportInfo[] {
       isPackage: !isRelativeImport(source) && !isBuiltinModule(source),
       isBuiltin: isBuiltinModule(source),
       importedNames: names,
+      ...(match[2] ? { importedSourceNames: parseNamedImportSources(match[2]) } : {}),
       hasDefault: !!match[1],
       hasNamespace: false,
       isTypeOnly: false,
@@ -313,18 +400,24 @@ function parseJSImports(content: string): ImportInfo[] {
 /**
  * Parse exports from JavaScript/TypeScript content
  */
-function parseJSExports(content: string): ExportInfo[] {
+export function parseJSExports(content: string): ExportInfo[] {
   const exports: ExportInfo[] = [];
 
-  // Remove comments
+  // Blank comments with same-length whitespace (newlines kept) so `match.index`
+  // offsets and `getLineNumber(content, …)` agree with the original file — the
+  // `parseHtmlAssetImports` discipline. Stripping comments outright would shift
+  // every recorded export line upward past a block-comment header.
   const cleanContent = content
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/.*$/gm, '');
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/\/\/.*$/gm, (m) => ' '.repeat(m.length));
 
   let match: RegExpExecArray | null;
 
-  // export default
-  const defaultExportRegex = /export\s+default\s+(?:(class|function)\s+(\w+)|(\w+))/g;
+  // export default — tolerate the `async` modifier and a generator `*` so
+  // `export default async function foo` captures `foo` (not `async`), and skip
+  // `abstract` before a default class.
+  const defaultExportRegex =
+    /export\s+default\s+(?:(?:async\s+)?(?:abstract\s+)?(class|function)\s*\*?\s*(\w+)|(\w+))/g;
   while ((match = defaultExportRegex.exec(cleanContent)) !== null) {
     const kind = match[1] as 'class' | 'function' | undefined;
     const name = match[2] || match[3] || 'default';
@@ -339,7 +432,9 @@ function parseJSExports(content: string): ExportInfo[] {
   }
 
   // export { X, Y } or export { X } from 'module'
-  const namedExportRegex = /export\s+\{([^}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g;
+  // Brace-excluded for the same reason as namedImportRegex above (and, like it,
+  // deliberately NOT length-bounded).
+  const namedExportRegex = /export\s+\{([^{}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g;
   while ((match = namedExportRegex.exec(cleanContent)) !== null) {
     const names = parseNamedImports(match[1]);
     const reExportSource = match[2];
@@ -356,8 +451,9 @@ function parseJSExports(content: string): ExportInfo[] {
     }
   }
 
-  // export const/let/var
-  const varExportRegex = /export\s+(?:const|let|var)\s+(\w+)/g;
+  // export const/let/var — but NOT `export const enum X` (a TS const-enum,
+  // recovered with its real name by the enum regex below).
+  const varExportRegex = /export\s+(?:const|let|var)\s+(?!enum\b)(\w+)/g;
   while ((match = varExportRegex.exec(cleanContent)) !== null) {
     exports.push({
       name: match[1],
@@ -369,8 +465,10 @@ function parseJSExports(content: string): ExportInfo[] {
     });
   }
 
-  // export function
-  const funcExportRegex = /export\s+function\s+(\w+)/g;
+  // export function — tolerate `async` and a generator `*` so
+  // `export async function`, `export function* gen`, and
+  // `export async function* agen` are not silently dropped.
+  const funcExportRegex = /export\s+(?:async\s+)?function\s*\*?\s*(\w+)/g;
   while ((match = funcExportRegex.exec(cleanContent)) !== null) {
     exports.push({
       name: match[1],
@@ -382,8 +480,8 @@ function parseJSExports(content: string): ExportInfo[] {
     });
   }
 
-  // export class
-  const classExportRegex = /export\s+class\s+(\w+)/g;
+  // export class — tolerate the `abstract` modifier.
+  const classExportRegex = /export\s+(?:abstract\s+)?class\s+(\w+)/g;
   while ((match = classExportRegex.exec(cleanContent)) !== null) {
     exports.push({
       name: match[1],
@@ -421,8 +519,9 @@ function parseJSExports(content: string): ExportInfo[] {
     });
   }
 
-  // export enum
-  const enumExportRegex = /export\s+enum\s+(\w+)/g;
+  // export enum — tolerate `declare` and `const` (a TS const-enum) so the real
+  // enum name is captured instead of the bare `enum` glitch.
+  const enumExportRegex = /export\s+(?:declare\s+)?(?:const\s+)?enum\s+(\w+)/g;
   while ((match = enumExportRegex.exec(cleanContent)) !== null) {
     exports.push({
       name: match[1],
@@ -504,40 +603,70 @@ const PYTHON_BUILTINS = new Set([
 /**
  * Parse imports from Python content
  */
-function parsePythonImports(content: string): ImportInfo[] {
+export function parsePythonImports(content: string): ImportInfo[] {
   const imports: ImportInfo[] = [];
 
-  // Remove comments and collapse multi-line parenthesized imports onto one line
-  // e.g. "from x import (\n  A,\n  B\n)" → "from x import A, B"
+  // Blank line comments (same length, newlines kept) and collapse ONLY multi-line
+  // `from X import ( … )` blocks onto the `from` line, relocating the newlines the
+  // collapse consumes to trailing blank lines so total line count — and every
+  // recorded import line — matches the original source. A multi-line import is
+  // attributed to its first (the `from`) line. Parenthesized spans that are NOT
+  // import lists (e.g. a multi-line call) are left untouched, so they cannot shift
+  // the line numbers of imports below them. Because the collapse is not
+  // length-preserving, line numbers below are read from `cleanContent`, whose
+  // newline positions stay line-aligned with the original.
   const cleanContent = content
-    .replace(/#.*$/gm, '')
-    .replace(/\(\s*([\s\S]*?)\s*\)/g, (_, inner) => inner.replace(/\s*\n\s*/g, ', '));
+    .replace(/#.*$/gm, (m) => ' '.repeat(m.length))
+    .replace(
+      /^([ \t]*from\s+[\w.]+\s+import\s*)\(([\s\S]*?)\)/gm,
+      (whole, prefix, inner) => {
+        // Linear string ops, not `inner.replace(/\s*\n\s*/g, ', ')`. `inner` is the
+        // whole parenthesised import list and is unbounded, and that regex is quadratic
+        // on a whitespace run containing no newline: the leading `\s*` eats the run,
+        // fails on `\n`, and backs off one character at a time — from every offset.
+        // Measured on the real `parsePythonImports` with `from a import (<N spaces>)`:
+        // 9.1 s at 50 KB, 129 s at 200 KB.
+        //
+        // The one difference is that this DROPS leading/trailing empty segments
+        // (`"\n a \n b \n"` → `"a, b"`, where the regex gave `", a, b, "`) and trims a
+        // segment's own outer whitespace. Both are invisible: the result is re-split on
+        // `,` and `trim()`ed below, so those segments were discarded downstream anyway.
+        const joined = prefix + inner.split('\n').map((s: string) => s.trim()).filter(Boolean).join(', ');
+        const consumedNewlines = (whole.match(/\n/g) ?? []).length;
+        return joined + '\n'.repeat(consumedNewlines);
+      },
+    );
 
   let match: RegExpExecArray | null;
 
-  // import X or import X, Y or import X.Y.Z
-  const importRegex = /^import[ \t]+([^\n\r]+)$/gm;
+  // import X or import X, Y or import X.Y.Z. Allow leading indentation so
+  // function-level / deferred imports (common in Python to break import cycles or
+  // lazy-load) are captured, not just module-top-level ones.
+  const importRegex = /^[ \t]*import[ \t]+([^\n\r]+)$/gm;
   while ((match = importRegex.exec(cleanContent)) !== null) {
     const modules = match[1].split(',').map(m => m.trim()).filter(Boolean);
     for (const mod of modules) {
-      const source = mod.split(/\s+as\s+/)[0].trim();
+      const source = mod.split(AS_SEPARATOR)[0].trim();
       imports.push({
         source,
         isRelative: source.startsWith('.'),
         isPackage: !source.startsWith('.'),
         isBuiltin: PYTHON_BUILTINS.has(source.split('.')[0]),
-        importedNames: [mod.includes(' as ') ? mod.split(/\s+as\s+/)[1].trim() : source.split('.').pop()!],
+        importedNames: [mod.includes(' as ') ? mod.split(AS_SEPARATOR)[1].trim() : source.split('.').pop()!],
+        isTopLevel: !/^[ \t]/.test(match[0]),
         hasDefault: false,
         hasNamespace: true,
         isTypeOnly: false,
         isDynamic: false,
-        line: getLineNumber(content, match.index),
+        line: getLineNumber(cleanContent, match.index),
       });
     }
   }
 
-  // from X import Y or from X import Y, Z (including multi-line after collapsing)
-  const fromImportRegex = /^from\s+([\w.]+)\s+import\s+(.+)$/gm;
+  // from X import Y or from X import Y, Z (including multi-line after collapsing).
+  // Allow leading indentation so function-level / deferred relative imports are
+  // captured (e.g. `    from .compare import compare` inside a function body).
+  const fromImportRegex = /^[ \t]*from\s+([\w.]+)\s+import\s+(.+)$/gm;
   while ((match = fromImportRegex.exec(cleanContent)) !== null) {
     const source = match[1];
     const importsPart = match[2].trim().replace(/[()]/g, '');
@@ -549,16 +678,18 @@ function parsePythonImports(content: string): ImportInfo[] {
         isPackage: !source.startsWith('.'),
         isBuiltin: PYTHON_BUILTINS.has(source.split('.')[0]),
         importedNames: ['*'],
+        isTopLevel: !/^[ \t]/.test(match[0]),
         hasDefault: false,
         hasNamespace: true,
         isTypeOnly: false,
         isDynamic: false,
-        line: getLineNumber(content, match.index),
+        line: getLineNumber(cleanContent, match.index),
       });
     } else {
-      const names = importsPart.split(',').map(n => {
+      const parts = importsPart.split(',');
+      const names = parts.map(n => {
         const trimmed = n.trim();
-        return trimmed.includes(' as ') ? trimmed.split(/\s+as\s+/)[1].trim() : trimmed;
+        return trimmed.includes(' as ') ? trimmed.split(AS_SEPARATOR)[1].trim() : trimmed;
       }).filter(Boolean);
 
       imports.push({
@@ -567,11 +698,13 @@ function parsePythonImports(content: string): ImportInfo[] {
         isPackage: !source.startsWith('.'),
         isBuiltin: PYTHON_BUILTINS.has(source.split('.')[0]),
         importedNames: names,
+        importedSourceNames: parts.map(n => n.trim().split(AS_SEPARATOR)[0]?.trim()).filter(Boolean),
+        isTopLevel: !/^[ \t]/.test(match[0]),
         hasDefault: false,
         hasNamespace: false,
         isTypeOnly: false,
         isDynamic: false,
-        line: getLineNumber(content, match.index),
+        line: getLineNumber(cleanContent, match.index),
       });
     }
   }
@@ -680,8 +813,8 @@ function isJavaBuiltin(source: string): boolean {
  */
 export function parseJavaPackage(content: string): string | undefined {
   // Strip block comments so we don't match inside them.
-  const clean = content.replace(/\/\*[\s\S]*?\*\//g, '');
-  const match = clean.match(/^\s*package\s+([\w.]+)\s*;/m);
+  const clean = blankCommentsPreservingLayout(content);
+  const match = clean.match(/^[ \t]*package\b\s+([\w.]+)\s*;/m);
   return match ? match[1] : undefined;
 }
 
@@ -697,12 +830,13 @@ export function parseJavaPackage(content: string): string | undefined {
 function parseJavaImports(content: string): ImportInfo[] {
   const imports: ImportInfo[] = [];
 
-  // Strip comments to avoid false matches
-  const clean = content
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/.*$/gm, '');
+  // Blank comments with same-length whitespace (newlines kept) so recorded
+  // import lines match the original file (the `parseHtmlAssetImports` discipline).
+  const clean = blankCommentsPreservingLayout(content);
 
-  const importRegex = /^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;/gm;
+  // `^[ \t]*` (not `^\s*`) so a preceding blank line's newline is not consumed
+  // into the match — that would report the import one line early.
+  const importRegex = /^[ \t]*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;/gm;
   let match: RegExpExecArray | null;
   while ((match = importRegex.exec(clean)) !== null) {
     const isStatic = !!match[1];
@@ -759,12 +893,12 @@ function parseJavaImports(content: string): ImportInfo[] {
  * and public fields on those types since downstream mapping uses
  * function-level exports to connect requirements to code.
  */
-function parseJavaExports(content: string): ExportInfo[] {
+export function parseJavaExports(content: string): ExportInfo[] {
   const exports: ExportInfo[] = [];
 
-  const clean = content
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/.*$/gm, '');
+  // Blank comments with same-length whitespace (newlines kept) so recorded
+  // export lines match the original file (the `parseHtmlAssetImports` discipline).
+  const clean = blankCommentsPreservingLayout(content);
 
   let match: RegExpExecArray | null;
 
@@ -788,24 +922,17 @@ function parseJavaExports(content: string): ExportInfo[] {
     });
   }
 
-  // Public methods: `public [static] [final] ReturnType name(`
-  // We keep this conservative: only methods with an explicit `public` modifier.
-  // The return-type capture is non-greedy and excludes keywords that start
-  // type declarations (class/interface/enum/record) to avoid false matches.
-  const methodRegex =
-    /\bpublic\s+(?:static\s+|final\s+|abstract\s+|synchronized\s+|default\s+|native\s+)*(?!class\b|interface\b|enum\b|record\b|@interface\b)(?:<[^>]+>\s+)?[\w<>[\], ?.]+?\s+(\w+)\s*\(/g;
-  while ((match = methodRegex.exec(clean)) !== null) {
-    const name = match[1];
-    // Filter obvious non-methods (the regex can match some constructors or
-    // edge cases; keep common false-positives out).
-    if (['class', 'interface', 'enum', 'record', 'new', 'return', 'if', 'for', 'while'].includes(name)) continue;
+  // Public methods are scanned with one monotonic cursor. This avoids retrying an
+  // unterminated declaration suffix from every `public` token and accepts valid
+  // return types without an arbitrary whitespace-token cap.
+  for (const method of scanJavaMethodDeclarations(clean)) {
     exports.push({
-      name,
+      name: method.name,
       isDefault: false,
       isType: false,
       isReExport: false,
       kind: 'function',
-      line: getLineNumber(content, match.index),
+      line: getLineNumber(content, method.start),
     });
   }
 
@@ -907,8 +1034,7 @@ export async function resolveImport(
     if (seen.has(candidate)) continue;
     seen.add(candidate);
     try {
-      await readFile(candidate);
-      return candidate;
+      if ((await stat(candidate)).isFile()) return candidate;
     } catch {
       // Not found, try next
     }
@@ -980,8 +1106,7 @@ async function resolveJavaImport(
     seen.add(root);
     const candidate = join(root, relPath);
     try {
-      await readFile(candidate);
-      return candidate;
+      if ((await stat(candidate)).isFile()) return candidate;
     } catch {
       // try next root
     }
@@ -997,6 +1122,109 @@ async function resolveJavaImport(
 /**
  * Import/Export Parser
  */
+// ============================================================================
+// HTML ASSET IMPORTS (decision b555b680)
+// ============================================================================
+
+// `<script ... src="…">` — any inline-referenced external script is a file dep.
+const HTML_SCRIPT_SRC_RE = /<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+// `<link …>` — filtered to rel=stylesheet below (rel/href order varies).
+const HTML_LINK_RE = /<link\b([^>]*)>/gi;
+
+/**
+ * Normalize an HTML asset href into a document-relative import source, or null
+ * when it should not produce a dependency edge. Absolute URLs (`http(s)://`,
+ * protocol-relative `//`), `data:`/`mailto:`/`tel:`/`javascript:` URIs, `#`
+ * anchors, root-absolute `/…` (web-root — out of scope), and empty refs are
+ * dropped. Query strings and fragments are stripped, and a bare `app.js` is
+ * prefixed `./` so it is treated as relative by isRelativeImport / resolveImport.
+ */
+function normalizeAssetHref(href: string): string | null {
+  const trimmed = href.trim();
+  if (!trimmed) return null;
+  if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(trimmed)) return null; // http(s):// or //
+  if (/^(?:data|mailto|tel|javascript):/i.test(trimmed)) return null;
+  if (trimmed.startsWith('#')) return null;
+  const clean = trimmed.split(/[?#]/)[0];
+  if (!clean) return null;
+  if (clean.startsWith('/')) return null; // root-absolute assumes a web root — out of scope
+  return clean.startsWith('.') ? clean : './' + clean;
+}
+
+function assetImport(source: string, line: number, assetKind: 'script' | 'stylesheet'): ImportInfo {
+  return {
+    source,
+    isRelative: true,
+    isPackage: false,
+    isBuiltin: false,
+    importedNames: [],
+    hasDefault: false,
+    hasNamespace: false,
+    isTypeOnly: false,
+    isDynamic: false,
+    line,
+    assetKind,
+  };
+}
+
+/**
+ * Extract local asset references from an HTML file as ImportInfo entries:
+ * `<script src=…>` (script) and `<link rel="stylesheet" href=…>` (stylesheet).
+ * External/CDN URLs and non-stylesheet links are excluded. The existing
+ * dependency-graph edge machinery resolves these against the document directory.
+ */
+export function parseHtmlAssetImports(content: string): ImportInfo[] {
+  const out: ImportInfo[] = [];
+  // Blank out HTML comments so commented-out <script>/<link> tags don't produce
+  // phantom edges. Same-length whitespace (newlines kept) preserves line numbers.
+  const scan = content.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+  const lineAt = (idx: number): number => scan.slice(0, idx).split('\n').length;
+
+  HTML_SCRIPT_SRC_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = HTML_SCRIPT_SRC_RE.exec(scan)) !== null) {
+    const src = normalizeAssetHref(m[1]);
+    if (src) out.push(assetImport(src, lineAt(m.index), 'script'));
+  }
+
+  HTML_LINK_RE.lastIndex = 0;
+  while ((m = HTML_LINK_RE.exec(scan)) !== null) {
+    const attrs = m[1];
+    // rel attribute anchored on a left boundary (so `data-rel` does not match)
+    // and order-independent over multi-token rel (`preload stylesheet`).
+    if (!/(?:^|\s)rel\s*=\s*["']?[^"'>]*\bstylesheet\b/i.test(attrs)) continue;
+    const hrefM = /(?:^|\s)href\s*=\s*["']([^"']+)["']/i.exec(attrs);
+    if (!hrefM) continue;
+    const href = normalizeAssetHref(hrefM[1]);
+    if (href) out.push(assetImport(href, lineAt(m.index), 'stylesheet'));
+  }
+
+  return out;
+}
+
+/**
+ * Whether `parseContent` extracts EXPORTS for this file (change: ground-generated-specs-in-the-graph).
+ * Derived from the same extension dispatch, so a consumer that reads the export inventory can tell
+ * "this file exports nothing by that name" from "exports are never extracted for this language".
+ */
+export function extractsExports(filePath: string): boolean {
+  const type = importParserFileType(filePath);
+  return type === 'ts' || type === 'js' || type === 'python' || type === 'java';
+}
+
+/** The parser's extension dispatch — the one definition `parseContent` and `extractsExports` share. */
+function importParserFileType(filePath: string): 'js' | 'ts' | 'python' | 'java' | 'html' | 'unknown' {
+  const ext = extname(filePath).toLowerCase();
+
+  if (['.ts', '.tsx', '.mts', '.cts'].includes(ext)) return 'ts';
+  if (['.js', '.jsx', '.mjs', '.cjs'].includes(ext)) return 'js';
+  if (['.py', '.pyw'].includes(ext)) return 'python';
+  if (ext === '.java') return 'java';
+  if (['.html', '.htm'].includes(ext)) return 'html';
+
+  return 'unknown';
+}
+
 export class ImportExportParser {
   private cache: Map<string, FileAnalysis> = new Map();
 
@@ -1010,15 +1238,41 @@ export class ImportExportParser {
   /**
    * Get file extension type
    */
-  private getFileType(filePath: string): 'js' | 'ts' | 'python' | 'java' | 'unknown' {
-    const ext = extname(filePath).toLowerCase();
+  private getFileType(filePath: string): 'js' | 'ts' | 'python' | 'java' | 'html' | 'unknown' {
+    return importParserFileType(filePath);
+  }
 
-    if (['.ts', '.tsx', '.mts', '.cts'].includes(ext)) return 'ts';
-    if (['.js', '.jsx', '.mjs', '.cjs'].includes(ext)) return 'js';
-    if (['.py', '.pyw'].includes(ext)) return 'python';
-    if (ext === '.java') return 'java';
-
-    return 'unknown';
+  /** Parse caller-supplied bytes without re-reading a path that may have changed. */
+  parseContent(filePath: string, content: string): FileAnalysis {
+    const analysis: FileAnalysis = {
+      filePath, imports: [], exports: [], localImports: [], externalImports: [], parseErrors: [],
+    };
+    const fileType = this.getFileType(filePath);
+    if (fileType === 'js' || fileType === 'ts') {
+      analysis.imports = parseJSImports(content);
+      analysis.exports = parseJSExports(content);
+    } else if (fileType === 'python') {
+      analysis.imports = parsePythonImports(content);
+      analysis.exports = parsePythonExports(content);
+    } else if (fileType === 'java') {
+      analysis.imports = parseJavaImports(content);
+      analysis.exports = parseJavaExports(content);
+      analysis.javaPackage = parseJavaPackage(content);
+    } else if (fileType === 'html') {
+      analysis.imports = parseHtmlAssetImports(content);
+    } else {
+      analysis.parseErrors.push(`Unsupported file type: ${extname(filePath)}`);
+    }
+    for (const imp of analysis.imports) {
+      if (imp.isRelative) analysis.localImports.push(imp.source);
+      else if (imp.isPackage) {
+        const pkgName = imp.source.startsWith('@')
+          ? imp.source.split('/').slice(0, 2).join('/')
+          : imp.source.split('/')[0];
+        if (!analysis.externalImports.includes(pkgName)) analysis.externalImports.push(pkgName);
+      }
+    }
+    return analysis;
   }
 
   /**
@@ -1041,37 +1295,17 @@ export class ImportExportParser {
     };
 
     try {
-      const content = await readFile(filePath, 'utf-8');
-      const fileType = this.getFileType(filePath);
-
-      if (fileType === 'js' || fileType === 'ts') {
-        analysis.imports = parseJSImports(content);
-        analysis.exports = parseJSExports(content);
-      } else if (fileType === 'python') {
-        analysis.imports = parsePythonImports(content);
-        analysis.exports = parsePythonExports(content);
-      } else if (fileType === 'java') {
-        analysis.imports = parseJavaImports(content);
-        analysis.exports = parseJavaExports(content);
-        analysis.javaPackage = parseJavaPackage(content);
-      } else {
-        analysis.parseErrors.push(`Unsupported file type: ${extname(filePath)}`);
-      }
-
-      // Categorize imports
-      for (const imp of analysis.imports) {
-        if (imp.isRelative) {
-          analysis.localImports.push(imp.source);
-        } else if (imp.isPackage) {
-          // Extract package name (first part of path)
-          const pkgName = imp.source.startsWith('@')
-            ? imp.source.split('/').slice(0, 2).join('/')
-            : imp.source.split('/')[0];
-          if (!analysis.externalImports.includes(pkgName)) {
-            analysis.externalImports.push(pkgName);
-          }
+      let oversized = false;
+      const content = await readSourceCapped(filePath, undefined, () => { oversized = true; });
+      if (content === null) {
+        if (oversized) {
+          analysis.parseErrors.push('File exceeds the analyzer source-size limit');
+          this.cache.set(filePath, analysis);
+          return analysis;
         }
+        throw new Error('source is unreadable or is not a regular file');
       }
+      Object.assign(analysis, this.parseContent(filePath, content));
     } catch (error) {
       analysis.parseErrors.push(`Failed to read file: ${(error as Error).message}`);
     }

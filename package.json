@@ -1,7 +1,7 @@
 {
-  "name": "spec-gen-cli",
-  "version": "1.3.6",
-  "description": "Reverse-engineer OpenSpec specifications from existing codebases",
+  "name": "openlore",
+  "version": "3.3.0",
+  "description": "Persistent architectural memory and structural cognition for AI coding agents.",
   "type": "module",
   "main": "dist/api/index.js",
   "types": "dist/api/index.d.ts",
@@ -10,63 +10,165 @@
       "import": "./dist/api/index.js",
       "types": "./dist/api/index.d.ts"
     },
+    "./serve-descriptor": {
+      "import": "./dist/api/serve-descriptor.js",
+      "types": "./dist/api/serve-descriptor.d.ts"
+    },
     "./cli": {
       "import": "./dist/cli/index.js"
     }
   },
   "bin": {
-    "spec-gen": "dist/cli/index.js"
+    "openlore": "dist/cli/index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": "^22.19.0 || >=23.5.0"
   },
   "scripts": {
     "dev": "tsx watch src/cli/index.ts",
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-assets.mjs",
     "start": "node dist/cli/index.js",
     "view": "tsx src/cli/index.ts view",
     "bench": "tsx scripts/bench.ts",
+    "bench:mcp": "tsx scripts/bench-mcp.ts",
+    "bench:watch": "tsx scripts/bench-watch.ts",
+    "bench:agent": "tsx scripts/bench-agent.ts",
+    "bench:surface": "tsx scripts/bench-preset-surface.ts",
+    "bench:selection": "tsx scripts/bench-preset-selection.ts",
+    "bench:completion": "tsx scripts/bench-preset-completion.ts",
+    "bench:protocol": "node --import tsx bench/run.ts",
+    "measure:certified-scale": "tsx scripts/measure-certified-scale.ts",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:unit": "vitest run --exclude src/core/analyzer/extractor-redos.test.ts --exclude src/core/analyzer/derived-artifact-equivalence.test.ts --exclude src/core/analyzer/hash-keyed-analyze.test.ts --exclude src/core/analyzer/pass1-fact-cache.test.ts --exclude src/core/analyzer/extraction-pool.test.ts --exclude src/core/analyzer/extraction-pool-threads.test.ts --exclude src/core/analyzer/condensation.test.ts --exclude src/core/analyzer/index-bundle.test.ts --exclude src/core/analyzer/bm25-corpus-persistence.test.ts --exclude src/core/analyzer/vector-index.test.ts --exclude src/core/analyzer/spec-vector-index.test.ts --exclude src/core/services/mcp-handlers/traversal.test.ts --exclude src/core/services/mcp-watcher-parity.test.ts --exclude src/core/services/mcp-watcher-incremental.test.ts",
+    "test:budgets": "vitest run --no-file-parallelism src/core/analyzer/extractor-redos.test.ts",
+    "test:equivalence": "vitest run src/core/analyzer/derived-artifact-equivalence.test.ts src/core/analyzer/hash-keyed-analyze.test.ts src/core/analyzer/pass1-fact-cache.test.ts src/core/analyzer/extraction-pool.test.ts src/core/analyzer/extraction-pool-threads.test.ts src/core/analyzer/condensation.test.ts src/core/analyzer/index-bundle.test.ts src/core/analyzer/bm25-corpus-persistence.test.ts src/core/analyzer/vector-index.test.ts src/core/analyzer/spec-vector-index.test.ts src/core/services/mcp-handlers/traversal.test.ts src/core/services/mcp-watcher-parity.test.ts src/core/services/mcp-watcher-incremental.test.ts",
+    "fuzz": "vitest run src/fuzz",
     "test:coverage": "vitest run --coverage",
     "test:openspec-compat": "vitest run --grep 'openspec' || echo 'No OpenSpec compat tests yet'",
     "test:e2e": "vitest run --config vitest.integration.config.ts --reporter=verbose",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:ci": "vitest run --config vitest.integration.config.ts src/api/analyze-parity.integration.test.ts src/api/generate.integration.test.ts src/api/run-dry-run.integration.test.ts src/api/verify.e2e.integration.test.ts src/cli/commands/analyze.integration.test.ts src/core/analyzer/html-asset-edges.integration.test.ts src/core/analyzer/html-inline-script.e2e.integration.test.ts src/core/services/mcp-watcher.integration.test.ts src/cli/commands/watch-auto.integration.test.ts src/core/services/mcp-handlers/spec-reconciliation-workflow.e2e.integration.test.ts src/core/verifier/verification-engine.e2e.integration.test.ts",
+    "test:api-consumer": "npm run build && node scripts/api-consumer-smoke.mjs",
+    "test:live": "vitest run --config vitest.integration.config.ts live-data --reporter=verbose",
     "build:watch": "tsc --watch",
+    "homebrew:formula": "node scripts/update-homebrew-formula.mjs",
     "clean": "rm -rf dist coverage",
+    "skill:install-local": "node scripts/install-skill.js",
     "format": "eslint src --fix",
     "lint": "eslint src",
+    "audit:gate": "node scripts/audit-gate.mjs",
+    "audit:packlist": "node scripts/audit-packlist.mjs",
+    "lock:integrity": "node scripts/backfill-lock-integrity.mjs",
+    "lock:integrity:check": "node scripts/backfill-lock-integrity.mjs --check",
+    "audit:deps": "node scripts/audit-dependencies.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build && npm run test:run"
+    "postinstall": "node scripts/postinstall.mjs",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run build && npm run test:run && npm run test:integration:ci && npm run audit:gate && npm run audit:packlist && npm run audit:deps",
+    "bench:reachability": "node scripts/bench-reachability.mjs",
+    "verify:reachability": "node scripts/verify-reachability-equivalence.mjs"
   },
   "keywords": [
-    "openspec",
-    "spec-driven",
+    "architectural-memory",
+    "structural-analysis",
     "code-analysis",
-    "documentation",
-    "reverse-engineering",
-    "specification",
-    "cli"
+    "call-graph",
+    "static-analysis",
+    "ai-coding-agents",
+    "mcp",
+    "cli",
+    "pi-package"
   ],
+  "pi": {
+    "image": "https://raw.githubusercontent.com/clay-good/openlore/main/docs/openlore-gallery.png",
+    "extensions": [
+      "./dist/pi/extension.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "openspec": {
+    "manifestVersion": 1,
+    "id": "openlore",
+    "namespace": "lore",
+    "displayName": "OpenLore",
+    "summary": "Persistent architectural memory and deterministic structural context for AI coding agents, computed locally from your code.",
+    "bin": "openlore",
+    "binArgs": [
+      "npx",
+      "--yes",
+      "openlore"
+    ],
+    "openspecCompat": ">=0.1.0",
+    "commands": [
+      {
+        "name": "generate",
+        "summary": "Reverse-engineer OpenSpec specs from existing code"
+      },
+      {
+        "name": "drift",
+        "summary": "Detect code/spec drift"
+      },
+      {
+        "name": "verify",
+        "summary": "Verify specs against the codebase"
+      },
+      {
+        "name": "analyze",
+        "summary": "Build the structural analysis graph (no API key)"
+      },
+      {
+        "name": "orient",
+        "summary": "One-shot structural orientation for a task"
+      },
+      {
+        "name": "digest",
+        "summary": "Emit the compact codebase digest"
+      },
+      {
+        "name": "decisions",
+        "summary": "Manage architectural decision records"
+      },
+      {
+        "name": "change-status",
+        "summary": "Compute OpenSpec change status from documented evidence"
+      }
+    ],
+    "skills": [
+      {
+        "dir": "openlore-orient",
+        "source": "skills/openlore-orient"
+      }
+    ],
+    "ownsConfigKeys": [
+      "openlore"
+    ]
+  },
   "author": "Clay Good",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/clay-good/spec-gen"
+    "url": "https://github.com/clay-good/openlore"
   },
   "bugs": {
-    "url": "https://github.com/clay-good/spec-gen/issues"
+    "url": "https://github.com/clay-good/openlore/issues"
   },
-  "homepage": "https://github.com/clay-good/spec-gen#readme",
+  "homepage": "https://github.com/clay-good/openlore#readme",
   "publishConfig": {
     "access": "public"
   },
   "files": [
     "dist",
     "!dist/**/*.test.*",
+    "scripts/postinstall.mjs",
     "src/viewer",
+    "!src/viewer/**/*.test.*",
     "examples",
+    "skills",
+    "!skills/.DS_Store",
     "stubs",
+    "schemas",
     "README.md",
     "LICENSE"
   ],
@@ -79,49 +181,89 @@
     }
   },
   "dependencies": {
-    "@inquirer/prompts": "^7.2.1",
-    "@lancedb/lancedb": "0.22.4-beta.3",
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "@modelcontextprotocol/server-memory": "^2026.1.26",
-    "@vitejs/plugin-react": "^5.0.2",
-    "apache-arrow": "^21.1.0",
-    "better-sqlite3": "^12.9.0",
-    "chalk": "^5.3.0",
+    "@inquirer/prompts": "^8.7.1",
+    "@repomix/tree-sitter-wasms": "0.1.17",
+    "chalk": "^6.0.0",
     "chokidar": "^5.0.0",
-    "commander": "^12.1.0",
-    "glob": "^11.0.0",
-    "ignore": "^6.0.2",
-    "ora": "^8.1.1",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1",
-    "tree-sitter": "^0.22.4",
-    "tree-sitter-cpp": "^0.23.4",
-    "tree-sitter-go": "^0.23.4",
-    "tree-sitter-java": "^0.23.5",
-    "tree-sitter-python": "^0.23.6",
-    "tree-sitter-ruby": "^0.23.1",
-    "tree-sitter-rust": "^0.24.0",
-    "tree-sitter-typescript": "^0.23.2",
-    "vite": "^7.1.3",
+    "commander": "^15.0.0",
+    "glob": "^13.0.6",
+    "ignore": "^7.0.8",
+    "jsonc-parser": "^3.3.1",
+    "minimatch": "^10.2.6",
+    "ora": "^9.4.1",
+    "web-tree-sitter": "0.27.0",
     "yaml": "^2.6.1"
   },
   "optionalDependencies": {
-    "tree-sitter-swift": "^0.7.1"
+    "@huggingface/transformers": "^4.2.0",
+    "@lancedb/lancedb": "0.39.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@tree-sitter-grammars/tree-sitter-lua": "^0.4.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "apache-arrow": "^21.1.0",
+    "protobufjs": "^8.8.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "tree-sitter": "^0.25.1",
+    "tree-sitter-bash": "^0.25.1",
+    "tree-sitter-c": "^0.24.1",
+    "tree-sitter-c-sharp": "^0.23.5",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-elixir": "^0.3.5",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-java": "^0.23.5",
+    "tree-sitter-kotlin": "^0.3.8",
+    "tree-sitter-php": "^0.24.2",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-ruby": "^0.23.1",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-scala": "^0.24.0",
+    "tree-sitter-swift": "^0.7.1",
+    "tree-sitter-typescript": "^0.23.2",
+    "vite": "^8.0.16"
   },
   "overrides": {
-    "tree-sitter-cli": "file:stubs/tree-sitter-cli-stub"
+    "tree-sitter-cli": "file:stubs/tree-sitter-cli-stub",
+    "@google/genai": {
+      "protobufjs": "^7.6.5"
+    },
+    "ws": "^8.21.0",
+    "undici": "^8.9.0",
+    "js-yaml": "^4.3.0",
+    "hono": "^4.12.34",
+    "@hono/node-server": "^2.0.5",
+    "sharp": "^0.35.4",
+    "adm-zip": "^0.6.1",
+    "fast-uri": "^3.1.7",
+    "nanoid": "^3.3.17",
+    "brace-expansion": "^5.0.9",
+    "onnxruntime-web": {
+      "protobufjs": "^7.6.5"
+    },
+    "@earendil-works/pi-coding-agent": {
+      "@google/genai": {
+        "protobufjs": "^7.6.5"
+      },
+      "ws": "^8.21.0",
+      "undici": "^8.9.0"
+    }
   },
   "devDependencies": {
-    "@eslint/js": "^9.17.0",
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.10.5",
-    "@vitest/coverage-v8": "^4.0.18",
-    "eslint": "^9.17.0",
-    "globals": "^16.0.0",
-    "memfs": "^4.15.0",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@earendil-works/pi-tui": "^0.87.1",
+    "@eslint/js": "^10.0.1",
+    "@fission-ai/openspec": "1.13.1",
+    "@types/node": "^26.4.0",
+    "@vitest/coverage-v8": "^5.0.0",
+    "eslint": "^10.9.1",
+    "fast-check": "^4.9.0",
+    "globals": "^17.7.0",
+    "memfs": "^4.71.0",
     "tsx": "^4.19.2",
+    "typebox": "1.3.34",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.19.1",
-    "vitest": "^4.0.18"
+    "vitest": "^5.0.0"
   }
 }

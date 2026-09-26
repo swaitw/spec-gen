@@ -9,7 +9,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { CallGraphBuilder } from './call-graph.js';
+import { CallGraphBuilder, callDistance, CALL_DISTANCE_COSTS, layerOf, classifyLayerEdge } from './call-graph.js';
+import { EDGE_CONFIDENCE_VALUES } from './call-graph-types.js';
+import type { CallEdge, EdgeConfidence } from './call-graph.js';
+import * as barrel from './call-graph.js';
+import * as cgTypes from './call-graph-types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,6 +40,40 @@ function fanOut(result: Awaited<ReturnType<CallGraphBuilder['build']>>, name: st
 }
 
 // ---------------------------------------------------------------------------
+// Stable barrel (change: modularize-call-graph-builder; analyzer:
+// StableCallGraphBarrel). The type/edge model now lives in ./call-graph-types.ts
+// and is re-exported from ./call-graph.ts. These guards lock the invariant for
+// the remaining slices: every moved name stays importable from the barrel and is
+// the SAME binding as the source module (a re-export, not a divergent copy).
+// ---------------------------------------------------------------------------
+describe('stable call-graph barrel', () => {
+  it('re-exports the moved value symbols from call-graph.ts (same binding as the source module)', () => {
+    expect(barrel.callDistance).toBe(cgTypes.callDistance);
+    expect(barrel.layerOf).toBe(cgTypes.layerOf);
+    expect(barrel.classifyLayerEdge).toBe(cgTypes.classifyLayerEdge);
+    expect(barrel.CALL_DISTANCE_COSTS).toBe(cgTypes.CALL_DISTANCE_COSTS);
+  });
+
+  it('callDistance agrees with CALL_DISTANCE_COSTS for every confidence (incl. external = Infinity)', () => {
+    for (const confidence of Object.keys(CALL_DISTANCE_COSTS) as EdgeConfidence[]) {
+      const edge = { callerId: 'a', calleeId: 'b', calleeName: 'b', confidence };
+      expect(callDistance(edge)).toBe(CALL_DISTANCE_COSTS[confidence]);
+    }
+    expect(callDistance({ callerId: 'a', calleeId: 'b', calleeName: 'b', confidence: 'external' })).toBe(Infinity);
+  });
+
+  it('layerOf / classifyLayerEdge resolve layers by path-prefix and flag wrong-direction edges', () => {
+    const layers = { api: ['src/api'], db: ['src/db'] };
+    expect(layerOf('src/api/main.ts', layers)).toBe('api');
+    expect(layerOf('src/db/store.ts', layers)).toBe('db');
+    expect(layerOf('src/other/x.ts', layers)).toBeUndefined();
+    // db (lower) → api (upper) is a violation; api → db is legal.
+    expect(classifyLayerEdge('src/db/store.ts', 'src/api/main.ts', layers)).toEqual({ fromLayer: 'db', toLayer: 'api' });
+    expect(classifyLayerEdge('src/api/main.ts', 'src/db/store.ts', layers)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TypeScript
 // ---------------------------------------------------------------------------
 
@@ -56,6 +94,201 @@ describe('CallGraphBuilder — TypeScript', () => {
     expect(edgePairs(result)).toEqual(['greet→emit', 'main→emit', 'main→greet'].sort());
     expect(fanIn(result, 'emit')).toBe(2);
     expect(fanOut(result, 'main')).toBe(2);
+  });
+
+  // this./super. method resolution (change: add-this-super-method-resolution).
+  // A `this.method()` call historically produced NO edge at all — the call query
+  // only captured an `(identifier)` receiver, so `this`/`super` receivers were
+  // dropped, leaving every edge-traversing tool blind to intra-object dispatch.
+  it('resolves this.method() to a sibling method of the same class (self_cls)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/k.ts',
+      language: 'TypeScript',
+      content: `
+        class K {
+          caller() { this.callee(); }
+          callee() { return 1; }
+        }
+      `,
+    }]);
+    expect(edgePairs(result)).toContain('caller→callee');
+    const e = result.edges.find(x => x.calleeName === 'callee' && result.nodes.get(x.callerId)?.name === 'caller');
+    expect(e?.confidence).toBe('self_cls');
+    expect(fanIn(result, 'callee')).toBe(1);
+  });
+
+  it('resolves this.method() to an inherited method on a parent class', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/h.ts',
+      language: 'TypeScript',
+      content: `
+        class Base { shared() { return 1; } }
+        class Child extends Base {
+          run() { this.shared(); }
+        }
+      `,
+    }]);
+    expect(edgePairs(result)).toContain('run→shared');
+  });
+
+  it('resolves inherited methods in TSX files', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/view.tsx',
+      language: 'TypeScript',
+      content: `
+        class Base { inherited() { return <span />; } }
+        class Child extends Base {
+          run() { this.inherited(); return <main />; }
+        }
+      `,
+    }]);
+
+    expect(edgePairs(result)).toContain('run→inherited');
+  });
+
+  it('resolves super.method() to the PARENT class method, not the overriding child', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/s.ts',
+      language: 'TypeScript',
+      content: `
+        class Base { greet() { return 'base'; } }
+        class Child extends Base {
+          greet() { super.greet(); return 'child'; }
+        }
+      `,
+    }]);
+    // super.greet() must target Base.greet, NOT Child.greet (no self-loop).
+    const superEdge = result.edges.find(
+      e => e.calleeName === 'greet' && result.nodes.get(e.callerId)?.id === 'src/s.ts::Child.greet',
+    );
+    expect(superEdge).toBeDefined();
+    expect(superEdge!.calleeId).toBe('src/s.ts::Base.greet');
+    expect(superEdge!.confidence).toBe('self_cls');
+  });
+
+  it('does not resolve this.method() to an unrelated class with the same method name', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/two.ts',
+      language: 'TypeScript',
+      content: `
+        class A { run() { this.work(); } work() {} }
+        class B { work() {} }
+      `,
+    }]);
+    // A.run's this.work() must bind to A.work, never B.work.
+    const e = result.edges.find(x => x.calleeName === 'work' && result.nodes.get(x.callerId)?.id === 'src/two.ts::A.run');
+    expect(e?.calleeId).toBe('src/two.ts::A.work');
+  });
+
+  it('binds this.method() to the caller’s OWN file when a same-named class exists in another file', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([
+      { path: 'src/a.ts', language: 'TypeScript', content: `class Dup { method() { return 'a'; } }` },
+      { path: 'src/b.ts', language: 'TypeScript', content: `class Dup { caller() { this.method(); } method() { return 'b'; } }` },
+    ]);
+    // b.ts::Dup.caller's this.method() must bind to b.ts::Dup.method, never a.ts::Dup.method.
+    const e = result.edges.find(
+      x => x.calleeName === 'method' && result.nodes.get(x.callerId)?.id === 'src/b.ts::Dup.caller' && x.confidence === 'self_cls',
+    );
+    expect(e?.calleeId).toBe('src/b.ts::Dup.method');
+  });
+
+  it('resolves super.method() to the IMPORTED parent, not a same-named decoy in another file', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([
+      { path: 'src/decoy.ts', language: 'TypeScript', content: `export class Base { inherited() { return 'decoy'; } }` },
+      { path: 'src/real.ts', language: 'TypeScript', content: `export class Base { inherited() { return 'real'; } }` },
+      {
+        path: 'src/child.ts',
+        language: 'TypeScript',
+        content: `import { Base } from './real';\nclass Child extends Base { run() { super.inherited(); } }`,
+      },
+    ]);
+    const e = result.edges.find(
+      x => x.calleeName === 'inherited' && result.nodes.get(x.callerId)?.id === 'src/child.ts::Child.run' && x.confidence === 'self_cls',
+    );
+    // Must bind the imported ./real Base, not the decoy.
+    expect(e?.calleeId).toBe('src/real.ts::Base.inherited');
+  });
+
+  it('resolves this.method() whose name collides with the call-noise ignore list (e.g. parse/map)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/p.ts',
+      language: 'TypeScript',
+      content: `
+        class Svc {
+          handle() { this.parse(); this.map(); }
+          parse() {}
+          map() {}
+        }
+      `,
+    }]);
+    // 'parse' and 'map' are in the noise ignore-list, but as this.* calls they are
+    // real intra-object methods and must resolve.
+    expect(edgePairs(result)).toContain('handle→parse');
+    expect(edgePairs(result)).toContain('handle→map');
+  });
+
+  it('drops an unresolved this.method() rather than minting an external::this.x leaf', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/u.ts',
+      language: 'TypeScript',
+      content: `class K { run() { this.notAMethodHere(); } }`,
+    }]);
+    // No edge, and no synthetic external node for the this-receiver call.
+    expect(result.edges.some(e => e.calleeName === 'notAMethodHere')).toBe(false);
+    expect(Array.from(result.nodes.values()).some(n => n.isExternal && n.name.includes('this.'))).toBe(false);
+  });
+
+  it('captures the class name for a class EXPRESSION so this.method() resolves', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/ce.ts',
+      language: 'TypeScript',
+      content: `
+        const K = class { caller() { this.callee(); } callee() {} };
+        const N = class Named { run() { this.work(); } work() {} };
+      `,
+    }]);
+    // Anonymous class expr takes the binding name (K); a named class expr keeps its own name.
+    expect(edgePairs(result)).toContain('caller→callee');
+    expect(edgePairs(result)).toContain('run→work');
+    const e = result.edges.find(x => x.calleeName === 'callee' && x.confidence === 'self_cls');
+    expect(e?.calleeId).toBe('src/ce.ts::K.callee');
+    const e2 = result.edges.find(x => x.calleeName === 'work' && x.confidence === 'self_cls');
+    expect(e2?.calleeId).toBe('src/ce.ts::Named.work');
+  });
+
+  it('does NOT create a self_cls edge from a this.call inside a nested object literal / function', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/nest.ts',
+      language: 'TypeScript',
+      content: `
+        class A {
+          realMethod() { return 1; }
+          viaObject() {
+            const obj = { inner() { this.realMethod(); } };  // runtime this = obj, NOT A
+            return obj;
+          }
+          viaFunction() {
+            function helper() { this.realMethod(); }          // nested fn, this != A
+            return helper;
+          }
+        }
+      `,
+    }]);
+    // The nested object-method and nested function are not A's methods — their this.realMethod()
+    // must NOT resolve to A.realMethod (no false self_cls edge).
+    const falseEdges = result.edges.filter(e => e.calleeName === 'realMethod' && e.confidence === 'self_cls');
+    expect(falseEdges).toEqual([]);
   });
 
   it('extracts class methods', async () => {
@@ -96,6 +329,36 @@ describe('CallGraphBuilder — TypeScript', () => {
     expect(result.nodes.get(mainEdge!.calleeId)?.filePath).toBe('a.ts');
   });
 
+  it('seeds resolution with pre-existing nodes so a subset rebuild does not degrade cross-file calls to external', async () => {
+    const builder = new CallGraphBuilder();
+
+    // The callee lives in utils.ts.
+    const full = await builder.build([{
+      path: 'src/utils.ts', language: 'TypeScript',
+      content: `export function validateThing() {}`,
+    }]);
+    const utilsNode = Array.from(full.nodes.values()).find(n => n.name === 'validateThing')!;
+
+    // Incremental subset rebuild of ONLY the caller file — utils.ts is not in the subset.
+    const callerOnly = [{
+      path: 'src/caller.ts', language: 'TypeScript',
+      content: `function handle() { validateThing(); }`,
+    }];
+
+    // Without seeds: the call degrades to a synthetic external leaf (the bug).
+    const degraded = await builder.build(callerOnly);
+    const dEdge = degraded.edges.find(e => degraded.nodes.get(e.callerId)?.name === 'handle');
+    expect(dEdge!.calleeId).toBe('external::validateThing');
+
+    // With seeds: the call resolves to the real internal node id, and the seed
+    // node is NOT added to the subset's output nodes.
+    const fixed = await builder.build(callerOnly, undefined, undefined, [utilsNode]);
+    const fEdge = fixed.edges.find(e => fixed.nodes.get(e.callerId)?.name === 'handle');
+    expect(fEdge!.calleeId).toBe('src/utils.ts::validateThing');
+    expect(fEdge!.confidence).not.toBe('external');
+    expect(Array.from(fixed.nodes.keys())).not.toContain('src/utils.ts::validateThing');
+  });
+
   it('extracts arrow functions assigned to variables', async () => {
     const builder = new CallGraphBuilder();
     const result = await builder.build([{
@@ -110,6 +373,161 @@ describe('CallGraphBuilder — TypeScript', () => {
     expect(nodeNames(result)).toContain('transform');
     expect(nodeNames(result)).toContain('process');
     expect(fanIn(result, 'transform')).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nested-function identity (change: add-stable-nested-function-identity)
+// ---------------------------------------------------------------------------
+
+describe('CallGraphBuilder — stable nested-function identity', () => {
+  const NESTED = `
+    function helper() { return 'top'; }
+    class A {
+      m1() { function helper() { sideEffect1(); } return helper(); }
+      m2() { function helper() { sideEffect2(); } return helper(); }
+    }
+    function sideEffect1() {}
+    function sideEffect2() {}
+  `;
+
+  it('gives same-named nested functions distinct, scope-qualified ids (no merge)', async () => {
+    const result = await new CallGraphBuilder().build([{ path: 'src/n.ts', language: 'TypeScript', content: NESTED }]);
+    const helperIds = Array.from(result.nodes.values()).filter(n => n.name === 'helper').map(n => n.id).sort();
+    // top-level keeps the bare id; each nested helper is qualified by its enclosing method.
+    expect(helperIds).toEqual([
+      'src/n.ts::A.m1/helper',
+      'src/n.ts::A.m2/helper',
+      'src/n.ts::helper',
+    ]);
+    // Each nested helper keeps its OWN outgoing edge — not merged.
+    expect(edgePairs(result)).toContain('helper→sideEffect1');
+    expect(edgePairs(result)).toContain('helper→sideEffect2');
+  });
+
+  it('keeps nested-function ids STABLE when unrelated code shifts above them', async () => {
+    const a = await new CallGraphBuilder().build([{ path: 'src/n.ts', language: 'TypeScript', content: NESTED }]);
+    const b = await new CallGraphBuilder().build([{ path: 'src/n.ts', language: 'TypeScript', content: `const X = 1;\nfunction unrelated(){}\n${NESTED}` }]);
+    const ids = (r: Awaited<ReturnType<CallGraphBuilder['build']>>) =>
+      Array.from(r.nodes.values()).filter(n => n.name === 'helper').map(n => n.id).sort();
+    // Scope-qualified (not byte-offset) → unchanged by an unrelated edit.
+    expect(ids(b)).toEqual(ids(a));
+  });
+
+  it('disambiguates two same-named functions in the SAME scope by document-order ordinal', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/d.ts', language: 'TypeScript',
+      content: `function outer() { function dup(){} function dup(){} }`,
+    }]);
+    const ids = Array.from(result.nodes.values()).filter(n => n.name === 'dup').map(n => n.id).sort();
+    expect(ids).toEqual(['src/d.ts::outer/dup', 'src/d.ts::outer/dup#2']);
+  });
+
+  // Scope contract: a same-id container is the SAME function matched twice (export
+  // wrapper / decorator), NOT a nested function — it must still collapse to one node.
+  it('does NOT split an `export function` double-match into a nested node', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/e.ts', language: 'TypeScript',
+      content: `export async function createOrder() { return 1; }`,
+    }]);
+    const ids = Array.from(result.nodes.values()).filter(n => n.name === 'createOrder').map(n => n.id);
+    expect(ids).toEqual(['src/e.ts::createOrder']); // one node, no `createOrder/createOrder`
+  });
+
+  // A call to a same-named function must bind to the twin nested in the CALLER's own
+  // scope, not merely the first same-file homonym. The node-split makes the two `validate`
+  // distinct nodes; the resolver must then route each method's `validate()` call to its own
+  // nested validate (else processB would misroute into processA's scope).
+  it('routes a nested call to the twin in the callers own scope (lexical resolution)', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/svc.ts', language: 'TypeScript',
+      content:
+        `class Service {\n` +
+        `  processA() { function validate(x: number) { return sinkA(x); } return validate(1); }\n` +
+        `  processB() { function validate(y: string) { return sinkB(y); } return validate('z'); }\n` +
+        `}\n` +
+        `function sinkA(n: number){ return n; }\nfunction sinkB(s: string){ return s; }`,
+    }]);
+    const byId = new Map(Array.from(result.nodes.values()).map(n => [n.id, n]));
+    const edgeFrom = (callerId: string, calleeName: string) =>
+      result.edges.find(e => e.callerId === callerId && byId.get(e.calleeId)?.name === calleeName);
+    // Each method calls ITS OWN nested validate, not the first one.
+    expect(edgeFrom('src/svc.ts::Service.processA', 'validate')?.calleeId).toBe('src/svc.ts::Service.processA/validate');
+    expect(edgeFrom('src/svc.ts::Service.processB', 'validate')?.calleeId).toBe('src/svc.ts::Service.processB/validate');
+    // And each validate keeps its own distinct downstream (no cross-wiring).
+    expect(edgePairs(result)).toContain('validate→sinkA');
+    expect(edgePairs(result)).toContain('validate→sinkB');
+  });
+
+  it('binds a recursive nested function to ITSELF, not a same-named sibling-scope twin', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/rec.ts', language: 'TypeScript',
+      content:
+        `class T {\n` +
+        `  a() { function visit(n: number){ if (n) visit(n - 1); } return visit(3); }\n` +
+        `  b() { function visit(n: number){ if (n) visit(n - 1); } return visit(3); }\n` +
+        `}`,
+    }]);
+    const recursesToSelf = (id: string) =>
+      result.edges.some(e => e.callerId === id && e.calleeId === id);
+    expect(recursesToSelf('src/rec.ts::T.a/visit')).toBe(true);
+    expect(recursesToSelf('src/rec.ts::T.b/visit')).toBe(true);
+    // The recursive call must NOT cross into the other method's visit.
+    expect(result.edges.some(e =>
+      e.callerId === 'src/rec.ts::T.b/visit' && e.calleeId === 'src/rec.ts::T.a/visit')).toBe(false);
+  });
+
+  // The shared query-spec extractor (C#/Kotlin/Scala/…) dedupes colliding ids at
+  // extraction; a genuinely NESTED twin must still survive to be re-keyed (it used to be
+  // dropped before disambiguation, leaving those languages merging nested twins) while a
+  // true overload at the same scope must still collapse to one node.
+  it('disambiguates nested twins in a query-spec language (C#) yet still collapses overloads', async () => {
+    const nested = await new CallGraphBuilder().build([{
+      path: 'x.cs', language: 'C#',
+      content:
+        `class Order {\n` +
+        `  void Process() { void Validate() { SinkA(); } Validate(); }\n` +
+        `  void Submit() { void Validate() { SinkB(); } Validate(); }\n` +
+        `  void SinkA() {} void SinkB() {}\n` +
+        `}`,
+    }]);
+    const vids = Array.from(nested.nodes.values()).filter(n => n.name === 'Validate').map(n => n.id).sort();
+    expect(vids).toEqual(['x.cs::Order.Process/Validate', 'x.cs::Order.Submit/Validate']);
+    const byId = new Map(Array.from(nested.nodes.values()).map(n => [n.id, n]));
+    const edge = (caller: string) => nested.edges.find(e => e.callerId === caller && byId.get(e.calleeId)?.name === 'Validate')?.calleeId;
+    expect(edge('x.cs::Order.Process')).toBe('x.cs::Order.Process/Validate');
+    expect(edge('x.cs::Order.Submit')).toBe('x.cs::Order.Submit/Validate');
+
+    // Overloads (same id at class scope, not nested) MUST still collapse to one node.
+    const overload = await new CallGraphBuilder().build([{
+      path: 'o.cs', language: 'C#',
+      content:
+        `class Calc {\n` +
+        `  int Add(int a, int b) { return a + b; }\n` +
+        `  string Add(string a, string b) { return a + b; }\n` +
+        `}`,
+    }]);
+    expect(Array.from(overload.nodes.values()).filter(n => n.name === 'Add').map(n => n.id)).toEqual(['o.cs::Calc.Add']);
+  });
+
+  // Re-keying a nested node must carry its CFG overlay with it. The CFG is collected by
+  // start byte during extraction and re-attached to the FINAL node id, so a re-keyed
+  // nested function is NOT left without a CFG (and no stale CFG orphans under the
+  // pre-disambiguation bare id). Guards the def-use / analyze_error_propagation consumers.
+  it('keeps each re-keyed nested function reachable by its CFG overlay (no orphan, no loss)', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/cfg.ts', language: 'TypeScript',
+      content:
+        `function outer(){ function helper(){ if (Math.random() > 0.5) { return 1; } return 2; } return helper(); }\n` +
+        `function other(){ function helper(){ for (let i = 0; i < 3; i++) {} return 3; } return helper(); }`,
+    }]);
+    const nodeIds = new Set(Array.from(result.nodes.values()).map(n => n.id));
+    const nested = [...nodeIds].filter(id => id === 'src/cfg.ts::outer/helper' || id === 'src/cfg.ts::other/helper');
+    expect(nested.sort()).toEqual(['src/cfg.ts::other/helper', 'src/cfg.ts::outer/helper']);
+    // BOTH nested helpers keep their OWN CFG (not collapsed to one by last-write-wins).
+    for (const id of nested) expect(result.cfgs?.has(id)).toBe(true);
+    // No CFG keyed under an id that no node carries (the stale bare `::helper`).
+    for (const key of result.cfgs?.keys() ?? []) expect(nodeIds.has(key)).toBe(true);
   });
 });
 
@@ -132,6 +550,481 @@ describe('CallGraphBuilder — JavaScript', () => {
     expect(nodeNames(result)).toEqual(['init', 'setup']);
     expect(edgePairs(result)).toEqual(['init→setup']);
     expect(fanIn(result, 'setup')).toBe(1);
+  });
+
+  it('parses JSX files with JSX syntax and resolves their calls', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/View.jsx',
+      language: 'JavaScript',
+      content: `
+        function save() {}
+        export function View() {
+          return <button onClick={() => save()}>Save</button>;
+        }
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(['View', 'save']);
+    expect(edgePairs(result)).toContain('View→save');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript — member-assigned & var-bound functions (CommonJS / pre-class idioms)
+// (change: widen-js-function-node-extraction)
+// ---------------------------------------------------------------------------
+
+describe('CallGraphBuilder — member-assigned & var-bound functions', () => {
+  it('indexes `exports.x = function(){}` as a node named exports.x', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/handler.js',
+      language: 'JavaScript',
+      content: `
+        exports.handler = function handler() { helper(); };
+        function helper() {}
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('exports.handler');
+    expect(result.nodes.has('lib/handler.js::exports.handler')).toBe(true);
+    expect(edgePairs(result)).toContain('exports.handler→helper');
+    expect(fanIn(result, 'helper')).toBe(1);
+  });
+
+  it('indexes `obj.method = function(){}` (Express-style) and resolves its calls', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/application.js',
+      language: 'JavaScript',
+      content: `
+        var app = {};
+        app.use = function use(fn) { return app.lazyrouter(); };
+        app.lazyrouter = function lazyrouter() {};
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(expect.arrayContaining(['app.use', 'app.lazyrouter']));
+    expect(edgePairs(result)).toContain('app.use→app.lazyrouter');
+  });
+
+  it('indexes `X.prototype.y = function(){}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/view.js',
+      language: 'JavaScript',
+      content: `
+        function View() {}
+        View.prototype.render = function render() {};
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('View.prototype.render');
+    expect(result.nodes.has('lib/view.js::View.prototype.render')).toBe(true);
+  });
+
+  it('indexes a bare identifier assignment `f = function(){}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/late.js',
+      language: 'JavaScript',
+      content: `
+        let f;
+        f = function f() {};
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('f');
+  });
+
+  it('indexes a `var`-bound function/arrow', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/old.js',
+      language: 'JavaScript',
+      content: `
+        var parse = function parse() {};
+        var format = () => {};
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(expect.arrayContaining(['parse', 'format']));
+  });
+
+  it('indexes a member-assigned arrow', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/router.js',
+      language: 'JavaScript',
+      content: `
+        var router = {};
+        router.handle = (req, res) => {};
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('router.handle');
+  });
+
+  it('does NOT index member assignments whose RHS is not a function', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/reexport.js',
+      language: 'JavaScript',
+      content: `
+        exports.router = require('./router');
+        exports.VERSION = 42;
+        exports.config = { a: 1 };
+        function real() {}
+      `,
+    }]);
+
+    // Only the genuine function is a node; the re-export, the number and the
+    // object literal must extract nothing.
+    expect(nodeNames(result)).toEqual(['real']);
+  });
+
+  it('collapses a re-assigned member to a single node (no duplicate explosion)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/reassign.js',
+      language: 'JavaScript',
+      content: `
+        obj.fn = function () {};
+        obj.fn = function () {};
+      `,
+    }]);
+
+    const fnNodes = Array.from(result.nodes.values()).filter(n => n.name === 'obj.fn');
+    expect(fnNodes.length).toBe(1);
+  });
+
+  it('assigns member-named nodes a distinct, escaped stableId', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/app.js',
+      language: 'JavaScript',
+      content: `app.use = function use(fn) {};`,
+    }]);
+
+    const node = Array.from(result.nodes.values()).find(n => n.name === 'app.use');
+    expect(node).toBeDefined();
+    // Dotted member names are backtick-escaped by stableSymbolId.
+    expect(node?.stableId).toBeDefined();
+    expect(node?.stableId).toContain('app.use');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript/TypeScript — class-field arrow/function members
+// (change: widen-js-function-node-extraction — public_field_definition arm)
+// ---------------------------------------------------------------------------
+
+describe('CallGraphBuilder — class-field arrow/function members', () => {
+  it('indexes `class C { handler = () => {} }` as C.handler with the enclosing className', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/widget.ts',
+      language: 'TypeScript',
+      content: `
+        class Widget {
+          handler = () => {};
+        }
+      `,
+    }]);
+
+    expect(nodeNames(result)).toContain('handler');
+    expect(result.nodes.get('src/widget.ts::Widget.handler')?.className).toBe('Widget');
+  });
+
+  it('resolves calls out of a class-field arrow', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/comp.ts',
+      language: 'TypeScript',
+      content: `
+        function recompute(msg) {}
+        class Comp {
+          onClick = () => { recompute('clicked'); };
+        }
+      `,
+    }]);
+
+    expect(edgePairs(result)).toContain('onClick→recompute');
+    expect(fanIn(result, 'recompute')).toBe(1);
+  });
+
+  it('indexes a class-field function expression and a type-annotated field arrow', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/svc.ts',
+      language: 'TypeScript',
+      content: `
+        class Svc {
+          legacy = function legacy() {};
+          typed: () => void = () => {};
+        }
+      `,
+    }]);
+
+    expect(nodeNames(result)).toEqual(expect.arrayContaining(['legacy', 'typed']));
+    expect(result.nodes.get('src/svc.ts::Svc.legacy')?.className).toBe('Svc');
+    expect(result.nodes.get('src/svc.ts::Svc.typed')?.className).toBe('Svc');
+  });
+
+  it('does NOT index non-function class fields', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/state.ts',
+      language: 'TypeScript',
+      content: `
+        class State {
+          count = 0;
+          data = {};
+          label = 'x';
+          real = () => {};
+        }
+      `,
+    }]);
+
+    // Only the arrow field is a node; the number, object and string fields extract nothing.
+    expect(nodeNames(result)).toEqual(['real']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript/TypeScript — widen-js extraction: adversarial boundaries
+// (change: widen-js-function-node-extraction — exclusion shapes the PR body
+//  claims "by construction" but the first cut left untested, plus the async-
+//  metadata correctness that the captured RHS value node now drives.)
+// ---------------------------------------------------------------------------
+
+describe('CallGraphBuilder — widen-js exclusion boundaries', () => {
+  it('does NOT index a computed-member assignment `obj[key] = function(){}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/dyn.js',
+      language: 'JavaScript',
+      content: `obj[key] = function(){}; function real(){}`,
+    }]);
+    // subscript_expression LHS is not a member_expression — excluded by construction.
+    expect(nodeNames(result)).toEqual(['real']);
+  });
+
+  it('does NOT index an augmented assignment `obj.x ||= function(){}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/aug.js',
+      language: 'JavaScript',
+      content: `obj.x ||= function(){}; obj.y = function(){}; function real(){}`,
+    }]);
+    // augmented_assignment_expression is a distinct node type — only the plain `=` matches.
+    expect(nodeNames(result)).toEqual(['obj.y', 'real']);
+  });
+
+  it('indexes only the inner binding of a chained `exports.a = exports.b = function(){}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/chain.js',
+      language: 'JavaScript',
+      content: `exports.a = exports.b = function(){};`,
+    }]);
+    // The outer assignment's RHS is another assignment_expression, not a function — only inner matches.
+    expect(nodeNames(result)).toEqual(['exports.b']);
+  });
+
+  it('does NOT index a private class field `#handler = () => {}`', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/priv.ts',
+      language: 'TypeScript',
+      content: `class C { #secret = () => {}; pub = () => {}; }`,
+    }]);
+    // #-prefixed fields are private_property_identifier, not property_identifier.
+    expect(nodeNames(result)).toEqual(['pub']);
+  });
+
+  it('collapses a member LHS split across lines to a stable dotted name', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/wrap.js',
+      language: 'JavaScript',
+      content: `app\n  .use = function(){};`,
+    }]);
+    expect(nodeNames(result)).toContain('app.use');
+  });
+
+  it('resolves an inbound call to a member-assigned method', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/inbound.js',
+      language: 'JavaScript',
+      content: `
+        app.render = function render(){};
+        app.boot = function boot(){ app.render(); };
+      `,
+    }]);
+    expect(edgePairs(result)).toContain('app.boot→app.render');
+    expect(fanIn(result, 'app.render')).toBe(1);
+    // The edge must land on the real internal node, not a synthetic external leaf.
+    const renderId = 'lib/inbound.js::app.render';
+    expect(result.edges.some(e => e.calleeId === renderId)).toBe(true);
+    expect(result.nodes.has('external::app.render')).toBe(false);
+  });
+
+  it('does NOT fabricate a member edge when no dotted node matches', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/nomatch.js',
+      language: 'JavaScript',
+      content: `
+        app.boot = function boot(){ redisClient.get('k'); };
+        app.use = function use(){};
+      `,
+    }]);
+    // redisClient.get has no internal dotted node — must stay an external leaf,
+    // and must not spuriously resolve onto an unrelated member node.
+    expect(fanIn(result, 'app.use')).toBe(0);
+    expect(result.nodes.has('external::redisClient.get')).toBe(true);
+  });
+});
+
+describe('CallGraphBuilder — widen-js async metadata (RHS value node)', () => {
+  it('marks an async member-assigned function isAsync', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/h.js',
+      language: 'JavaScript',
+      content: `exports.handler = async function(){};`,
+    }]);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'exports.handler')?.isAsync).toBe(true);
+  });
+
+  it('marks an async class-field arrow isAsync', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/c.ts',
+      language: 'TypeScript',
+      content: `class C { run = async () => {}; idle = () => {}; }`,
+    }]);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'run')?.isAsync).toBe(true);
+    // a non-async sibling field stays false — async must come from the RHS, not the class.
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'idle')?.isAsync).toBe(false);
+  });
+
+  it('marks an async var-bound arrow isAsync and leaves a sync one false', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'lib/v.js',
+      language: 'JavaScript',
+      content: `var load = async () => {}; var parse = () => {};`,
+    }]);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'load')?.isAsync).toBe(true);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'parse')?.isAsync).toBe(false);
+  });
+
+  it('still marks a plain `async function` declaration and `async` method isAsync', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'src/keep.ts',
+      language: 'TypeScript',
+      content: `async function fetchIt(){} class C { async load(){} sync(){} }`,
+    }]);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'fetchIt')?.isAsync).toBe(true);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'load')?.isAsync).toBe(true);
+    expect(Array.from(result.nodes.values()).find(n => n.name === 'sync')?.isAsync).toBe(false);
+  });
+
+  it('stores exact/lower-bound call counts and AST-derived TypeScript invocation bounds', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/arity.ts', language: 'TypeScript', content: `
+        function exact(a: number, b: object, c: number) {}
+        function optional(a: number, b?: number) {}
+        function defaulted(a: number, b = 1) {}
+        function withThis(this: object, value: number) {}
+        function rest(a: number, ...tail: number[]) {}
+        function run(xs: number[]) {
+          exact(1, { nested: [2, 3] }, optional(4));
+          rest(1, ...xs);
+        }
+      `,
+    }]);
+    const nodes = [...result.nodes.values()];
+    expect(nodes.find(n => n.name === 'exact')?.callArity).toMatchObject({
+      required: 3, total: 3, variadic: false, hasOptionalOrDefault: false, implicitReceiverCount: 0,
+    });
+    expect(nodes.find(n => n.name === 'optional')?.callArity).toMatchObject({
+      required: 1, total: 2, variadic: false, hasOptionalOrDefault: true,
+    });
+    expect(nodes.find(n => n.name === 'defaulted')?.callArity).toMatchObject({
+      required: 1, total: 2, variadic: false, hasOptionalOrDefault: true,
+    });
+    expect(nodes.find(n => n.name === 'withThis')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 1,
+    });
+    expect(nodes.find(n => n.name === 'rest')?.callArity).toMatchObject({
+      required: 1, total: 1, variadic: true, hasOptionalOrDefault: false,
+    });
+    expect(result.edges.find(e => e.calleeName === 'exact')).toMatchObject({ argCount: 3 });
+    expect(result.edges.find(e => e.calleeName === 'rest')).toMatchObject({
+      argCount: 1, argCountLowerBound: true,
+    });
+  });
+
+  it('does not count TypeScript comments as call or declaration arguments', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/comment-arity.ts', language: 'TypeScript', content: `
+        function target(a: number, /* declaration comment */ b: number) {}
+        function run() { target(1, /* call comment */ 2); }
+      `,
+    }]);
+    expect([...result.nodes.values()].find(n => n.name === 'target')?.callArity).toMatchObject({
+      required: 2, total: 2, variadicParameterCount: 0,
+    });
+    expect(result.edges.find(e => e.calleeName === 'target')).toMatchObject({ argCount: 2 });
+  });
+
+  it('keeps interface and type-literal signatures distinct from executable functions', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/type-surfaces.ts', language: 'TypeScript', content: `
+        interface Contract { execute(value: string): void; }
+        type CallbackShape = { execute(value: string, radix: number): void };
+        function execute(value: string) { return value; }
+        class Service { execute(value: string) { return value; } }
+      `,
+    }]);
+    const execute = [...result.nodes.values()].filter(n => n.name === 'execute');
+    expect(execute.map(n => n.id).sort()).toEqual([
+      'src/type-surfaces.ts::CallbackShape.execute',
+      'src/type-surfaces.ts::Contract.execute',
+      'src/type-surfaces.ts::Service.execute',
+      'src/type-surfaces.ts::execute',
+    ]);
+    expect(execute.every(n => n.callArity?.overloaded !== true)).toBe(true);
+  });
+
+  it('captures JavaScript call counts without claiming definition arity semantics', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/arity.js', language: 'JavaScript',
+      content: 'function target(a) {} function run(xs) { target(1); target(...xs); }',
+    }]);
+    expect([...result.nodes.values()].find(n => n.name === 'target')?.callArity).toBeUndefined();
+    const calls = result.edges.filter(e => e.calleeName === 'target');
+    expect(calls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ argCount: 1 }),
+      expect.objectContaining({ argCount: 0, argCountLowerBound: true }),
+    ]));
+  });
+
+  it('marks collapsed TypeScript overloads so no consumer trusts one declaration shape', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'src/over.ts', language: 'TypeScript', content: `
+        function parse(a: string): void;
+        function parse(a: string, radix: number): void;
+        function parse(a: string, radix?: number): void {}
+      `,
+    }]);
+    expect([...result.nodes.values()].find(n => n.name === 'parse')?.callArity?.overloaded).toBe(true);
   });
 });
 
@@ -161,6 +1054,112 @@ def validate():
     expect(nodeNames(result)).toEqual(['main', 'process', 'validate']);
     expect(fanIn(result, 'validate')).toBe(2);
     expect(fanOut(result, 'main')).toBe(2);
+  });
+
+  it('stores Python call counts and excludes implicit receivers from invocation bounds', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'arity.py', language: 'Python', content: `
+def target(a, b=1, *rest, **kwargs):
+    pass
+
+def standalone(self):
+    pass
+
+class Service:
+    def method(self, value):
+        target(value, named=2)
+        target(value, *rest)
+
+    @staticmethod
+    def static(self):
+        pass
+      `,
+    }]);
+    const nodes = [...result.nodes.values()];
+    expect(nodes.find(n => n.name === 'target')?.callArity).toMatchObject({
+      required: 1, total: 2, variadic: true, variadicParameterCount: 2,
+      hasOptionalOrDefault: true, implicitReceiverCount: 0,
+    });
+    expect(nodes.find(n => n.name === 'method')?.callArity).toMatchObject({
+      required: 1, total: 1, variadic: false, implicitReceiverCount: 1,
+    });
+    expect(nodes.find(n => n.name === 'standalone')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 0,
+    });
+    expect(nodes.find(n => n.name === 'static')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 0,
+    });
+    const calls = result.edges.filter(e => e.calleeName === 'target');
+    expect(calls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ argCount: 2 }),
+      expect.objectContaining({ argCount: 1, argCountLowerBound: true }),
+    ]));
+  });
+
+  it('excludes Python comments and positional/keyword separators from exact counts', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'comment_arity.py', language: 'Python', content: `
+def target(a,  # declaration comment
+           /, b, *, c):
+    pass
+
+def run():
+    target(1,  # call comment
+           2, c=3)
+      `,
+    }]);
+    expect([...result.nodes.values()].find(n => n.name === 'target')?.callArity).toMatchObject({
+      required: 3, total: 3, variadic: false, variadicParameterCount: 0,
+    });
+    expect(result.edges.find(e => e.calleeName === 'target')).toMatchObject({ argCount: 3 });
+  });
+
+  it('binds the first parameter of every non-static Python method regardless of its name', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'receiver.py', language: 'Python', content: `
+class Service:
+    def method(receiver, value):
+        def helper(value):
+            return value
+        return value
+
+    @classmethod
+    def create(klass, value):
+        return value
+
+    @staticmethod
+    def static(receiver, value):
+        return value
+      `,
+    }]);
+    const nodes = [...result.nodes.values()];
+    expect(nodes.find(n => n.name === 'method')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 1,
+    });
+    expect(nodes.find(n => n.name === 'create')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 1,
+    });
+    expect(nodes.find(n => n.name === 'static')?.callArity).toMatchObject({
+      required: 2, total: 2, implicitReceiverCount: 0,
+    });
+    expect(nodes.find(n => n.name === 'helper')?.callArity).toMatchObject({
+      required: 1, total: 1, implicitReceiverCount: 0,
+    });
+  });
+
+  it('marks collapsed Python overload declarations as non-authoritative arity', async () => {
+    const result = await new CallGraphBuilder().build([{
+      path: 'over.py', language: 'Python', content: `
+from typing import overload
+@overload
+def parse(value: str): ...
+@overload
+def parse(value: str, radix: int): ...
+def parse(value, radix=None):
+    pass
+      `,
+    }]);
+    expect([...result.nodes.values()].find(n => n.name === 'parse')?.callArity?.overloaded).toBe(true);
   });
 
   it('extracts class methods and resolves self.method() calls', async () => {
@@ -332,6 +1331,30 @@ impl Engine {
     expect(startNode?.className).toBe('Engine');
     expect(startNode?.isAsync).toBe(true);
   });
+
+  it('uses the implementing type (not the trait) as className for `impl Trait for Struct`', async () => {
+    // Regression: the impl-block className must be the implementing type, not the
+    // trait — otherwise every impl of a trait collapses onto the trait name and
+    // distinct types' methods collide (and content-addressed stableIds collide).
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'draw.rs',
+      language: 'Rust',
+      content: `
+trait Drawable { fn draw(&self); }
+struct Circle {}
+struct Square {}
+impl Drawable for Circle { fn draw(&self) {} }
+impl Drawable for Square { fn draw(&self) {} }
+impl<T> Holder<T> { fn get(&self) {} }
+`,
+    }]);
+    const draws = Array.from(result.nodes.values()).filter(n => n.name === 'draw');
+    expect(draws.map(n => n.className).sort()).toEqual(['Circle', 'Square']); // not "Drawable"
+    // generic impl keeps the base type as className (generics stripped), not undefined
+    const get = Array.from(result.nodes.values()).find(n => n.name === 'get');
+    expect(get?.className).toBe('Holder');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -436,6 +1459,143 @@ public class OrderService {
     expect(createNode?.className).toBe('OrderService');
   });
 
+  it('does not drop calls to methods named after C++/Swift builtins', async () => {
+    // Regression (#138): IGNORED_CALLEES was global, so C++/Swift stdlib names
+    // (find/contains/remove/insert/size/...) silently dropped legitimate Java
+    // calls — e.g. a repository `find(id)` or a cache `remove(k)`.
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Repo.java',
+      language: 'Java',
+      content: `
+public class Repo {
+    public Item lookup(int id) {
+        return find(id);
+    }
+    private Item find(int id) { return null; }
+}
+      `,
+    }]);
+
+    // The internal `find` method must keep its caller edge (not be ignored).
+    expect(edgePairs(result)).toContain('lookup→find');
+    expect(fanIn(result, 'find')).toBe(1);
+  });
+
+  it('emits one edge per qualified call (no bare/qualified duplication)', async () => {
+    // Regression (#138): JAVA_CALL_QUERY matched a qualified `Money.of(...)` with
+    // BOTH the qualified and the bare pattern, emitting two edges (a `Money.of`
+    // external node AND a bare `of`). That doubled fan-out and let bare names
+    // falsely resolve to unrelated same-named methods.
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Pay.java',
+      language: 'Java',
+      content: `
+public class Pay {
+    public Receipt process(Order o) {
+        Money m = Money.of(o.total());
+        return repo.save(m);
+    }
+}
+      `,
+    }]);
+
+    // No bare duplicates of the qualified callees.
+    const externalNames = Array.from(result.nodes.values()).filter(n => n.isExternal).map(n => n.name);
+    expect(externalNames).not.toContain('of');    // only `Money.of`
+    expect(externalNames).not.toContain('save');  // only `repo.save`
+    // process makes exactly three distinct outgoing calls: Money.of, o.total, repo.save.
+    expect(fanOut(result, 'process')).toBe(3);
+  });
+
+  it('captures constructor calls, method references, and chained calls', async () => {
+    // Java patterns previously missing/dropped: `new Foo()` (object_creation),
+    // `this::m` (method_reference), and the outer call of a chain `a.b().c()`
+    // distinct calls keyed by callee-name position so both survive the dedup).
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Svc.java',
+      language: 'Java',
+      content: `
+public class Svc {
+    void run(java.util.List items) {
+        Helper h = new Helper();        // constructor call
+        items.forEach(this::handle);    // method reference -> internal handle
+        items.stream().collect();       // chained: stream() AND collect() must both appear
+    }
+    void handle(Object o) {}
+}
+class Helper {}
+      `,
+    }]);
+
+    const pairs = edgePairs(result);
+    expect(pairs).toContain('run→Helper');        // new Helper()
+    expect(pairs).toContain('run→handle');        // this::handle resolved internally
+    // Both ends of the chain `items.stream().collect()` must appear: the inner
+    // qualified call is labeled by its receiver, the outer bare call by name.
+    expect(pairs).toContain('run→items.stream');  // inner chained call
+    expect(pairs).toContain('run→collect');       // outer chained call (regression)
+  });
+
+  it('attributes record methods to the record, not the enclosing class', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Order.java',
+      language: 'Java',
+      content: `
+public class Order {
+    record LineItem(String sku, int qty) {
+        int subtotal() { return qty * 10; }
+    }
+}
+      `,
+    }]);
+
+    const subtotal = Array.from(result.nodes.values()).find(n => n.name === 'subtotal');
+    expect(subtotal?.className).toBe('LineItem');
+  });
+
+  it('resolves a static call to an internal class (Money.of)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Money.java',
+      language: 'Java',
+      content: `
+class Money {
+    static Money of(long cents) { return new Money(cents); }
+    Money(long c) {}
+}
+class Service {
+    Money compute() { return Money.of(100); }
+}
+      `,
+    }]);
+
+    // Money.of must resolve to the internal node, not a synthetic external one.
+    expect(edgePairs(result)).toContain('compute→of');
+    const ofNode = Array.from(result.nodes.values()).find(n => n.name === 'of');
+    expect(ofNode?.isExternal).toBeFalsy();
+  });
+
+  it('collapses overloaded methods to a single node', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Api.java',
+      language: 'Java',
+      content: `
+public class Api {
+    public void send(String a) {}
+    public void send(String a, int b) {}
+}
+      `,
+    }]);
+
+    const sends = Array.from(result.nodes.values()).filter(n => n.name === 'send');
+    expect(sends).toHaveLength(1);
+  });
+
   it('extracts constructors as nodes', async () => {
     const builder = new CallGraphBuilder();
     const result = await builder.build([{
@@ -451,6 +1611,54 @@ public class UserRepository {
 
     expect(nodeNames(result)).toContain('UserRepository');
     expect(nodeNames(result)).toContain('init');
+  });
+
+  it('captures super(...) as an edge to the parent class constructor (#138)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([
+      { path: 'Person.java', language: 'Java', content: `
+public class Person {
+    public Person(String name) {}
+}
+      ` },
+      { path: 'Owner.java', language: 'Java', content: `
+public class Owner extends Person {
+    public Owner(String name, int age) { super(name); }
+}
+      ` },
+    ]);
+
+    // Constructor nodes are keyed by the class name; super(name) → Person's ctor.
+    const ctorEdges = result.edges.filter(e => e.callType === 'constructor');
+    expect(ctorEdges).toHaveLength(1);
+    expect(edgePairs(result)).toContain('Owner→Person');
+  });
+
+  it('omits this(...) self-delegation (overloads collapse to one node) (#138)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'Point.java', language: 'Java', content: `
+public class Point {
+    public Point(int x, int y) {}
+    public Point() { this(0, 0); }
+}
+      ` }]);
+    // No constructor edge: this(...) would only be a self-loop on the collapsed node.
+    expect(result.edges.filter(e => e.callType === 'constructor')).toHaveLength(0);
+  });
+
+  it('drops super(...) to an external superclass without creating an external node (#138)', async () => {
+    const builder = new CallGraphBuilder();
+    const result = await builder.build([{
+      path: 'FooException.java', language: 'Java', content: `
+public class FooException extends RuntimeException {
+    public FooException(String m) { super(m); }
+}
+      ` }]);
+    // The parent (RuntimeException) is not in the codebase → no edge, no external node.
+    expect(result.edges.filter(e => e.callType === 'constructor')).toHaveLength(0);
+    expect(nodeNames(result)).not.toContain('RuntimeException');
+    expect(Array.from(result.nodes.keys()).some(id => id.includes('RuntimeException'))).toBe(false);
   });
 });
 
@@ -883,5 +2091,327 @@ describe('CallGraphBuilder — Swift', () => {
 
     const node = Array.from(result.nodes.values()).find(n => n.name === 'fetchData');
     expect(node?.isAsync).toBe(true);
+  });
+});
+
+describe('widened receiver type inference', () => {
+  for (const fixture of [
+    {
+      language: 'Kotlin', path: 'Parser.kt', caller: 'useParser', callee: 'run',
+      content: 'class Parser { fun run() {} }\nfun useParser() { val p = Parser(); p.run() }',
+    },
+    {
+      language: 'Dart', path: 'parser.dart', caller: 'useParser', callee: 'run',
+      content: 'class Parser { void run() {} }\nvoid useParser() { final p = Parser(); p.run(); }',
+    },
+  ]) {
+    it(`${fixture.language} resolves a local receiver through its constructor type`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      const caller = [...result.nodes.values()].find(n => n.name === fixture.caller);
+      const callee = [...result.nodes.values()].find(n => n.name === fixture.callee && n.className === 'Parser');
+      const edge = result.edges.find(e => e.callerId === caller?.id && e.calleeId === callee?.id);
+      expect(edge?.confidence).toBe('type_inference');
+    });
+  }
+
+  for (const fixture of [
+    { language: 'Kotlin', path: 'post-shadow.kt', content: 'class A { fun run() {} }\nclass B { fun run() {} }\nfun use(){ val p=A(); run { val p=B() }; p.run() }' },
+    { language: 'Dart', path: 'post-shadow.dart', content: 'class A { void run() {} } class B { void run() {} }\nvoid use(){ final p=A(); { final p=B(); } p.run(); }' },
+  ]) {
+    it(`${fixture.language} retains the outer receiver after a closed shadow scope`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      expect(result.edges).toContainEqual(expect.objectContaining({ callerId: `${fixture.path}::use`, calleeId: `${fixture.path}::A.run`, confidence: 'type_inference' }));
+    });
+  }
+
+  for (const fixture of [
+    { language: 'Kotlin', path: 'write.kt', content: 'class A { fun run() {} }\nclass B { fun run() {} }\nfun use(){ var p=A(); p=B(); p.run() }' },
+    { language: 'Dart', path: 'write.dart', content: 'class A { void run() {} }\nclass B { void run() {} }\nvoid use(){ var p=A(); p=B(); p.run(); }' },
+  ]) {
+    it(`${fixture.language} refuses dispatch after an unmodeled receiver write`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      const calls = result.edges.filter(edge => edge.callerId === `${fixture.path}::use` && edge.calleeName === 'run');
+      expect(calls.every(edge => edge.confidence === 'external')).toBe(true);
+    });
+  }
+
+  for (const fixture of [
+    {
+      language: 'Kotlin', path: 'annotated.kt',
+      content: 'class Parser { fun run() {} }\nfun provide(): Parser = Parser()\nfun use() { val p: Parser = provide(); p.run() }',
+    },
+    {
+      language: 'Dart', path: 'annotated.dart',
+      content: 'class Parser { void run() {} }\nParser provide() => Parser();\nvoid use() { final Parser p = provide(); p.run(); }',
+    },
+  ]) {
+    it(`${fixture.language} dispatches an explicitly annotated receiver end to end`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      expect(result.edges).toContainEqual(expect.objectContaining({
+        callerId: `${fixture.path}::use`,
+        calleeId: `${fixture.path}::Parser.run`,
+        confidence: 'type_inference',
+      }));
+    });
+  }
+
+  for (const fixture of [
+    {
+      language: 'Kotlin', path: 'shadow.kt',
+      content: 'class A { fun run() {} }\nclass B { fun run() {} }\nfun use() {\n val p = A()\n p.run()\n run { val p = B(); p.run() }\n}',
+    },
+    {
+      language: 'Dart', path: 'shadow.dart',
+      content: 'class A { void run() {} }\nclass B { void run() {} }\nvoid use() {\n final p = A();\n p.run();\n { final p = B(); p.run(); }\n}',
+    },
+  ]) {
+    it(`${fixture.language} resolves each shadowed receiver in its lexical scope`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      const receiverCalls = result.edges.filter(edge => edge.callerId === `${fixture.path}::use` && edge.calleeName === 'run');
+      expect(receiverCalls).toEqual(expect.arrayContaining([
+        expect.objectContaining({ calleeId: `${fixture.path}::A.run`, confidence: 'type_inference' }),
+        expect.objectContaining({ calleeId: `${fixture.path}::B.run`, confidence: 'type_inference' }),
+      ]));
+    });
+  }
+
+  for (const fixture of [
+    { language: 'Kotlin', path: 'late.kt', content: 'class A { fun run() {} }\nfun use(){ p.run(); val p=A() }' },
+    { language: 'Dart', path: 'late.dart', content: 'class A { void run() {} }\nvoid use(){ p.run(); final p=A(); }' },
+  ]) {
+    it(`${fixture.language} does not resolve a receiver from a later declaration`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      expect(result.edges.some(edge => edge.callerId === `${fixture.path}::use` && edge.calleeName === 'run' && edge.confidence !== 'external')).toBe(false);
+    });
+  }
+
+  it('does not attach the assigned variable as a receiver of a Dart constructor', async () => {
+    const result = await new CallGraphBuilder().build([{
+      language: 'Dart', path: 'parser.dart',
+      content: 'class Parser { void run() {} }\nvoid useParser() { final p = Parser(); p.run(); }',
+    }]);
+    expect(result.edges.some(e => e.calleeId === 'external::p.Parser')).toBe(false);
+    expect(result.edges.some(e => e.calleeId === 'parser.dart::Parser.run' && e.confidence === 'type_inference')).toBe(true);
+  });
+
+  it('records duplicate inferred receiver types as ambiguity independent of file order', async () => {
+    const parser = (path: string) => ({ path, language: 'Kotlin', content: 'class Parser { fun run() {} }' });
+    const caller = { path: 'use.kt', language: 'Kotlin', content: 'fun use() { val p = Parser(); p.run() }' };
+    const snapshots: string[] = [];
+    for (const files of [[parser('a.kt'), parser('z.kt'), caller], [parser('z.kt'), parser('a.kt'), caller]]) {
+      const result = await new CallGraphBuilder().build(files);
+      expect(result.edges.some(e => e.confidence === 'type_inference')).toBe(false);
+      const site = result.ambiguousSites?.find(s => s.strategy === 'type_inference' && s.calleeName === 'run');
+      expect(site?.candidateIds).toEqual(['a.kt::Parser.run', 'z.kt::Parser.run']);
+      snapshots.push(JSON.stringify(site));
+    }
+    expect(snapshots[0]).toBe(snapshots[1]);
+  });
+
+  it('uses same-file affinity for an inferred receiver when another file has the same class', async () => {
+    const result = await new CallGraphBuilder().build([
+      { path: 'local.kt', language: 'Kotlin', content: 'class Parser { fun run() {} }\nfun use() { val p = Parser(); p.run() }' },
+      { path: 'other.kt', language: 'Kotlin', content: 'class Parser { fun run() {} }' },
+    ]);
+    const edge = result.edges.find(e => e.confidence === 'type_inference');
+    expect(edge?.calleeId).toBe('local.kt::Parser.run');
+    expect(result.ambiguousSites?.some(s => s.strategy === 'type_inference')).not.toBe(true);
+  });
+});
+
+describe('HTTP call-site identity', () => {
+  it('rejects malformed client syntax and discloses the HTTP degradation', async () => {
+    const result = await new CallGraphBuilder().build([
+      { path: 'bad.py', language: 'Python', content: 'import requests\ndef f(:\n requests.get("/x")' },
+      { path: 'api.py', language: 'Python', content: 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef x(): return 1' },
+    ]);
+    expect(result.edges.some(edge => edge.confidence === 'http_endpoint')).toBe(false);
+    expect(result.httpClientDegradations).toContainEqual(expect.objectContaining({ file: 'bad.py', reason: 'parse-failure' }));
+  });
+
+  it('preserves traversal-budget degradation while healthy sibling edges survive', async () => {
+    const deep = `import requests\nx=${'('.repeat(5_000)}1${')'.repeat(5_000)}`;
+    const result = await new CallGraphBuilder().build([
+      { path: 'deep.py', language: 'Python', content: deep },
+      { path: 'client.py', language: 'Python', content: 'import requests\ndef load(): return requests.get("/x")' },
+      { path: 'api.py', language: 'Python', content: 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef x(): return 1' },
+    ]);
+    expect(result.edges).toContainEqual(expect.objectContaining({ callerId: 'client.py::load', calleeId: 'api.py::x', confidence: 'http_endpoint' }));
+    expect(result.httpClientDegradations).toContainEqual({ file: 'deep.py', reason: 'traversal-budget' });
+  });
+  it('wires two same-line functions that call the same endpoint', async () => {
+    const result = await new CallGraphBuilder().build([
+      {
+        path: 'client.ts', language: 'TypeScript',
+        content: 'function a(){ fetch("/x") } function b(){ fetch("/x") }',
+      },
+      {
+        path: 'api.py', language: 'Python',
+        content: 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef x(): return 1',
+      },
+    ]);
+    const httpEdges = result.edges.filter(edge => edge.confidence === 'http_endpoint');
+    expect(httpEdges.map(edge => edge.callerId).sort()).toEqual(['client.ts::a', 'client.ts::b']);
+  });
+
+  for (const fixture of [
+    {
+      language: 'Python', path: 'client.py', caller: 'load',
+      content: 'import httpx\nasync def load():\n async with httpx.AsyncClient() as c:\n  return await c.get("/x")',
+    },
+    {
+      language: 'Go', path: 'client.go', caller: 'Load',
+      content: 'package p\nimport "net/http"\nfunc Load(){ c:=http.DefaultClient; req,_:=http.NewRequest(http.MethodGet,"/x",nil); c.Do(req) }',
+    },
+  ]) {
+    it(`wires the canonical ${fixture.language} client flow to a route`, async () => {
+      const result = await new CallGraphBuilder().build([
+        fixture,
+        { path: 'api.py', language: 'Python', content: 'from fastapi import FastAPI\napp=FastAPI()\n@app.get("/x")\ndef x(): return 1' },
+      ]);
+      expect(result.edges).toContainEqual(expect.objectContaining({
+        callerId: `${fixture.path}::${fixture.caller}`,
+        calleeId: 'api.py::x',
+        confidence: 'http_endpoint',
+      }));
+    });
+  }
+});
+
+describe('widened CFG parameter and foreach semantics', () => {
+  it('Dart models a C-style for initializer, condition, and update', async () => {
+    const result = await new CallGraphBuilder().build([{
+      language: 'Dart', path: 'cstyle.dart',
+      content: 'void f(int n) {\n for (var i = 0; i < n; i++) { print(i); }\n}',
+    }]);
+    const cfg = [...(result.cfgs?.values() ?? [])][0];
+    expect(cfg?.defUse).toContainEqual(expect.objectContaining({ variable: 'n', defLine: 1, useLine: 2 }));
+    expect(cfg?.defUse).toContainEqual(expect.objectContaining({ variable: 'i', defLine: 2, useLine: 2 }));
+  });
+
+  it('Dart runs a C-style update after the body, not in the preheader', async () => {
+    const result = await new CallGraphBuilder().build([{
+      language: 'Dart', path: 'order.dart',
+      content: 'void f(int n) {\n var i = 0;\n for (; i < n; i++) {\n  print(i);\n }\n}',
+    }]);
+    const cfg = [...(result.cfgs?.values() ?? [])][0];
+    expect(cfg?.defUse).toContainEqual(expect.objectContaining({ variable: 'i', defLine: 2, useLine: 4 }));
+  });
+
+  it('Scala fails soft for multiple generators rather than dropping later header semantics', async () => {
+    const result = await new CallGraphBuilder().build([{
+      language: 'Scala', path: 'multi.scala',
+      content: 'object C { def f(xs: List[Int], ys: List[Int]) = {\n for { x <- xs; y <- ys } yield x + y\n} }',
+    }]);
+    expect([...(result.cfgs?.values() ?? [])]).toEqual([]);
+  });
+
+  it('Scala fails soft for a guarded generator rather than dropping its iterable', async () => {
+    const result = await new CallGraphBuilder().build([{
+      language: 'Scala', path: 'guard.scala',
+      content: 'object C { def f(xs: List[Int], limit: Int) = {\n for (x <- xs if x > limit) { println(x) }\n} }',
+    }]);
+    expect([...(result.cfgs?.values() ?? [])]).toEqual([]);
+  });
+
+  for (const fixture of [
+    {
+      language: 'Kotlin', path: 'loop.kt',
+      content: 'fun f(xs: List<Int>) {\n for (x in xs) {\n  println(x)\n }\n}',
+    },
+    {
+      language: 'Swift', path: 'loop.swift',
+      content: 'func f(_ xs: [Int]) {\n for x in xs {\n  print(x)\n }\n}',
+    },
+    {
+      language: 'Scala', path: 'loop.scala',
+      content: 'object C { def f(xs: List[Int]) = {\n for (x <- xs) {\n  println(x)\n }\n} }',
+    },
+    {
+      language: 'Dart', path: 'loop.dart',
+      content: 'void f(List<int> xs) {\n for (final x in xs) {\n  print(x);\n }\n}',
+    },
+  ]) {
+    it(`${fixture.language} records its parameter, iterable use, and iteration binding`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      const cfg = [...(result.cfgs?.values() ?? [])][0];
+      expect(cfg?.params).toContain('xs');
+      expect(cfg?.defUse).toContainEqual(expect.objectContaining({ variable: 'xs', defLine: 1, useLine: 2 }));
+      expect(cfg?.defUse).toContainEqual(expect.objectContaining({ variable: 'x', defLine: 2, useLine: 3 }));
+    });
+  }
+
+  for (const fixture of [
+    {
+      language: 'Kotlin', path: 'conditional.kt',
+      content: 'fun f(x:Int):Int { var y = if (x>0) 1 else 2; while(y<3){y=y+1}; return y }',
+    },
+    {
+      language: 'Scala', path: 'conditional.scala',
+      content: 'object C { def f(x:Int):Int = { var y = if (x>0) 1 else 2; while(y<3){y += 1}; y } }',
+    },
+  ]) {
+    it(`${fixture.language} refuses an expression-valued if rather than omitting its branch`, async () => {
+      const result = await new CallGraphBuilder().build([fixture]);
+      expect([...(result.cfgs?.values() ?? [])]).toEqual([]);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// callDistance — confidence-weighted edge cost
+// ---------------------------------------------------------------------------
+
+describe('callDistance', () => {
+  const edge = (confidence: EdgeConfidence): CallEdge =>
+    ({ callerId: 'a::f', calleeId: 'b::g', calleeName: 'g', confidence });
+
+  // Pin every confidence level to its cost. Adding an EdgeConfidence member
+  // breaks compilation of CALL_DISTANCE_COSTS, forcing an explicit cost choice.
+  const expected: Record<EdgeConfidence, number> = {
+    import: 1, re_export: 1, same_file: 1, self_cls: 1, http_endpoint: 1,
+    type_inference: 2, type_name: 2, receiver_inferred: 2,
+    name_only: 3,
+    synthesized: 4,
+    external: Infinity,
+  };
+
+  for (const [confidence, cost] of Object.entries(expected) as [EdgeConfidence, number][]) {
+    it(`maps ${confidence} → ${cost}`, () => {
+      expect(callDistance(edge(confidence))).toBe(cost);
+      expect(CALL_DISTANCE_COSTS[confidence]).toBe(cost);
+    });
+  }
+
+  // change: shrink-receiver-resolution-boundary. Three runtime validators used to carry their own
+  // hand-written copy of the confidence set. Adding `receiver_inferred` to the union without them
+  // meant the edges were written to SQLite and silently dropped on every read, and one path called
+  // the freshly-written artifact invalid. The set is now DERIVED; this pins that it stays derived.
+  it('exposes every confidence value to the runtime validators', () => {
+    for (const confidence of Object.keys(expected) as EdgeConfidence[]) {
+      expect(EDGE_CONFIDENCE_VALUES.has(confidence), `${confidence} must be accepted on read`).toBe(true);
+    }
+    expect(EDGE_CONFIDENCE_VALUES.size).toBe(Object.keys(expected).length);
+  });
+
+  it('ranks strongly-resolved edges nearer than heuristic ones', () => {
+    expect(callDistance(edge('import'))).toBeLessThan(callDistance(edge('name_only')));
+  });
+
+  it('costs a synthesized edge more than any directly-resolved confidence', () => {
+    const directConfidences: EdgeConfidence[] = ['import', 'same_file', 'self_cls', 'http_endpoint', 'type_inference', 'type_name', 'receiver_inferred', 'name_only'];
+    for (const c of directConfidences) {
+      expect(callDistance(edge('synthesized'))).toBeGreaterThan(callDistance(edge(c)));
+    }
+  });
+
+  it('excludes external edges from internal traversal (Infinity)', () => {
+    expect(Number.isFinite(callDistance(edge('external')))).toBe(false);
+  });
+
+  it('falls back to a finite cost for a malformed/legacy confidence', () => {
+    // Real data never carries this, but the runtime default must not throw.
+    const bad = { callerId: 'a::f', calleeId: 'b::g', calleeName: 'g', confidence: 'exact' } as unknown as CallEdge;
+    expect(callDistance(bad)).toBe(3);
   });
 });

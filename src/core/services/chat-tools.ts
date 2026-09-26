@@ -22,18 +22,17 @@ import {
 } from './mcp-handlers/graph.js';
 
 import {
-  handleSearchCode,
   handleSuggestInsertionPoints,
   handleSearchSpecs,
   handleListSpecDomains,
   handleGetSpec,
   handleUnifiedSearch,
 } from './mcp-handlers/semantic.js';
+import { dispatchTool } from './tool-dispatch.js';
 
 import {
   handleGetArchitectureOverview,
   handleGetRefactorReport,
-  handleGetDecisions,
 } from './mcp-handlers/analysis.js';
 
 import { handleOrient } from './mcp-handlers/orient.js';
@@ -371,11 +370,12 @@ export const CHAT_TOOLS: ChatTool[] = [
       required: ['directory', 'query'],
     },
     async execute(directory, args) {
-      const result = await handleSearchCode(
-        (args.directory as string) ?? directory,
-        args.query as string,
-        (args.limit as number) ?? 10
-      );
+      const targetDirectory = (args.directory as string) ?? directory;
+      const result = await dispatchTool('search_code', {
+        directory: targetDirectory,
+        query: args.query as string,
+        limit: (args.limit as number) ?? 10,
+      }, targetDirectory);
       const paths: string[] = [];
       if (result && typeof result === 'object') {
         const r = result as Record<string, unknown>;
@@ -553,29 +553,6 @@ export const CHAT_TOOLS: ChatTool[] = [
     },
   },
 
-  // ── Architecture Decision Records ────────────────────────────────────────
-  {
-    name: 'get_decisions',
-    description:
-      'USE THIS WHEN: the user asks "why was X decided?", "is there an ADR about Y?", ' +
-      'or "what\'s the rationale behind Z?". Lists documented architectural decisions — ' +
-      'gives the "why" that is not visible in the code itself.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        directory: { type: 'string', description: 'Absolute path to the project directory' },
-        query: { type: 'string', description: 'Optional text filter on title or content' },
-      },
-      required: ['directory'],
-    },
-    async execute(directory, args) {
-      const result = await handleGetDecisions(
-        (args.directory as string) ?? directory,
-        args.query as string | undefined
-      );
-      return { result, filePaths: [] };
-    },
-  },
 
   // ── Refactor report ──────────────────────────────────────────────────────
   {

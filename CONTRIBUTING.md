@@ -1,16 +1,21 @@
-# Contributing to spec-gen
+# Contributing to openlore
 
 Thank you for your interest in contributing. This document covers how to set up your development environment, run tests, and submit changes.
 
 ## Development Setup
 
-**Requirements:** Node.js ≥ 20, npm ≥ 9
+**Requirements:** Node.js ≥ 22.5.0, npm ≥ 9
 
 ```bash
-git clone https://github.com/clay-good/spec-gen
-cd spec-gen
+git clone https://github.com/clay-good/openlore
+cd openlore
 npm install
 ```
+
+> **Windows (PowerShell):** if `npm install` fails with _"running scripts is disabled on this system"_, run this once to allow npm scripts for your user account:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
 
 Build TypeScript (outputs to `dist/`):
 
@@ -26,16 +31,30 @@ npm run dev -- analyze
 npm run dev -- generate
 ```
 
+To use the `openlore` command directly (instead of `npm run dev --`), link the package globally after building:
+
+```bash
+npm link
+```
+
+After that, `openlore init`, `openlore analyze`, etc. all work. Re-run `npm run build` before using the linked binary when you change source files.
+
 ## Agent Context Setup (one-time, after cloning)
 
-`CLAUDE.md` references `.spec-gen/analysis/CODEBASE.md`, which is git-ignored and must be generated locally:
+This repo **dogfoods OpenLore's own tools**, so your coding agent can be oriented from the first task. The tracked `CLAUDE.md` / `AGENTS.md` reference two things a fresh clone doesn't have yet — both regenerated locally, never committed:
+
+1. **`.openlore/analysis/CODEBASE.md`** (git-ignored) — the architecture digest `CLAUDE.md` loads at session start.
+2. **The OpenLore MCP server** — `CLAUDE.md` instructs your agent to call tools like `orient`, `search_code`, and `record_decision`. These live in a `.mcp.json` that is **intentionally git-ignored** (it's regenerated per machine; it merges with, never overwrites, the tracked `CLAUDE.md`).
+
+One command wires both, with no API key:
 
 ```bash
 npm run build
-npm run dev -- analyze    # or: spec-gen analyze if installed globally
+npm install -g . && openlore install --preset full   # or, without a global link:
+node dist/cli/index.js install --preset full
 ```
 
-See [Agent Setup](README.md#agent-setup) in the README for the full explanation of what this file contains and why it matters.
+`--preset full` is recommended for contributors because the **decisions-gate workflow** below needs `record_decision`, `search_specs`, and `check_spec_drift`, which the lean default preset omits. This also builds the index (generating `CODEBASE.md`). See [Agent Setup](README.md#agent-setup) in the README for what these files contain and why they matter.
 
 ## Running Tests
 
@@ -57,13 +76,12 @@ Tests use [Vitest](https://vitest.dev/). The test suite runs entirely in-process
 
 ## Integration & E2E Tests
 
-The e2e suite (`src/core/analyzer/e2e.integration.test.ts`) runs the full `analyze` pipeline against the real spec-gen codebase and verifies that semantic queries return the correct source files. It is the primary non-regression guard for the analyzer.
+The e2e suite (`src/core/analyzer/e2e.integration.test.ts`) runs the full `analyze` pipeline against the real openlore codebase and verifies that semantic queries return the correct source files. It is the primary non-regression guard for the analyzer.
 
 **Prerequisites:**
 
 ```bash
-npm run embed:up              # start the embedding server (Docker)
-spec-gen analyze --embed      # build / refresh the vector index
+openlore embed --local        # switch to the on-device embedder and build the semantic index (no Docker, no API key)
 ```
 
 **Run:**
@@ -119,7 +137,7 @@ src/
 
 ### Key conventions
 
-- **Constants:** All magic numbers and path strings belong in `src/constants.ts`. Never hardcode `.spec-gen`, `openspec`, subdirectory names, or numeric thresholds inline.
+- **Constants:** All magic numbers and path strings belong in `src/constants.ts`. Never hardcode `.openlore`, `openspec`, subdirectory names, or numeric thresholds inline.
 - **API vs CLI:** The `src/api/` layer must never call `process.exit()` or write to stdout/stderr directly — it only throws errors. The `src/cli/` layer handles all user-facing output.
 - **File existence:** Use the async `fileExists()` from `src/utils/command-helpers.ts` instead of `fs.existsSync()` in async contexts.
 - **Error classes:** Use the `errors.*` factory functions in `src/utils/errors.ts` for typed, user-facing errors.
@@ -141,13 +159,25 @@ For each `beforeEach`, reset `process.exitCode = undefined` and call `vi.clearAl
 1. Fork the repository and create a branch: `git checkout -b my-feature`
 2. Make your changes — keep PRs focused on a single concern
 3. Ensure `npm run typecheck`, `npm run lint`, and `npm run test:run` all pass
-4. If touching `src/core/analyzer/`, `src/core/generator/stages/`, or `src/core/services/mcp-handlers/`: run `npm run test:e2e` (requires `npm run embed:up` and a fresh index)
+4. If touching `src/core/analyzer/`, `src/core/generator/stages/`, or `src/core/services/mcp-handlers/`: run `npm run test:e2e` (requires a semantic index — `openlore embed --local`)
 5. Open a pull request with a clear description of the change and why
+
+## The commit gate (decisions)
+
+This repo ships a **decisions pre-commit gate** (installed by `openlore install`). When you `git commit` after changing source, it can block the commit and print JSON containing `"gated": true` — this is expected, not a crash. It means OpenLore detected an architectural decision that should be recorded before the change lands.
+
+What to do when a commit is blocked:
+
+- Read the `reason` field. Common ones: `verified` (decisions are waiting for you to approve), `approved_not_synced` (run `openlore decisions --sync`), `no_decisions_recorded` (source changed but nothing was recorded — run `openlore decisions --consolidate --gate` to check for undocumented decisions).
+- To record a decision proactively (and keep commits instant), call `record_decision` **before** writing the code — see the checklist in [`CLAUDE.md`](CLAUDE.md).
+- Escape hatch: `git commit --no-verify` skips the gate for a commit that genuinely introduces no architectural decision.
+
+The gate adds no LLM latency on the happy path; it only triggers extraction when source changed without a recorded decision.
 
 ## Reporting Bugs
 
-Open an issue at https://github.com/clay-good/spec-gen/issues with:
+Open an issue at https://github.com/clay-good/openlore/issues with:
 - The command you ran
 - The error message or unexpected output
-- Your OS, Node.js version (`node --version`), and spec-gen version (`spec-gen --version`)
-- Output of `spec-gen doctor` if relevant
+- Your OS, Node.js version (`node --version`), and openlore version (`openlore --version`)
+- Output of `openlore doctor` if relevant

@@ -4,18 +4,19 @@
  * Determines which OpenSpec scenarios are covered by existing test files.
  *
  * Mode A — Tag-based (default, fast):
- *   Scans test files for // spec-gen: {JSON} or # spec-gen: {JSON} tags.
+ *   Scans test files for // openlore: {JSON} or # openlore: {JSON} tags.
  *   O(files) — no LLM required.
  *
  * Mode B — Retroactive discovery (--discover, slower):
  *   Extracts describe()/it()/test()/TEST_CASE() titles from test files and
  *   uses LLM semantic comparison to link existing tests to uncovered scenarios.
- *   Useful for teams that already have tests but haven't run spec-gen test yet.
+ *   Useful for teams that already have tests but haven't run openlore test yet.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { fileExists } from '../../utils/command-helpers.js';
+import { isTestFile } from '../analyzer/test-file.js';
 import { parseScenarios } from './scenario-parser.js';
 import type {
   ParsedScenario,
@@ -26,19 +27,11 @@ import type {
 } from '../../types/test-generator.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { DriftResult } from '../../types/index.js';
+import { protectPrompt } from '../../utils/prompt-boundary.js';
 
 // ============================================================================
 // FILE WALKING
 // ============================================================================
-
-const TEST_FILE_PATTERNS = [
-  /\.spec\.[tj]s$/,
-  /\.test\.[tj]s$/,
-  /_test\.py$/,
-  /test_.*\.py$/,
-  /_test\.cpp$/,
-  /_test\.cc$/,
-];
 
 async function walkTestFiles(dir: string, rootPath: string): Promise<string[]> {
   const results: string[] = [];
@@ -53,12 +46,13 @@ async function walkTestFiles(dir: string, rootPath: string): Promise<string[]> {
     }
     for (const entry of entries) {
       // Skip common non-test directories
-      if (['node_modules', '.git', 'dist', 'build', '.spec-gen'].includes(entry)) continue;
+      if (['node_modules', '.git', 'dist', 'build', '.openlore'].includes(entry)) continue;
 
       const fullPath = join(current, entry);
-      // Check if it looks like a test file
-      if (TEST_FILE_PATTERNS.some((p) => p.test(entry))) {
-        results.push(relative(rootPath, fullPath));
+      // Check if it looks like a test file (canonical cross-language predicate)
+      const rel = relative(rootPath, fullPath);
+      if (isTestFile(rel)) {
+        results.push(rel);
         continue;
       }
       // Recurse into directories (heuristic: no extension = directory)
@@ -84,7 +78,7 @@ async function walkTestFiles(dir: string, rootPath: string): Promise<string[]> {
 // TAG-BASED COVERAGE (Mode A)
 // ============================================================================
 
-const TAG_REGEX = /(?:\/\/|#)\s*spec-gen:\s*(\{[^\n]+\})/g;
+const TAG_REGEX = /(?:\/\/|#)\s*openlore:\s*(\{[^\n]+\})/g;
 
 async function scanTagsInFile(
   absPath: string,
@@ -184,12 +178,13 @@ async function discoverWithLlm(
     'Only include matches with similarity >= 0.75. ' +
     'Do not include any prose or explanation.';
 
-  const userPrompt =
+  const untrustedContent =
     `Scenarios:\n${scenarioDescriptions.join('\n')}\n\n` +
     `Test titles:\n${titleList}`;
+  const prompts = protectPrompt(systemPrompt, untrustedContent);
 
   try {
-    const response = await llm.complete({ systemPrompt, userPrompt, maxTokens: 2048 });
+    const response = await llm.complete({ ...prompts, maxTokens: 2048 });
     // Extract JSON array from response
     const jsonMatch = response.content.match(/\[[\s\S]*\]/);
     if (!jsonMatch) return discovered;
@@ -244,7 +239,19 @@ export async function analyzeTestCoverage(opts: {
   } = opts;
 
   // ── 1. Parse all spec scenarios ──────────────────────────────────────────
-  const allScenarios = await parseScenarios({ rootPath, domains });
+  // Dedupe by scenario key up front. parseScenarios does not dedupe, so a spec with
+  // two identically-keyed scenarios (same domain::requirement::scenarioName — e.g. a
+  // copy-pasted `#### Scenario:` block) would make totalScenarios (a raw count) disagree
+  // with the key-deduped covered/uncovered sets and byDomain tallies, breaking the
+  // `coveredScenarios + uncovered.length = totalScenarios` invariant. Count each key once.
+  const parsedScenarios = await parseScenarios({ rootPath, domains });
+  const seenScenarioKeys = new Set<string>();
+  const allScenarios = parsedScenarios.filter((s) => {
+    const k = `${s.domain}::${s.requirement}::${s.scenarioName}`;
+    if (seenScenarioKeys.has(k)) return false;
+    seenScenarioKeys.add(k);
+    return true;
+  });
 
   // ── 2. Walk test files in testDirs ───────────────────────────────────────
   const testFiles: string[] = [];
@@ -286,14 +293,32 @@ export async function analyzeTestCoverage(opts: {
   }
 
   // ── 5. Build final covered / uncovered sets ──────────────────────────────
-  const allCovered: CoveredScenario[] = [...tagCovered];
-  for (const [, entry] of semanticCovered) {
-    allCovered.push(entry);
-  }
-
-  const allCoveredKeys = new Set(
-    allCovered.map((c) => `${c.domain}::${c.requirement}::${c.scenarioName}`)
+  // Coverage is counted ONLY against scenarios that actually exist in the parsed
+  // specs. Two guards:
+  //   - drop tags whose scenario isn't a real parsed scenario (e.g. example/
+  //     fixture tags living inside the test suite itself, like the auth specs in
+  //     this analyzer's own tests) — otherwise they inflate the count and make
+  //     `covered + uncovered ≠ total`.
+  //   - dedupe by scenario key so several files tagging the same scenario, or a
+  //     repeated tag, count once.
+  const scenarioKeys = new Set(
+    allScenarios.map((s) => `${s.domain}::${s.requirement}::${s.scenarioName}`)
   );
+  const keyOf = (c: CoveredScenario): string =>
+    `${c.domain}::${c.requirement}::${c.scenarioName}`;
+
+  // tag entries first, then semantic — first write wins on dedupe, so a tagged
+  // scenario keeps its tag attribution.
+  const rawCovered: CoveredScenario[] = [...tagCovered, ...semanticCovered.values()];
+  const allCovered: CoveredScenario[] = [];
+  const allCoveredKeys = new Set<string>();
+  for (const c of rawCovered) {
+    const k = keyOf(c);
+    if (!scenarioKeys.has(k)) continue; // not a real scenario — ignore
+    if (allCoveredKeys.has(k)) continue; // already counted
+    allCoveredKeys.add(k);
+    allCovered.push(c);
+  }
 
   const uncovered: UncoveredScenario[] = allScenarios
     .filter((s) => !allCoveredKeys.has(`${s.domain}::${s.requirement}::${s.scenarioName}`))
@@ -314,9 +339,9 @@ export async function analyzeTestCoverage(opts: {
   }
 
   // ── 7. Per-domain breakdown ──────────────────────────────────────────────
-  const byDomain: Record<string, DomainCoverage> = {};
+  const byDomain: Record<string, DomainCoverage> = Object.create(null);
   for (const s of allScenarios) {
-    if (!byDomain[s.domain]) {
+    if (!Object.prototype.hasOwnProperty.call(byDomain, s.domain)) {
       byDomain[s.domain] = {
         total: 0,
         covered: 0,
@@ -335,10 +360,13 @@ export async function analyzeTestCoverage(opts: {
   }
 
   // ── 8. Totals ────────────────────────────────────────────────────────────
+  // All derived from the deduped, real-scenario-only `allCovered`, so the
+  // invariants hold: coveredScenarios = taggedScenarios + discoveredScenarios,
+  // and coveredScenarios + uncovered.length = totalScenarios.
   const totalScenarios = allScenarios.length;
-  const taggedScenarios = tagCovered.length;
-  const discoveredScenarios = semanticCovered.size;
   const coveredScenarios = allCovered.length;
+  const taggedScenarios = allCovered.filter((c) => c.discoveredBy === 'tag').length;
+  const discoveredScenarios = allCovered.filter((c) => c.discoveredBy === 'semantic').length;
   const coveragePercent =
     totalScenarios === 0
       ? 0

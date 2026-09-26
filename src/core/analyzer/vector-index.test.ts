@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VectorIndex } from './vector-index.js';
+import { VectorIndex, _resetVectorIndexCachesForTesting } from './vector-index.js';
 import type { FunctionNode } from './call-graph.js';
 import type { FileSignatureMap } from './signature-extractor.js';
 import type { EmbeddingService } from './embedding-service.js';
+import { semanticAnswerBytes } from './derived-artifact-equivalence.js';
 
 // ============================================================================
 // FIXTURES
@@ -115,7 +117,7 @@ describe('VectorIndex', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-vector-test-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-vector-test-'));
   });
 
   // Clean up after each test
@@ -155,11 +157,89 @@ describe('VectorIndex', () => {
       expect(texts).toHaveLength(SAMPLE_NODES.length);
     });
 
-    it('throws when nodes array is empty', async () => {
-      const embedSvc = makeMockEmbedSvc();
+    it('builds a searchable signature-only index when grammar extraction produced no nodes', async () => {
+      const result = await VectorIndex.build(
+        tmpDir, [], SAMPLE_SIGNATURES, new Set(), new Set(), null,
+      );
+      expect(result).toMatchObject({ total: 2, signatureOnlySymbols: 2, productionFunctions: 0 });
+      const matches = await VectorIndex.search(tmpDir, 'authenticate JWT token', null, { limit: 5 });
+      expect(matches.map(match => match.record.name)).toContain('authenticate');
+      expect(matches.find(match => match.record.name === 'authenticate')?.record.filePath).toBe('src/auth.ts');
+    });
+
+    it('still refuses an index with neither graph nodes nor signatures', async () => {
       await expect(
-        VectorIndex.build(tmpDir, [], SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc)
-      ).rejects.toThrow('No functions to index');
+        VectorIndex.build(tmpDir, [], [], new Set(), new Set(), null),
+      ).rejects.toThrow('No repository functions to index');
+    });
+
+    it('excludes synthetic external call targets and reports the indexed population', async () => {
+      const external = makeNode({
+        id: 'external::id.startsWith',
+        name: 'id.startsWith',
+        filePath: 'external',
+        isExternal: true,
+      });
+      const testNode = makeNode({
+        id: 'src/auth.test.ts::authenticates',
+        name: 'authenticates',
+        filePath: 'src/auth.test.ts',
+        isTest: true,
+      });
+
+      const result = await VectorIndex.build(
+        tmpDir,
+        [...SAMPLE_NODES, external, testNode],
+        SAMPLE_SIGNATURES,
+        new Set(),
+        new Set(),
+        null,
+      );
+
+      expect(result).toMatchObject({
+        total: SAMPLE_NODES.length + 1,
+        productionFunctions: SAMPLE_NODES.length,
+        testFunctions: 1,
+        signatureOnlySymbols: 0,
+      });
+      _resetVectorIndexCachesForTesting();
+      expect(await VectorIndex.search(tmpDir, 'startsWith', null, { limit: 10 })).toEqual([]);
+    });
+
+    it('indexes repository signature symbols when every call-graph node is external', async () => {
+      const external = makeNode({
+        id: 'external::console.log',
+        name: 'console.log',
+        filePath: 'external',
+        isExternal: true,
+      });
+      const signatures: FileSignatureMap[] = [{
+        path: 'src/config.ts',
+        language: 'TypeScript',
+        entries: [{
+          kind: 'const',
+          name: 'DEFAULT_GREETING',
+          signature: 'const DEFAULT_GREETING = "hello"',
+        }],
+      }];
+
+      const result = await VectorIndex.build(
+        tmpDir,
+        [external],
+        signatures,
+        new Set(),
+        new Set(),
+        null,
+      );
+
+      expect(result).toMatchObject({
+        total: 1,
+        productionFunctions: 0,
+        testFunctions: 0,
+        signatureOnlySymbols: 1,
+      });
+      const matches = await VectorIndex.search(tmpDir, 'DEFAULT_GREETING', null, { limit: 5 });
+      expect(matches.map((match) => match.record.name)).toEqual(['DEFAULT_GREETING']);
     });
 
     it('marks hub functions correctly', async () => {
@@ -203,7 +283,72 @@ describe('VectorIndex', () => {
       const results = await VectorIndex.search(tmpDir, 'query', embedSvc, { limit: 10 });
       for (const r of results) {
         expect(typeof r.score).toBe('number');
+        expect(r.scoreKind).toBe('rrf');
       }
+    });
+
+    it('prefilters ANN recall so a language match below the old fetch horizon is returned', async () => {
+      const nodes = [
+        ...Array.from({ length: 29 }, (_, i) => makeNode({
+          id: `src/ts-${i}.ts::fn${i}`,
+          name: `fn${i}`,
+          filePath: `src/ts-${i}.ts`,
+          language: 'TypeScript',
+        })),
+        makeNode({
+          id: 'src/target.rs::target',
+          name: 'target',
+          filePath: 'src/target.rs',
+          language: 'Rust',
+        }),
+      ];
+      const embedSvc = makeMockEmbedSvc();
+      await VectorIndex.build(tmpDir, nodes, [], new Set(), new Set(), embedSvc);
+
+      const results = await VectorIndex.search(tmpDir, 'query', embedSvc, {
+        limit: 1,
+        language: 'Rust',
+        hybrid: false,
+      });
+
+      expect(results.map(result => result.record.id)).toEqual(['src/target.rs::target']);
+      expect(results[0].scoreKind).toBe('cosine_distance');
+    });
+
+    it('uses cosine distance when dense results are labeled cosine_distance', async () => {
+      let call = 0;
+      const embedSvc = {
+        modelName: 'cosine-test',
+        embed: vi.fn().mockImplementation(async (texts: string[]) => {
+          call++;
+          return call === 1
+            ? texts.map((_, index) => index === 0 ? [1, 0] : [0, 1])
+            : [[10, 0]];
+        }),
+      } as unknown as EmbeddingService;
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc);
+
+      const results = await VectorIndex.search(tmpDir, 'query', embedSvc, { limit: 1, hybrid: false });
+
+      expect(results[0].scoreKind).toBe('cosine_distance');
+      expect(results[0].score).toBeCloseTo(0, 5);
+    });
+
+    it('emits honest evidence for hybrid and dense-only production paths', async () => {
+      const embedSvc = makeMockEmbedSvc();
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc);
+
+      const hybrid = await VectorIndex.search(tmpDir, 'authenticate', embedSvc, { limit: 10 });
+      const auth = hybrid.find((result) => result.record.name === 'authenticate');
+      expect(auth?.matchEvidence).toMatchObject({ field: 'symbol', terms: ['authenticate'], tier: 2 });
+
+      const dense = await VectorIndex.search(tmpDir, 'authenticate', embedSvc, { limit: 10, hybrid: false });
+      expect(dense.length).toBeGreaterThan(0);
+      expect(dense.every((result) =>
+        result.matchEvidence?.field === 'vector' &&
+        result.matchEvidence.tier === 3 &&
+        result.matchEvidence.terms.length === 0,
+      )).toBe(true);
     });
 
     it('result records do not include the vector field', async () => {
@@ -273,6 +418,182 @@ describe('VectorIndex', () => {
         minFanIn: 9999,
       });
       expect(results).toHaveLength(0);
+    });
+  });
+
+  // ==========================================================================
+  // BM25-only build + search (no embedding service) — spec-06
+  // ==========================================================================
+
+  describe('BM25-only (no embeddings)', () => {
+    const META = 'vector-index-meta.json';
+
+    async function readMeta(dir: string) {
+      return JSON.parse(await readFile(join(dir, META), 'utf-8'));
+    }
+
+    it('build(embedSvc=null) creates the index and a hasEmbeddings:false sidecar', async () => {
+      const res = await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+      expect(VectorIndex.exists(tmpDir)).toBe(true);
+      expect(res.hasEmbeddings).toBe(false);
+      expect(res.total).toBe(SAMPLE_NODES.length);
+
+      expect(existsSync(join(tmpDir, META))).toBe(true);
+      const meta = await readMeta(tmpDir);
+      expect(meta.hasEmbeddings).toBe(false);
+      expect(meta.dim).toBe(0);
+      expect(meta.model).toBeNull();
+    });
+
+    it('search(embedSvc=null) returns ranked BM25 results with correct fields', async () => {
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(['src/auth.ts::authenticate']), new Set(), null);
+      _resetVectorIndexCachesForTesting();
+
+      const results = await VectorIndex.search(tmpDir, 'authenticate', null, { limit: 10 });
+      expect(results.length).toBeGreaterThan(0);
+      const auth = results.find(r => r.record.name === 'authenticate');
+      expect(auth).toBeDefined();
+      expect(auth!.record.isHub).toBe(true);
+      expect(auth!.matchEvidence).toMatchObject({ field: 'symbol', terms: ['authenticate'], tier: 1 });
+      expect((auth!.record as Record<string, unknown>)['vector']).toBeUndefined();
+      for (const r of results) expect(typeof r.score).toBe('number');
+      for (const r of results) expect(r.scoreKind).toBe('bm25');
+    });
+
+    it('explains morphological and foreign misses from indexed identifiers only', async () => {
+      const greet = makeNode({
+        id: 'src/main.ts::greet',
+        name: 'greet',
+        filePath: 'src/main.ts',
+      });
+      await VectorIndex.build(tmpDir, [greet], [], new Set(), new Set(), null);
+
+      const morphological = await VectorIndex.keywordMissDiagnostics(tmpDir, 'change the greeting');
+      expect(morphological.missedTokens).toContain('greeting');
+      expect(morphological.nearTokens).toContainEqual({
+        queryToken: 'greeting',
+        indexedTokens: ['greet'],
+      });
+
+      const foreign = await VectorIndex.keywordMissDiagnostics(tmpDir, 'kubernetes ingress rules');
+      expect(foreign.missedTokens).toEqual(['kubernetes', 'ingress', 'rules']);
+      expect(foreign.nearTokens).toEqual([]);
+    });
+
+    it('invalidates the cached identifier vocabulary after an incremental update', async () => {
+      const greet = makeNode({ id: 'src/main.ts::greet', name: 'greet', filePath: 'src/main.ts' });
+      await VectorIndex.build(tmpDir, [greet], [], new Set(), new Set(), null);
+      expect((await VectorIndex.keywordMissDiagnostics(tmpDir, 'greeting')).nearTokens)
+        .toContainEqual({ queryToken: 'greeting', indexedTokens: ['greet'] });
+
+      const welcome = makeNode({ id: 'src/main.ts::welcome', name: 'welcome', filePath: 'src/main.ts' });
+      await VectorIndex.updateFiles(
+        tmpDir,
+        [welcome],
+        new Set(['src/main.ts']),
+        [],
+        new Set(),
+        new Set(),
+        null,
+      );
+
+      const updated = await VectorIndex.keywordMissDiagnostics(tmpDir, 'welcomes');
+      expect(updated.nearTokens).toContainEqual({ queryToken: 'welcomes', indexedTokens: ['welcome'] });
+      expect(updated.nearTokens.flatMap((receipt) => receipt.indexedTokens)).not.toContain('greet');
+    });
+
+    it('does NOT embed the query against a hasEmbeddings:false index, even when an embedder is supplied', async () => {
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+      _resetVectorIndexCachesForTesting();
+
+      const spy = makeMockEmbedSvc();
+      const results = await VectorIndex.search(tmpDir, 'authenticate', spy, { limit: 10 });
+      expect(spy.embed).not.toHaveBeenCalled();
+      expect(results.length).toBeGreaterThan(0);
+    });
+
+    it.each([
+      ['unparseable', 'not json {{{'],
+      ['structurally invalid', JSON.stringify({ hasEmbeddings: 'true' })],
+    ])('rejects and repairs %s metadata instead of treating it as a dense legacy index', async (_kind, malformed) => {
+      const embedSvc = makeMockEmbedSvc();
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc);
+      const baseline = await VectorIndex.search(tmpDir, 'authenticate', embedSvc, { limit: 10 });
+      await writeFile(join(tmpDir, META), malformed, 'utf-8');
+      _resetVectorIndexCachesForTesting();
+
+      expect(VectorIndex.exists(tmpDir)).toBe(false);
+      const repairedEmbedder = makeMockEmbedSvc();
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), repairedEmbedder);
+      const results = await VectorIndex.search(tmpDir, 'authenticate', repairedEmbedder, { limit: 10 });
+      expect(VectorIndex.exists(tmpDir)).toBe(true);
+      expect(semanticAnswerBytes(results)).toBe(semanticAnswerBytes(baseline));
+      expect(results.some((result) => result.record.name === 'authenticate')).toBe(true);
+    });
+
+    it('BM25 ranking is deterministic across runs for a fixed query + corpus', async () => {
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+
+      _resetVectorIndexCachesForTesting();
+      const a = await VectorIndex.search(tmpDir, 'user', null, { limit: 10 });
+      _resetVectorIndexCachesForTesting();
+      const b = await VectorIndex.search(tmpDir, 'user', null, { limit: 10 });
+      expect(a.map(r => r.record.id)).toEqual(b.map(r => r.record.id));
+    });
+
+    it('build with a mock embedder records hasEmbeddings:true with the correct dim', async () => {
+      const embedSvc = makeMockEmbedSvc();
+      const res = await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc);
+      expect(res.hasEmbeddings).toBe(true);
+      const meta = await readMeta(tmpDir);
+      expect(meta.hasEmbeddings).toBe(true);
+      expect(meta.dim).toBe(8); // DIM from the mock
+    });
+
+    it('incremental rebuild on a no-embedding index does not crash and refreshes the corpus', async () => {
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+      const res = await VectorIndex.build(
+        tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null,
+        undefined, /* incremental */ true
+      );
+      expect(res.hasEmbeddings).toBe(false);
+      _resetVectorIndexCachesForTesting();
+      const results = await VectorIndex.search(tmpDir, 'authenticate', null, { limit: 10 });
+      expect(results.length).toBeGreaterThan(0);
+    });
+
+    it('downgrade: embedded → null rebuild converts to BM25-only', async () => {
+      const embedSvc = makeMockEmbedSvc();
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc);
+      expect((await readMeta(tmpDir)).hasEmbeddings).toBe(true);
+
+      const res = await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+      expect(res.hasEmbeddings).toBe(false);
+      expect((await readMeta(tmpDir)).hasEmbeddings).toBe(false);
+
+      // A supplied embedder must now be ignored (BM25 forced by the sidecar).
+      _resetVectorIndexCachesForTesting();
+      const spy = makeMockEmbedSvc();
+      await VectorIndex.search(tmpDir, 'authenticate', spy, { limit: 10 });
+      expect(spy.embed).not.toHaveBeenCalled();
+    });
+
+    it('upgrade: BM25-only → embedded rebuild restores hybrid search', async () => {
+      await VectorIndex.build(tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), null);
+      expect((await readMeta(tmpDir)).hasEmbeddings).toBe(false);
+
+      const embedSvc = makeMockEmbedSvc();
+      const res = await VectorIndex.build(
+        tmpDir, SAMPLE_NODES, SAMPLE_SIGNATURES, new Set(), new Set(), embedSvc,
+        undefined, /* incremental */ true
+      );
+      expect(res.hasEmbeddings).toBe(true);
+      expect((await readMeta(tmpDir)).hasEmbeddings).toBe(true);
+
+      _resetVectorIndexCachesForTesting();
+      const spy = makeMockEmbedSvc();
+      await VectorIndex.search(tmpDir, 'authenticate', spy, { limit: 10 });
+      expect(spy.embed).toHaveBeenCalled(); // ANN path active again
     });
   });
 });

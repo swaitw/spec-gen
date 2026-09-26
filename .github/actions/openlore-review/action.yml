@@ -1,0 +1,188 @@
+name: 'OpenLore structural review'
+description: >
+  Post a deterministic structural PR briefing (structural delta + blast radius) as ONE sticky comment.
+  Advisory by default — with gate:true, fails on opted-in blast-radius orphan enforcement or an invalid candidate enforcement config.
+author: 'OpenLore'
+
+# SECURITY NOTE — why every input below reaches the shell through `env:` and never
+# through `${{ }}` inside a `run:` block.
+#
+# Actions expression interpolation is a TEXTUAL substitution performed before the
+# shell starts, so a `${{ inputs.x }}` written inline in a script is not an argument —
+# it becomes part of the program, and any shell metacharacter in the value is executed
+# rather than compared.
+#
+# The defaults here are commit SHAs, but a caller controls every input. Never combine
+# a `pull_request_target` write token with a checkout of the pull request head: parsing
+# attacker-controlled repository content is a trust-boundary crossing even when the
+# analyzer does not execute that content. Passed via `env:`, input values remain inert
+# shell data; the shipped workflow example documents a split workflow for fork comments.
+
+inputs:
+  github-token:
+    description: 'Token used to create/update the sticky PR comment.'
+    required: false
+    default: ${{ github.token }}
+  base:
+    description: 'Base git ref to compare against.'
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  head:
+    description: 'Head git ref (the PR head). Defaults to the checked-out commit.'
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+  analyze:
+    description: 'Run `openlore analyze` before the review so the blast radius is fully populated.'
+    required: false
+    default: 'true'
+  gate:
+    description: 'Pass `--hook` so blocking, frozen-new, uninitialized, or unverifiable blast-radius orphan enforcement, or invalid candidate config, fails the job.'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '24'
+
+    - name: Build the SHA-pinned OpenLore Action source
+      id: openlore
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        NPM_CONFIG_CACHE: ${{ runner.temp }}/openlore-npm-cache
+        NPM_CONFIG_GLOBALCONFIG: ${{ runner.temp }}/openlore-empty-global-npmrc
+        NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+        NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/'
+        NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/openlore-empty-user-npmrc
+      run: |
+        : > "$NPM_CONFIG_GLOBALCONFIG"
+        : > "$NPM_CONFIG_USERCONFIG"
+        ACTION_REPO_ROOT="$(cd "$ACTION_PATH/../../.." && pwd -P)"
+        if [ ! -f "$ACTION_REPO_ROOT/package-lock.json" ]; then
+          echo "The SHA-pinned OpenLore Action checkout has no package-lock.json." >&2
+          exit 2
+        fi
+        cd "$ACTION_REPO_ROOT"
+        npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+        npm run build
+        CLI="$ACTION_REPO_ROOT/dist/cli/index.js"
+        if [ ! -f "$CLI" ]; then
+          echo "The SHA-pinned OpenLore Action source did not build dist/cli/index.js." >&2
+          exit 2
+        fi
+        echo "cli=$CLI" >> "$GITHUB_OUTPUT"
+
+    - name: Build the OpenLore index (optional, for full blast radius)
+      id: analyze
+      if: ${{ inputs.analyze == 'true' }}
+      shell: bash
+      env:
+        OPENLORE_CLI: ${{ steps.openlore.outputs.cli }}
+      run: |
+        set +e
+        node "$OPENLORE_CLI" analyze --no-embed
+        RC=$?
+        set -e
+        if [ "$RC" -ne 0 ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "analyze failed — review will disclose that the blast radius may be incomplete or stale"
+        else
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run openlore review
+      id: review
+      shell: bash
+      env:
+        OPENLORE_CLI: ${{ steps.openlore.outputs.cli }}
+        REVIEW_BASE: ${{ inputs.base }}
+        REVIEW_HEAD: ${{ inputs.head }}
+        REVIEW_GATE: ${{ inputs.gate }}
+        OPENLORE_REVIEW_ANALYZE_FAILED: ${{ steps.analyze.outputs.failed }}
+      run: |
+        OUT="$RUNNER_TEMP/openlore-review.md"
+        rm -f "$OUT"
+        ARGS=(review --base "$REVIEW_BASE" --head "$REVIEW_HEAD" --format markdown --out "$OUT")
+        if [ "$REVIEW_GATE" = "true" ]; then ARGS+=(--hook); fi
+        set +e
+        node "$OPENLORE_CLI" "${ARGS[@]}"
+        RC=$?
+        set -e
+        # Exit 3 is the review CLI's reserved policy-gate receipt. Defer that failure
+        # until after the evidence comment is posted; every other nonzero is an
+        # execution failure and remains advisory.
+        if [ "$REVIEW_GATE" = "true" ] && [ "$RC" -eq 3 ]; then
+          echo "gated=true" >> "$GITHUB_OUTPUT"
+          echo "openlore review: configured review enforcement gated this change — attempting to post the briefing before failing the job."
+        else
+          echo "gated=false" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "openlore review failed with exit $RC — treating this as advisory because it was not a policy-gate receipt."
+          fi
+        fi
+        if [ ! -s "$OUT" ]; then
+          echo "openlore review produced no briefing — the SHA-pinned Action source may not ship the 'review' command, or the base..head range was unreachable. Skipping the comment (advisory)."
+        fi
+
+    - name: Post or update the sticky review comment
+      id: post
+      if: ${{ github.event_name == 'pull_request' }}
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const path = `${process.env.RUNNER_TEMP}/openlore-review.md`;
+          if (!fs.existsSync(path)) { core.info('No review output to post.'); return; }
+          let body = fs.readFileSync(path, 'utf8');
+          if (!body.trim()) { core.info('Review output was empty; skipping comment.'); return; }
+          // GitHub rejects a comment body over 65536 chars (422). `openlore review` already
+          // clamps, but guard here too so a future change can never 422 the post step.
+          const MAX = 65536;
+          if (body.length > MAX) {
+            const notice = '\n\n<sub>⚠ Briefing truncated to fit GitHub\'s comment size limit.</sub>\n';
+            body = body.slice(0, MAX - notice.length) + notice;
+          }
+          const marker = '<!-- openlore-review -->';
+          const { owner, repo } = context.repo;
+          const issue_number = context.issue.number;
+          if (!issue_number) { core.info('Not a PR context; skipping comment.'); return; }
+          // Advisory contract: a comment-post failure (a fork PR's read-only GITHUB_TOKEN,
+          // a missing `pull-requests: write` permission, a transient API error) must NEVER
+          // fail the check. Warn and move on — the briefing is in the job log either way.
+          try {
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const matches = comments.filter(c => typeof c.body === 'string' && c.body.includes(marker));
+            const existing = matches[0];
+            // Self-heal: if more than one sticky comment ever exists (a prior race / human
+            // copy), keep the first and remove the rest so the PR carries exactly one.
+            for (const dup of matches.slice(1)) {
+              await github.rest.issues.deleteComment({ owner, repo, comment_id: dup.id }).catch(() => {});
+            }
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              core.info(`Updated sticky review comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info('Created sticky review comment');
+            }
+          } catch (e) {
+            core.warning(`OpenLore: could not post the review comment (${e.status ?? ''} ${e.message}). ` +
+              `On pull requests from a fork, GITHUB_TOKEN is read-only and cannot comment; ` +
+              `the briefing is available in this job's log.`);
+          }
+
+    - name: Fail after attempting gated briefing publication
+      if: ${{ always() && steps.review.outputs.gated == 'true' }}
+      shell: bash
+      env:
+        REVIEW_GATED: ${{ steps.review.outputs.gated }}
+      run: |
+        if [ "$REVIEW_GATED" = "true" ]; then
+          echo "openlore review: failing after attempting to publish the review gate evidence." >&2
+          exit 3
+        fi

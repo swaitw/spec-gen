@@ -11,6 +11,7 @@ import { DECISIONS_VERIFICATION_MAX_TOKENS } from '../../constants.js';
 import type { LLMService } from '../services/llm-service.js';
 import type { PendingDecision } from '../../types/index.js';
 import { parseJSON } from '../../utils/misc.js';
+import { createPromptBoundary } from '../../utils/prompt-boundary.js';
 
 const SYSTEM_PROMPT = `You are an architectural decision verifier for a software project.
 
@@ -37,9 +38,29 @@ interface VerificationRaw {
   missing: Array<{ file: string; description: string }>;
 }
 
+function isVerificationRaw(value: unknown): value is VerificationRaw {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Record<string, unknown>;
+  const verified = Array.isArray(item.verified) && item.verified.every((entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    const candidate = entry as Record<string, unknown>;
+    return typeof candidate.id === 'string'
+      && typeof candidate.evidenceFile === 'string'
+      && ['high', 'medium', 'low'].includes(candidate.confidence as string);
+  });
+  const phantom = Array.isArray(item.phantom) && item.phantom.every((entry) =>
+    !!entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>).id === 'string');
+  const missing = Array.isArray(item.missing) && item.missing.every((entry) =>
+    !!entry && typeof entry === 'object'
+      && typeof (entry as Record<string, unknown>).file === 'string'
+      && typeof (entry as Record<string, unknown>).description === 'string');
+  return verified && phantom && missing;
+}
+
 export interface VerificationResult {
   verified: PendingDecision[];
   phantom: PendingDecision[];
+  unassessed: PendingDecision[];
   missing: Array<{ file: string; description: string }>;
 }
 
@@ -91,6 +112,45 @@ function buildTargetedDiff(
   return fallbackDiff.slice(0, 4_000);
 }
 
+/** A changed hunk is "substantive" once it carries at least this many +/- lines. */
+const SUBSTANTIVE_MIN_CHANGED_LINES = 2;
+
+/** Count real added/removed lines in a diff hunk (excluding the +++/--- file markers). */
+function countChangedLines(hunk: string): number {
+  let n = 0;
+  for (const line of hunk.split('\n')) {
+    if ((line.startsWith('+') && !line.startsWith('+++')) ||
+        (line.startsWith('-') && !line.startsWith('---'))) {
+      n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * Deterministic verification evidence: a decision is grounded when EVERY one of its
+ * affectedFiles appears in the diff with a substantive hunk. Returns the evidence
+ * file (the first affected file) when grounded, else null.
+ *
+ * This is the HF-1 fallback: the LLM `verify` step over-marks legitimate
+ * tool-addition decisions as `phantom`, stalling the dogfood gate. When the code
+ * is demonstrably in the diff, trust the diff over the LLM's "no evidence" call.
+ */
+export function substantiveEvidence(
+  decision: PendingDecision,
+  diffByFile: Map<string, string>,
+): string | null {
+  if (decision.affectedFiles.length === 0) return null;
+  let totalChanged = 0;
+  for (const file of decision.affectedFiles) {
+    const normalised = file.replace(/^[ab]\//, '');
+    const hunk = diffByFile.get(normalised);
+    if (!hunk) return null; // require ALL affected files present
+    totalChanged += countChangedLines(hunk);
+  }
+  return totalChanged >= SUBSTANTIVE_MIN_CHANGED_LINES ? decision.affectedFiles[0] : null;
+}
+
 export async function verifyDecisions(
   decisions: PendingDecision[],
   diff: string,
@@ -98,7 +158,7 @@ export async function verifyDecisions(
   commitMessages?: string,
 ): Promise<VerificationResult> {
   if (decisions.length === 0) {
-    return { verified: [], phantom: [], missing: [] };
+    return { verified: [], phantom: [], unassessed: [], missing: [] };
   }
 
   const diffByFile = parseDiffByFile(diff);
@@ -113,33 +173,76 @@ export async function verifyDecisions(
 
   const commitSection = commitMessages ? `\nCommit messages:\n${commitMessages}\n` : '';
   const userContent = `Decisions:\n${JSON.stringify(decisionSummary, null, 2)}${commitSection}`;
+  const boundary = createPromptBoundary();
 
   const response = await llm.complete({
-    systemPrompt: SYSTEM_PROMPT,
-    userPrompt: userContent,
+    systemPrompt: `${SYSTEM_PROMPT}\n\n${boundary.instruction}`,
+    userPrompt: boundary.wrap(userContent),
     maxTokens: DECISIONS_VERIFICATION_MAX_TOKENS,
     temperature: 0.1,
   });
   const raw = response.content;
 
-  const result = parseJSON<VerificationRaw>(raw, { verified: [], phantom: [], missing: [] });
+  const parsed = parseJSON<unknown>(raw, null);
+  if (!isVerificationRaw(parsed)) {
+    throw new Error('decision verification returned invalid structured output');
+  }
+  const result = parsed;
 
   const byId = new Map(decisions.map((d) => [d.id, d]));
   const now = new Date().toISOString();
 
-  const verified: PendingDecision[] = result.verified
-    .flatMap((v) => {
-      const d = byId.get(v.id);
-      if (!d) return [];
-      return [{ ...d, status: 'verified' as const, confidence: v.confidence, evidenceFile: v.evidenceFile, verifiedAt: now }];
-    });
+  const verified: PendingDecision[] = [];
+  const phantom: PendingDecision[] = [];
+  const classified = new Set<string>();
+  for (const v of result.verified) {
+    const d = byId.get(v.id);
+    if (!d || classified.has(v.id)) continue;
+    classified.add(v.id);
+    const evidenceFile = v.evidenceFile.replace(/^[ab]\//, '');
+    const targeted = d.affectedFiles.some((file) => file.replace(/^[ab]\//, '') === evidenceFile);
+    const evidenceHunk = diffByFile.get(evidenceFile);
+    if (targeted && evidenceHunk && countChangedLines(evidenceHunk) >= SUBSTANTIVE_MIN_CHANGED_LINES) {
+      verified.push({ ...d, status: 'verified', confidence: v.confidence, verificationEvidence: 'git-diff', evidenceFile, verifiedAt: now });
+      continue;
+    }
+    const deterministicEvidence = substantiveEvidence(d, diffByFile);
+    if (deterministicEvidence) {
+      verified.push({ ...d, status: 'verified', confidence: 'low', verificationEvidence: 'git-diff', evidenceFile: deterministicEvidence, verifiedAt: now });
+    } else {
+      phantom.push({ ...d, status: 'phantom', confidence: 'low', verifiedAt: now });
+    }
+  }
 
-  const phantom: PendingDecision[] = result.phantom
-    .flatMap((p) => {
-      const d = byId.get(p.id);
-      if (!d) return [];
-      return [{ ...d, status: 'phantom' as const, confidence: 'low' as const, verifiedAt: now }];
-    });
+  // HF-1: rescue any LLM-marked phantom whose affected files are all present in the
+  // diff with substantive hunks — trust the diff over the LLM's "no evidence" call.
+  for (const p of result.phantom) {
+    const d = byId.get(p.id);
+    if (!d || classified.has(p.id)) continue;
+    classified.add(p.id);
+    const evidenceFile = substantiveEvidence(d, diffByFile);
+    if (evidenceFile) {
+      verified.push({ ...d, status: 'verified', confidence: 'low', verificationEvidence: 'git-diff', evidenceFile, verifiedAt: now });
+    } else {
+      phantom.push({ ...d, status: 'phantom', confidence: 'low', verifiedAt: now });
+    }
+  }
 
-  return { verified, phantom, missing: result.missing };
+  // A well-formed but incomplete model response must not delete durable intent.
+  // change: harden-spec-verification-honesty
+  const unassessed = decisions.filter((decision) => !classified.has(decision.id));
+  return { verified, phantom, unassessed, missing: result.missing };
+}
+
+/**
+ * Mark decisions that could not be checked against a git diff without claiming evidence.
+ * change: harden-api-decision-and-generate-safety
+ */
+export function markVerificationEvidenceAbsent(decisions: PendingDecision[]): PendingDecision[] {
+  return decisions.map((decision) => ({
+    ...decision,
+    status: 'verified',
+    confidence: 'medium',
+    verificationEvidence: 'none',
+  }));
 }

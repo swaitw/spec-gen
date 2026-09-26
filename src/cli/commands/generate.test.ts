@@ -3,8 +3,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { RepoStructure, LLMContext } from '../../core/analyzer/artifact-generator.js';
 
 // Mock dependencies
@@ -40,8 +42,8 @@ vi.mock('../../core/services/llm-service.js', async (importOriginal) => {
 
 describe('generate command', () => {
   const testDir = join(process.cwd(), 'test-generate-cmd');
-  const specGenDir = join(testDir, '.spec-gen');
-  const analysisDir = join(specGenDir, 'analysis');
+  const openloreDir = join(testDir, '.openlore');
+  const analysisDir = join(openloreDir, 'analysis');
 
   beforeEach(async () => {
     // Create test directories
@@ -153,6 +155,13 @@ describe('generate command', () => {
   });
 
   describe('command options', () => {
+    it('preserves absolute output directories and resolves relative ones from the project root', async () => {
+      const { resolveGenerateOutputPath } = await import('./generate.js');
+      const absoluteOut = resolve('/private/tmp/specs');
+      expect(resolveGenerateOutputPath(resolve('/project'), absoluteOut)).toBe(absoluteOut);
+      expect(resolveGenerateOutputPath('/project', 'artifacts/specs')).toBe(resolve('/project/artifacts/specs'));
+    });
+
     it('should have correct default values', async () => {
       const { generateCommand } = await import('./generate.js');
 
@@ -167,6 +176,33 @@ describe('generate command', () => {
       // Find the domains option
       const domainsOption = generateCommand.options.find(opt => opt.long === '--domains');
       expect(domainsOption).toBeDefined();
+    });
+
+    it('uses the shared cleanup policy so filtered force generation cannot delete other domains', () => {
+      const source = readFileSync(fileURLToPath(new URL('./generate.ts', import.meta.url)), 'utf-8');
+      expect(source).toMatch(
+        /cleanBeforeWrite:\s*shouldCleanStaleDomains\(opts\.force,\s*opts\.domains,\s*opts\.adrOnly\)/,
+      );
+    });
+
+    it('keeps scoped global metadata honest and wires the concrete output root', () => {
+      const source = readFileSync(fileURLToPath(new URL('./generate.ts', import.meta.url)), 'utf-8');
+      expect(source).toContain('openspecRoot: fullOpenspecPath');
+      expect(source).toContain('updateConfig: hasOperatorOutputDir || opts.domains.length === 0');
+      expect(source).toContain('scoped: opts.domains.length > 0 && !hasOperatorOutputDir');
+    });
+
+    it('derives the link index from the specs it wrote, not from the pipeline result', () => {
+      const source = readFileSync(fileURLToPath(new URL('./generate.ts', import.meta.url)), 'utf-8');
+      // Anchors are verified against the graph BEFORE the write…
+      expect(source).toContain('verifyRequirementAnchors(requirementAnchorProposals(pipelineResult), depGraph)');
+      // …and the persisted index is derived AFTER it, from the files on disk.
+      const write = source.indexOf('await writer.writeSpecs(');
+      const derive = source.indexOf('await finalizeGeneration({');
+      expect(write).toBeGreaterThan(-1);
+      expect(derive).toBeGreaterThan(write);
+      // No probabilistic matcher survives as a coverage input.
+      expect(source).not.toContain('MappingGenerator');
     });
 
     it('should have dry-run option', async () => {
@@ -369,5 +405,133 @@ describe('generate command', () => {
       const { logger } = await import('../../utils/logger.js');
       expect(logger.error).toBeDefined();
     });
+  });
+});
+
+// ============================================================================
+// FREE PLAN/DRY RUN VS PAID PREVIEW (change: harden-spec-workflow-lifecycle)
+// ============================================================================
+
+const { generateCommand } = await import('./generate.js');
+const { renderSpecPreviewDiff } = await import('./generate.js');
+
+describe('generate preview modes', () => {
+  const roots: string[] = [];
+
+  afterEach(async () => {
+    const { rm } = await import('node:fs/promises');
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  });
+
+  async function specTree(specs: Record<string, string>): Promise<string> {
+    const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const root = await mkdtemp(join(tmpdir(), 'openlore-preview-'));
+    roots.push(root);
+    for (const [domain, content] of Object.entries(specs)) {
+      await mkdir(join(root, 'specs', domain), { recursive: true });
+      await writeFile(join(root, 'specs', domain, 'spec.md'), content, 'utf-8');
+    }
+    return root;
+  }
+
+  it('exposes free --dry-run/--plan and explicit paid --preview', () => {
+    expect(generateCommand.options.find(opt => opt.long === '--plan')).toBeDefined();
+    expect(generateCommand.options.find(opt => opt.long === '--dry-run')).toBeDefined();
+    expect(generateCommand.options.find(opt => opt.long === '--preview')).toBeDefined();
+  });
+
+  it('preserves force in the normalized execution options', async () => {
+    const { normalizeGenerateOptions } = await import('./generate.js');
+    expect(normalizeGenerateOptions({ force: true }).force).toBe(true);
+    expect(normalizeGenerateOptions({}).force).toBe(false);
+  });
+
+  // skipIf(win32): the premise is a symlink, which needs elevated privileges or Developer
+  // Mode there — the test cannot build the thing it asserts is not copied. Exercised on Linux.
+  it.skipIf(process.platform === 'win32')('seeds a preview from regular project files without copying symlinks', async () => {
+    const { copyRegularTree } = await import('./generate.js');
+    const { mkdir, readFile, symlink, writeFile } = await import('node:fs/promises');
+    const source = await specTree({ billing: '# Billing\nhuman content\n' });
+    const destination = await specTree({});
+    const victim = join(source, '..', `preview-victim-${Date.now()}.json`);
+    roots.push(victim);
+    await writeFile(victim, 'ORIGINAL');
+    await mkdir(join(source, '.openlore', 'generation'), { recursive: true });
+    await symlink(victim, join(source, '.openlore', 'generation', 'pipeline-result.json'));
+
+    await copyRegularTree(source, destination);
+
+    expect(await readFile(join(destination, 'specs', 'billing', 'spec.md'), 'utf-8'))
+      .toContain('human content');
+    await expect(readFile(join(destination, '.openlore', 'generation', 'pipeline-result.json')))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(victim, 'utf-8')).toBe('ORIGINAL');
+  });
+
+  it('documents cost only on the explicit preview', () => {
+    const dryRun = generateCommand.options.find(opt => opt.long === '--dry-run');
+    expect(dryRun?.description).toMatch(/no provider call, no cost/i);
+    const plan = generateCommand.options.find(opt => opt.long === '--plan');
+    expect(plan?.description).toMatch(/no provider call/i);
+    const preview = generateCommand.options.find(opt => opt.long === '--preview');
+    expect(preview?.description).toMatch(/cost occur/i);
+  });
+
+  it('runs dry-run and plan mode before provider resolution or construction', () => {
+    const source = readFileSync(fileURLToPath(new URL('./generate.ts', import.meta.url)), 'utf-8');
+    const planReturn = source.indexOf("logger.success(`${opts.dryRun ? 'Dry run' : 'Plan'} complete");
+    const providerResolved = source.indexOf('const resolved = resolveGenerationProvider(');
+    const providerCreated = source.indexOf('llm = createLLMService(');
+    expect(planReturn).toBeGreaterThan(-1);
+    expect(providerResolved).toBeGreaterThan(planReturn);
+    expect(providerCreated).toBeGreaterThan(planReturn);
+  });
+
+  it('redirects every paid-preview write into a captured throwaway workspace and removes it', () => {
+    const source = readFileSync(fileURLToPath(new URL('./generate.ts', import.meta.url)), 'utf-8');
+    expect(source).toContain("mkdtemp(join(tmpdir(), 'openlore-preview-'))");
+    expect(source).toContain('opts.outputDir = previewRoot;');
+    expect(source).toContain('? join(previewRoot, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR)');
+    expect(source).toContain('snapshotRootPath: previewRoot ?? rootPath');
+    // Cleanup runs in a finally, so a provider failure cannot leak the workspace.
+    expect(source).toMatch(/finally \{[\s\S]*if \(previewRoot\)[\s\S]*rm\(previewRoot/);
+  });
+
+  it('reports a new spec as an addition', async () => {
+    const project = await specTree({});
+    const preview = await specTree({ billing: '# Billing\nline\n' });
+    const lines = await renderSpecPreviewDiff(project, preview);
+    expect(lines.join('\n')).toContain('+ billing');
+    expect(lines.join('\n')).toContain('1 specification(s) would change');
+  });
+
+  it('reports a rewritten spec with its line delta', async () => {
+    const project = await specTree({ billing: '# Billing\n' });
+    const preview = await specTree({ billing: '# Billing\nmore\nlines\n' });
+    const lines = await renderSpecPreviewDiff(project, preview);
+    expect(lines.join('\n')).toMatch(/~ billing.*\+2 lines/);
+  });
+
+  it('reports a byte-identical spec as unchanged rather than as a rewrite', async () => {
+    const identical = '# Billing\nsame\n';
+    const project = await specTree({ billing: identical });
+    const preview = await specTree({ billing: identical });
+    const lines = await renderSpecPreviewDiff(project, preview);
+    expect(lines.join('\n')).toContain('= billing  (byte-identical)');
+    expect(lines.join('\n')).toContain('No specification would change');
+  });
+
+  it('leaves a spec outside the generation scope marked untouched', async () => {
+    const project = await specTree({ billing: '# Billing\n', auth: '# Auth\n' });
+    const preview = await specTree({ billing: '# Billing\nnew\n' });
+    const lines = await renderSpecPreviewDiff(project, preview);
+    expect(lines.join('\n')).toContain("= auth  (untouched");
+  });
+
+  it('says so plainly when the preview produced nothing', async () => {
+    const project = await specTree({});
+    const preview = await specTree({});
+    expect(await renderSpecPreviewDiff(project, preview)).toEqual(['  (no specifications were generated)']);
   });
 });

@@ -1,0 +1,290 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { claudeCodeAdapter } from './claude-code.js';
+import { continueAdapter } from './continue.js';
+import { cursorAdapter } from './cursor.js';
+import type { ApplyContext } from './types.js';
+
+const dirs: string[] = [];
+
+/**
+ * A Windows host whose own paths cannot be written into a shell command field: the profile
+ * directory `a$b` is a parameter expansion Git Bash would substitute, and no quoting form
+ * means the same thing to cmd.exe and to a POSIX shell (change: harden-windows-hook-quoting).
+ */
+const UNFORMATTABLE_WINDOWS_RUNTIME = {
+  nodeExecutable: 'C:\\Users\\a$b\\nodejs\\node.exe',
+  pathValue: '',
+  fileExists: () => true,
+};
+
+async function context(platform: NodeJS.Platform): Promise<ApplyContext> {
+  const root = await mkdtemp(join(tmpdir(), 'openlore-platform-command-'));
+  dirs.push(root);
+  return {
+    root,
+    platform,
+    platformCommandRuntime: {
+      nodeExecutable: 'C:\\Program Files\\nodejs\\node.exe',
+      pathValue: '',
+      fileExists: () => true,
+    },
+    instructionTemplate: 'Use OpenLore.',
+    dryRun: false,
+    force: false,
+    preset: 'substrate',
+  };
+}
+
+afterEach(async () => {
+  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+describe('Windows-generated agent launch commands', () => {
+  it('wraps the Claude Code MCP entry and both managed hooks', async () => {
+    const ctx = await context('win32');
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+
+    const mcp = JSON.parse(await readFile(join(ctx.root, '.mcp.json'), 'utf8'));
+    expect(mcp.mcpServers.openlore).toEqual({
+      command: 'C:\\Program Files\\nodejs\\node.exe',
+      args: ['C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js', '--yes', 'openlore', 'mcp', '--preset', 'substrate'],
+    });
+    const settings = JSON.parse(await readFile(join(ctx.root, '.claude/settings.json'), 'utf8'));
+    expect(settings.hooks.SessionStart[0].hooks[0].command)
+      .toBe('"C:\\Program Files\\nodejs\\node.exe" "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js" --yes openlore orient --json');
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0].command)
+      .toBe('"C:\\Program Files\\nodejs\\node.exe" "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js" --yes openlore orient --inject');
+  });
+
+  it('wraps the Cursor MCP entry', async () => {
+    const ctx = await context('win32');
+    expect((await cursorAdapter.apply(ctx)).conflict).toBe(false);
+
+    const mcp = JSON.parse(await readFile(join(ctx.root, '.cursor/mcp.json'), 'utf8'));
+    expect(mcp.mcpServers.openlore).toEqual({
+      command: 'C:\\Program Files\\nodejs\\node.exe',
+      args: ['C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js', '--yes', 'openlore', 'mcp', '--preset', 'substrate'],
+    });
+  });
+
+  it('wraps the Continue slash command', async () => {
+    const ctx = await context('win32');
+    expect((await continueAdapter.apply(ctx)).conflict).toBe(false);
+
+    const config = JSON.parse(await readFile(join(ctx.root, '.continue/config.json'), 'utf8'));
+    expect(config.slashCommands).toContainEqual({
+      name: 'orient',
+      description: 'Call openlore orient() for the current task context',
+      run: '"C:\\Program Files\\nodejs\\node.exe" "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js" --yes openlore orient --json',
+    });
+  });
+
+  it.each(['darwin', 'linux'] as const)('preserves native generated commands on %s', async (platform) => {
+    const ctx = await context(platform);
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+    expect((await cursorAdapter.apply(ctx)).conflict).toBe(false);
+    expect((await continueAdapter.apply(ctx)).conflict).toBe(false);
+
+    const mcp = JSON.parse(await readFile(join(ctx.root, '.mcp.json'), 'utf8'));
+    expect(mcp.mcpServers.openlore.command).toBe('npx');
+    const settings = JSON.parse(await readFile(join(ctx.root, '.claude/settings.json'), 'utf8'));
+    expect(settings.hooks.SessionStart[0].hooks[0].command)
+      .toBe('npx --yes openlore orient --json');
+    const cursor = JSON.parse(await readFile(join(ctx.root, '.cursor/mcp.json'), 'utf8'));
+    expect(cursor.mcpServers.openlore.command).toBe('npx');
+    const continueConfig = JSON.parse(await readFile(join(ctx.root, '.continue/config.json'), 'utf8'));
+    expect(continueConfig.slashCommands[0].run).toBe('npx --yes openlore orient --json');
+  });
+
+  it('migrates managed commands across platforms and is byte-idempotent', async () => {
+    const ctx = await context('linux');
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+    const native = await readFile(join(ctx.root, '.mcp.json'), 'utf8');
+    expect(native).toContain('"command": "npx"');
+
+    ctx.platform = 'win32';
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+    const windowsMcp = await readFile(join(ctx.root, '.mcp.json'), 'utf8');
+    const windowsSettings = await readFile(join(ctx.root, '.claude/settings.json'), 'utf8');
+    expect(windowsMcp).toContain('C:\\\\Program Files\\\\nodejs\\\\node.exe');
+    expect(windowsSettings).toContain('C:\\\\Program Files\\\\nodejs\\\\node_modules\\\\npm\\\\bin\\\\npx-cli.js');
+
+    const reapplied = await claudeCodeAdapter.apply(ctx);
+    expect(reapplied.conflict).toBe(false);
+    expect(await readFile(join(ctx.root, '.mcp.json'), 'utf8')).toBe(windowsMcp);
+    expect(await readFile(join(ctx.root, '.claude/settings.json'), 'utf8')).toBe(windowsSettings);
+
+    ctx.platform = 'linux';
+    expect((await claudeCodeAdapter.uninstall(ctx)).conflict).toBe(false);
+  });
+});
+
+/**
+ * The direct form (change: fix-windows-console-flash-from-npx-shim). Every test above
+ * runs from TypeScript source, where no built CLI sits beside the module, so all of them
+ * exercise the `npx` FALLBACK. Injecting the entry is the only way to assert what a real,
+ * built install actually writes — the shape users get.
+ */
+describe('a built install wires OpenLore\'s own CLI, never the npx shim', () => {
+  const WIN_ENTRY = 'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\openlore\\dist\\cli\\index.js';
+  const POSIX_ENTRY = '/usr/local/lib/node_modules/openlore/dist/cli/index.js';
+
+  async function builtContext(platform: NodeJS.Platform): Promise<ApplyContext> {
+    const ctx = await context(platform);
+    const posix = platform !== 'win32';
+    ctx.platformCommandRuntime = {
+      ...ctx.platformCommandRuntime,
+      nodeExecutable: posix ? '/usr/local/bin/node' : 'C:\\Program Files\\nodejs\\node.exe',
+      openloreCliEntry: posix ? POSIX_ENTRY : WIN_ENTRY,
+    };
+    return ctx;
+  }
+
+  it.each(['win32', 'linux'] as const)('wires every Claude Code surface directly on %s', async (platform) => {
+    const ctx = await builtContext(platform);
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+
+    const mcp = await readFile(join(ctx.root, '.mcp.json'), 'utf8');
+    const settings = await readFile(join(ctx.root, '.claude/settings.json'), 'utf8');
+    // The regression this whole change exists to prevent: npx resolves the target bin to
+    // openlore.cmd, and a .cmd can only start through cmd.exe — one console window per
+    // agent turn for the UserPromptSubmit hook.
+    for (const written of [mcp, settings]) {
+      expect(written).not.toContain('npx');
+      expect(written).not.toContain('.cmd');
+    }
+    expect(JSON.parse(mcp).mcpServers.openlore.args[0]).toBe(platform === 'win32' ? WIN_ENTRY : POSIX_ENTRY);
+    for (const key of ['SessionStart', 'UserPromptSubmit']) {
+      expect(JSON.parse(settings).hooks[key][0].hooks[0].command).toContain('cli');
+    }
+  });
+
+  it.each(['win32', 'linux'] as const)('wires Cursor and Continue directly on %s', async (platform) => {
+    const ctx = await builtContext(platform);
+    expect((await cursorAdapter.apply(ctx)).conflict).toBe(false);
+    expect((await continueAdapter.apply(ctx)).conflict).toBe(false);
+
+    for (const file of ['.cursor/mcp.json', '.continue/config.json']) {
+      const written = await readFile(join(ctx.root, file), 'utf8');
+      expect(written).not.toContain('npx');
+      expect(written).not.toContain('.cmd');
+    }
+  });
+
+  it('removes the entry it wrote even after the managed marker is gone', async () => {
+    // `isOurMcpEntry` identifies a marker-less entry by its argv. The direct form dropped
+    // the literal `openlore` argument the old check keyed on; without the path shape, every
+    // entry written by this version would be stranded in the user scope.
+    const ctx = await builtContext('linux');
+    ctx.scope = 'user';
+    expect((await claudeCodeAdapter.apply(ctx)).conflict).toBe(false);
+
+    const mcpPath = join(ctx.root, '.claude.json');
+    const parsed = JSON.parse(await readFile(mcpPath, 'utf8'));
+    expect(parsed.mcpServers.openlore).toBeDefined();
+    delete parsed._openlore; // any tool that rewrites this file and drops unknown keys
+    await writeFile(mcpPath, JSON.stringify(parsed, null, 2));
+
+    expect((await claudeCodeAdapter.uninstall(ctx)).conflict).toBe(false);
+    expect(JSON.parse(await readFile(mcpPath, 'utf8')).mcpServers?.openlore).toBeUndefined();
+  });
+});
+
+/**
+ * An install must never write a command field it knows the shell will mangle — nor crash the
+ * whole run over one. `runInstall` rethrows a project-scope adapter error, so the refusal has
+ * to happen in the adapter, as a reported conflict (change: harden-windows-hook-quoting).
+ */
+describe('an unformattable Windows path costs the hooks, and nothing else', () => {
+  it('installs everything that IS writable, and leaves only the hooks out', async () => {
+    const ctx = { ...(await context('win32')), platformCommandRuntime: UNFORMATTABLE_WINDOWS_RUNTIME };
+    const result = await claudeCodeAdapter.apply(ctx);
+
+    // NOT a conflict: an unquotable path is a property of the host, not a clash with the
+    // user's file. Reporting it as a conflict returned exit 1, which also skipped the index
+    // build — so one unwritable field cost the whole install.
+    expect(result.conflict).toBeFalsy();
+    expect(result.warnings.join('\n')).toMatch(/hooks were NOT wired, because .*contains an expansion/);
+
+    // The three things that are still perfectly writable are written.
+    const mcp = JSON.parse(await readFile(join(ctx.root, '.mcp.json'), 'utf8'));
+    expect(mcp.mcpServers.openlore.command).toBe('C:\\Users\\a$b\\nodejs\\node.exe');
+    await expect(readFile(join(ctx.root, 'CLAUDE.md'), 'utf8')).resolves.toContain('OpenLore');
+    const settings = JSON.parse(await readFile(join(ctx.root, '.claude/settings.json'), 'utf8'));
+    // ... and the hooks, the one unwritable thing, are absent rather than wrong.
+    expect(settings.hooks?.SessionStart).toBeUndefined();
+    expect(settings.hooks?.UserPromptSubmit).toBeUndefined();
+  });
+
+  it('removes a hook it wired earlier once the host can no longer run it', async () => {
+    // The failure this prevents: openlore is reinstalled to an unquotable path, so the hook
+    // still on disk names a command Git Bash mangles. Leaving it means #483's
+    // `Cannot find module` on every single turn, forever, with nothing saying why.
+    const ctx = await context('win32');
+    await claudeCodeAdapter.apply(ctx);
+    const settingsPath = join(ctx.root, '.claude/settings.json');
+    expect(JSON.parse(await readFile(settingsPath, 'utf8')).hooks.SessionStart).toBeDefined();
+
+    const result = await claudeCodeAdapter.apply({
+      ...ctx, platformCommandRuntime: UNFORMATTABLE_WINDOWS_RUNTIME,
+    });
+
+    const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+    expect(settings.hooks?.SessionStart).toBeUndefined();
+    expect(settings.hooks?.UserPromptSubmit).toBeUndefined();
+    expect(result.warnings.join('\n')).toMatch(/removed rather than left pointing at a command/);
+  });
+
+  it('keeps a user-authored hook in the same group while removing only ours', async () => {
+    const ctx = await context('win32');
+    await claudeCodeAdapter.apply(ctx);
+    const settingsPath = join(ctx.root, '.claude/settings.json');
+    const wired = JSON.parse(await readFile(settingsPath, 'utf8'));
+    wired.hooks.SessionStart.push({ matcher: '', hooks: [{ type: 'command', command: 'mine.sh' }] });
+    await writeFile(settingsPath, JSON.stringify(wired, null, 2));
+
+    await claudeCodeAdapter.apply({
+      ...ctx, platformCommandRuntime: UNFORMATTABLE_WINDOWS_RUNTIME, force: true,
+    });
+
+    const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+    expect(JSON.stringify(settings.hooks.SessionStart)).toContain('mine.sh');
+    expect(JSON.stringify(settings.hooks.SessionStart)).not.toContain('_openlore');
+  });
+
+  it('declines the Continue slash command without failing the run', async () => {
+    const ctx = { ...(await context('win32')), platformCommandRuntime: UNFORMATTABLE_WINDOWS_RUNTIME };
+    const result = await continueAdapter.apply(ctx);
+
+    // Not a conflict: Continue being unwirable must not undo a Claude Code install that
+    // succeeded in the same pass.
+    expect(result.conflict).toBe(false);
+    expect(result.warnings.join('\n')).toMatch(/\/orient command was NOT wired.*contains an expansion/);
+    await expect(readFile(join(ctx.root, '.continue/config.json'), 'utf8')).rejects.toThrow();
+  });
+
+  it('still UNINSTALLS hooks that a now-unformattable path once wired', async () => {
+    // Uninstall identifies our groups by their `_openlore` marker and needs no command at
+    // all. Formatting one there would throw on the removal path and strand the very hooks
+    // uninstall exists to remove — so the keys are deliberately decoupled from the commands.
+    const ctx = await context('win32');
+    await claudeCodeAdapter.apply(ctx);
+    const settingsPath = join(ctx.root, '.claude/settings.json');
+    expect(JSON.parse(await readFile(settingsPath, 'utf8')).hooks.SessionStart).toBeDefined();
+
+    const result = await claudeCodeAdapter.uninstall({
+      ...ctx, platformCommandRuntime: UNFORMATTABLE_WINDOWS_RUNTIME,
+    });
+
+    expect(result.conflict).toBe(false);
+    let remaining: Record<string, unknown> = {};
+    try {
+      remaining = JSON.parse(await readFile(settingsPath, 'utf8')).hooks ?? {};
+    } catch { /* the file is removed outright once nothing is left in it */ }
+    expect(remaining.SessionStart).toBeUndefined();
+    expect(remaining.UserPromptSubmit).toBeUndefined();
+  });
+});

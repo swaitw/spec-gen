@@ -13,6 +13,7 @@ import {
 import type { RepositoryMap, DetectedFramework, LanguageBreakdown, DirectoryStats } from './repository-mapper.js';
 import type { DependencyGraphResult, DependencyNode, DependencyEdge, FileCluster } from './dependency-graph.js';
 import type { ScoredFile, ProjectType } from '../../types/index.js';
+import { MAX_HTML_INLINE_SCRIPT_CHARS } from '../../constants.js';
 
 // ============================================================================
 // TEST HELPERS
@@ -38,6 +39,7 @@ function createScoredFile(overrides: Partial<ScoredFile> & { name: string; path:
     isConfig: overrides.isConfig ?? false,
     isTest: overrides.isTest ?? false,
     isGenerated: overrides.isGenerated ?? false,
+    tooling: overrides.tooling,
     score: overrides.score ?? 50,
     scoreBreakdown: overrides.scoreBreakdown ?? { name: 10, path: 10, structure: 10, connectivity: 20 },
     tags: overrides.tags ?? [],
@@ -191,14 +193,210 @@ describe('AnalysisArtifactGenerator', () => {
 
   beforeEach(async () => {
     tempDir = await createTempDir();
-    outputDir = join(tempDir, '.spec-gen', 'analysis');
+    outputDir = join(tempDir, '.openlore', 'analysis');
   });
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  describe('Phase-3 sampling determinism (fix-artifact-output-determinism)', () => {
+    it('selects the same validation files in the same order across identical runs', async () => {
+      // Build a real tree of 8 leaf files. The phase-3 sample shuffles the leaf
+      // candidates; a seeded shuffle (hash of the sorted candidate paths) must pick
+      // the SAME subset in the SAME order every run — an unseeded Math.random shuffle
+      // of 8 candidates would agree across two runs with probability ~1/8!.
+      const leafNodes: DependencyNode[] = [];
+      const leafIds: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        const rel = `src/leaf${i}.ts`;
+        const abs = join(tempDir, rel);
+        await mkdir(join(tempDir, 'src'), { recursive: true });
+        await writeFile(abs, `export const leaf${i} = ${i};\n`);
+        const id = `/leaf/${rel}`;
+        leafIds.push(id);
+        leafNodes.push({
+          id,
+          file: createScoredFile({ name: `leaf${i}.ts`, path: rel, absolutePath: abs }),
+          exports: [],
+          metrics: { inDegree: 0, outDegree: 0, betweenness: 0, pageRank: 0.1 },
+        });
+      }
+      // Empty highValueFiles ⇒ phase-2 is empty ⇒ all 8 leaves are phase-3 candidates.
+      const repoMap = createMockRepoMap({ highValueFiles: [] });
+      const depGraph = createMockDepGraph({
+        nodes: leafNodes,
+        edges: [],
+        rankings: {
+          byImportance: [], byConnectivity: [], clusterCenters: [],
+          leafNodes: leafIds, bridgeNodes: [], orphanNodes: [],
+        },
+      });
+
+      const opts = { rootDir: tempDir, outputDir, maxDeepAnalysisFiles: 0, maxValidationFiles: 8 };
+      const a = await generateArtifacts(repoMap, depGraph, opts);
+      const b = await generateArtifacts(repoMap, depGraph, opts);
+
+      const pathsA = a.llmContext.phase3_validation.files.map(f => f.path);
+      const pathsB = b.llmContext.phase3_validation.files.map(f => f.path);
+      expect(pathsA.length).toBe(8);
+      expect(pathsA).toEqual(pathsB);
+    });
+  });
+
+  describe('size-cap exclusion (fix-analyze-native-abort-and-file-cost-budget)', () => {
+    it('records an oversized HTML file as size-cap instead of dropping it silently', async () => {
+      // HTML over MAX_HTML_INLINE_SCRIPT_CHARS never reaches the graph — the bound on the
+      // same-length char-array allocation in extractHtmlScripts. It used to vanish with no trace,
+      // so any inline <script> it contained read as genuinely absent.
+      await mkdir(join(tempDir, 'src'), { recursive: true });
+      const rel = 'src/huge.html';
+      const huge = `<html><body><script>function inlineFn(){ return 1; }</script>${'<p>x</p>'.repeat(200_000)}</body></html>`;
+      expect(huge.length).toBeGreaterThan(MAX_HTML_INLINE_SCRIPT_CHARS);
+      await writeFile(join(tempDir, rel), huge);
+
+      const repoMap = createMockRepoMap({
+        allFiles: [createScoredFile({ name: 'huge.html', path: rel, absolutePath: join(tempDir, rel) })],
+        highValueFiles: [],
+      });
+      const artifacts = await generateArtifacts(repoMap, createMockDepGraph({}), {
+        rootDir: tempDir, outputDir, maxDeepAnalysisFiles: 0, maxValidationFiles: 0,
+      });
+
+      const rec = artifacts.parseHealth?.files.find(f => f.filePath === rel);
+      expect(rec, 'the dropped file is recorded, not silent').toBeDefined();
+      expect(rec!.exclusion).toBe('size-cap');
+      expect(artifacts.parseHealth!.excludedByReason).toEqual({ 'size-cap': 1 });
+    });
+
+    it('leaves an ordinary HTML file alone — the cap must not catch real pages', async () => {
+      await mkdir(join(tempDir, 'src'), { recursive: true });
+      const rel = 'src/page.html';
+      await writeFile(join(tempDir, rel), '<html><body><script>function f(){ return g(); }</script></body></html>');
+      const repoMap = createMockRepoMap({
+        allFiles: [createScoredFile({ name: 'page.html', path: rel, absolutePath: join(tempDir, rel) })],
+        highValueFiles: [],
+      });
+      const artifacts = await generateArtifacts(repoMap, createMockDepGraph({}), {
+        rootDir: tempDir, outputDir, maxDeepAnalysisFiles: 0, maxValidationFiles: 0,
+      });
+      expect(artifacts.parseHealth?.files.find(f => f.filePath === rel)).toBeUndefined();
+    });
+  });
+
+  describe('SFC script extraction (change: add-sfc-script-extraction)', () => {
+    it('extracts Vue script nodes and persists the narrowed container boundary', async () => {
+      await mkdir(join(tempDir, 'src'), { recursive: true });
+      const vueRel = 'src/App.vue';
+      const helperRel = 'src/helper.ts';
+      await writeFile(join(tempDir, vueRel), [
+        '<template><button @click="save()" /></template>',
+        '<script lang="ts">',
+        "import { helper } from './helper';",
+        'export function save(flag: boolean) { if (flag) { helper(); } }',
+        '</script>',
+      ].join('\n'));
+      await writeFile(join(tempDir, helperRel), 'export function helper() {}\n');
+      const files = [
+        createScoredFile({ name: 'App.vue', path: vueRel, absolutePath: join(tempDir, vueRel), extension: '.vue' }),
+        createScoredFile({ name: 'helper.ts', path: helperRel, absolutePath: join(tempDir, helperRel) }),
+      ];
+      const artifacts = await generateArtifacts(createMockRepoMap({ allFiles: files, highValueFiles: [] }), createMockDepGraph({}), {
+        rootDir: tempDir, outputDir, maxDeepAnalysisFiles: 0, maxValidationFiles: 0,
+      });
+      const graph = artifacts.llmContext.callGraph!;
+      const save = graph.nodes.find(node => node.name === 'save');
+      const helper = graph.nodes.find(node => node.name === 'helper');
+
+      expect(save?.startLine).toBe(4);
+      expect(graph.edges.some(edge => edge.callerId === save?.id && edge.calleeId === helper?.id)).toBe(true);
+      expect(artifacts.llmContext.signatures?.find(map => map.path === vueRel)?.entries.map(entry => entry.name))
+        .toContain('save');
+      const vueStyle = artifacts.styleFingerprint?.files.find(file => file.filePath === vueRel);
+      expect(vueStyle?.language).toBe('Vue');
+      expect(vueStyle?.functionsSampled).toBeGreaterThan(0);
+      expect(artifacts.parseHealth?.scriptContainers?.[0]).toMatchObject({
+        format: 'Vue', fileCount: 1, scriptBlockCount: 1, extractedScriptBlockCount: 1,
+      });
+      expect(artifacts.parseHealth?.scriptContainers?.[0].limitations).toContain('template expressions');
+    });
+  });
+
   describe('RepoStructure Generation', () => {
+    it('discloses an analyzed source with no callable node that belongs to no domain', async () => {
+      const scriptDir = join(tempDir, 'scripts');
+      const scriptPath = join(scriptDir, 'report.py');
+      await mkdir(scriptDir, { recursive: true });
+      await writeFile(scriptPath, 'def report():\n    return 1\n');
+      const script = createScoredFile({
+        name: 'report.py', path: 'scripts/report.py', absolutePath: scriptPath,
+        directory: 'scripts', extension: '.py',
+      });
+      const repoMap = createMockRepoMap({
+        allFiles: [script], highValueFiles: [script], entryPoints: [], schemaFiles: [],
+        configFiles: [],
+        clusters: {
+          byDirectory: { scripts: [script] }, byDomain: {},
+          byLayer: { presentation: [], business: [], data: [], infrastructure: [] },
+        },
+      });
+
+      const artifacts = await generateArtifacts(repoMap, createMockDepGraph({ nodes: [], edges: [], clusters: [] }), {
+        rootDir: tempDir, outputDir,
+      });
+
+      expect(artifacts.repoStructure.undomained).toEqual(['scripts/report.py']);
+      expect(artifacts.repoStructure.undomainedEvidence).toEqual([{
+        path: 'scripts/report.py', role: 'defining', reason: 'production-source',
+      }]);
+      expect(artifacts.summaryMarkdown).toContain('Undomained analyzed evidence by role');
+      expect(artifacts.summaryMarkdown).toContain('scripts/report.py');
+    });
+
+    // One repository-authored file name, asserted twice. Both cases share the same
+    // premise — a REAL walked file whose name is shaped like an artifact-generator
+    // internal — and differ only in which bytes the platform lets a file name hold.
+    async function undomainedArtifactsFor(relativePath: string, absolutePath: string) {
+      await writeFile(absolutePath, 'def report():\n    return 1\n');
+      const file = createScoredFile({
+        name: relativePath, path: relativePath, absolutePath, extension: '.py',
+      });
+      const repoMap = createMockRepoMap({
+        allFiles: [file], highValueFiles: [], entryPoints: [], schemaFiles: [], configFiles: [],
+        clusters: {
+          byDirectory: { '(root)': [file] }, byDomain: {},
+          byLayer: { presentation: [], business: [], data: [], infrastructure: [] },
+        },
+      });
+      return generateArtifacts(repoMap, createMockDepGraph({ nodes: [], edges: [], clusters: [] }), {
+        rootDir: tempDir, outputDir,
+      });
+    }
+
+    it('escapes markdown metacharacters in a real repository file name', async () => {
+      // Every byte here is legal in a file name on both POSIX and Windows, so the
+      // premise (a REAL file on disk, not a synthetic record) holds on both.
+      const relativePath = 'external.report ## forged.py';
+      const artifacts = await undomainedArtifactsFor(relativePath, join(tempDir, relativePath));
+      expect(artifacts.repoStructure.undomained).toContain(relativePath);
+      expect(artifacts.summaryMarkdown).not.toContain('## forged.py');
+      expect(artifacts.summaryMarkdown).toContain('\\#\\# forged.py');
+    });
+
+    // skipIf(win32): `:` and a newline are ILLEGAL in a Windows file name, so the
+    // `external::` synthetic-node prefix and the heading-forging line break cannot
+    // exist on a real Windows path at all — the premise is unbuildable there, and
+    // writing the fixture fails with ENOENT rather than testing anything. The
+    // platform-independent half (metacharacter escaping of a real walked file) is
+    // asserted on both platforms by the test above.
+    it.skipIf(process.platform === 'win32')('does not mistake a real external-prefixed path for a synthetic node', async () => {
+      const relativePath = 'external::report\n## forged.py';
+      const artifacts = await undomainedArtifactsFor(relativePath, join(tempDir, relativePath));
+      expect(artifacts.repoStructure.undomained).toContain(relativePath);
+      expect(artifacts.summaryMarkdown).not.toContain('\n## forged.py');
+      expect(artifacts.summaryMarkdown).toContain('\\u000a\\#\\# forged.py');
+    });
+
     it('should generate valid repo-structure.json', async () => {
       const repoMap = createMockRepoMap();
       const depGraph = createMockDepGraph();
@@ -277,6 +475,63 @@ describe('AnalysisArtifactGenerator', () => {
       }
     });
 
+    it('does not leak source file extensions into entity names (#138)', async () => {
+      const javaFiles: ScoredFile[] = [
+        createScoredFile({ name: 'VetController.java', path: 'src/main/java/com/acme/vet/VetController.java', directory: 'src/main/java/com/acme/vet', score: 70 }),
+        createScoredFile({ name: 'VetRepository.java', path: 'src/main/java/com/acme/vet/VetRepository.java', directory: 'src/main/java/com/acme/vet', score: 65 }),
+      ];
+      const repoMap = createMockRepoMap({
+        highValueFiles: javaFiles,
+        allFiles: javaFiles,
+        clusters: {
+          byDirectory: { 'src/main/java/com/acme/vet': javaFiles },
+          byDomain: { vet: javaFiles },
+          byLayer: { presentation: javaFiles, business: [], data: [], infrastructure: [] },
+        },
+      });
+      const depGraph = createMockDepGraph();
+
+      const artifacts = await generateArtifacts(repoMap, depGraph, {
+        rootDir: tempDir,
+        outputDir,
+      });
+
+      const vetDomain = artifacts.repoStructure.domains.find(d => d.name === 'vet');
+      expect(vetDomain).toBeDefined();
+      expect(vetDomain!.entities).toContain('VetController');
+      expect(vetDomain!.entities).toContain('VetRepository');
+      for (const entity of vetDomain!.entities) {
+        expect(entity).not.toMatch(/Java$/);
+      }
+    });
+
+    it('excludes package-info/module-info marker files from entities (#138)', async () => {
+      const files: ScoredFile[] = [
+        createScoredFile({ name: 'TypeToken.java', path: 'src/main/java/com/acme/reflect/TypeToken.java', directory: 'src/main/java/com/acme/reflect', score: 70 }),
+        createScoredFile({ name: 'package-info.java', path: 'src/main/java/com/acme/reflect/package-info.java', directory: 'src/main/java/com/acme/reflect', score: 40 }),
+        createScoredFile({ name: 'module-info.java', path: 'src/main/java/module-info.java', directory: 'src/main/java', score: 40 }),
+      ];
+      const repoMap = createMockRepoMap({
+        highValueFiles: files,
+        allFiles: files,
+        clusters: {
+          byDirectory: { 'src/main/java/com/acme/reflect': files },
+          byDomain: { reflect: files },
+          byLayer: { presentation: files, business: [], data: [], infrastructure: [] },
+        },
+      });
+
+      const artifacts = await generateArtifacts(repoMap, createMockDepGraph(), {
+        rootDir: tempDir,
+        outputDir,
+      });
+
+      const reflect = artifacts.repoStructure.domains.find(d => d.name === 'reflect');
+      expect(reflect?.entities).toContain('TypeToken');
+      expect(reflect?.entities).not.toContain('PackageInfo');
+      expect(reflect?.entities).not.toContain('ModuleInfo');
+    });
+
     it('should generate entry points', async () => {
       const repoMap = createMockRepoMap();
       const depGraph = createMockDepGraph();
@@ -324,6 +579,17 @@ describe('AnalysisArtifactGenerator', () => {
       expect(Array.isArray(artifacts.repoStructure.keyFiles.config)).toBe(true);
       expect(Array.isArray(artifacts.repoStructure.keyFiles.auth)).toBe(true);
       expect(Array.isArray(artifacts.repoStructure.keyFiles.database)).toBe(true);
+    });
+
+    it('excludes OpenLore tooling from key files', async () => {
+      const tooling = createScoredFile({
+        name: '.mcp.json', path: '.mcp.json', extension: '.json', isConfig: true, tooling: true,
+      });
+      const repoMap = createMockRepoMap({ allFiles: [tooling] });
+      const artifacts = await generateArtifacts(repoMap, createMockDepGraph(), {
+        rootDir: tempDir, outputDir,
+      });
+      expect(artifacts.repoStructure.keyFiles.config).not.toContain('.mcp.json');
     });
 
     it('should include statistics', async () => {
@@ -419,7 +685,10 @@ describe('AnalysisArtifactGenerator', () => {
       });
 
       expect(artifacts.summaryMarkdown).toContain('## Detected Domains');
+      expect(artifacts.summaryMarkdown).toContain('raw candidates');
       expect(artifacts.summaryMarkdown).toContain('| Domain | Files |');
+      expect(artifacts.llmContext.domains).toEqual(artifacts.repoStructure.domains);
+      expect(artifacts.repoStructure.statistics.finalDomainCount).toBe(artifacts.repoStructure.domains.length);
     });
 
     it('should include dependency insights', async () => {
@@ -562,6 +831,21 @@ describe('AnalysisArtifactGenerator', () => {
   });
 
   describe('File Saving', () => {
+    it('never deletes or renames existing OpenSpec specifications during analysis', async () => {
+      const existingSpec = join(tempDir, 'openspec', 'specs', 'legacy-stage', 'spec.md');
+      await mkdir(join(tempDir, 'openspec', 'specs', 'legacy-stage'), { recursive: true });
+      await writeFile(existingSpec, '# Legacy Stage Specification\n');
+      const before = await readFile(existingSpec, 'utf8');
+
+      await generateAndSaveArtifacts(createMockRepoMap(), createMockDepGraph(), {
+        rootDir: tempDir,
+        outputDir,
+      });
+
+      await expect(readFile(existingSpec, 'utf8')).resolves.toBe(before);
+      await expect(access(join(tempDir, 'openspec', 'specs', 'legacy-stage', 'spec.md'))).resolves.not.toThrow();
+    });
+
     it('should save all artifacts to disk', async () => {
       const srcDir = join(tempDir, 'src');
       await mkdir(srcDir, { recursive: true });
@@ -665,7 +949,7 @@ describe('AnalysisArtifactGenerator', () => {
     });
 
     it('should create output directory if it does not exist', async () => {
-      const nestedOutputDir = join(tempDir, 'nested', 'deeply', '.spec-gen', 'analysis');
+      const nestedOutputDir = join(tempDir, 'nested', 'deeply', '.openlore', 'analysis');
 
       const repoMap = createMockRepoMap();
       const depGraph = createMockDepGraph();

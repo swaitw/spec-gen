@@ -1,20 +1,26 @@
 /**
- * spec-gen verify — programmatic API
+ * openlore verify — programmatic API
  *
  * Tests generated spec accuracy against actual source code.
- * No side effects (no process.exit, no console.log).
+ * Never controls the process and is console-silent by default.
  */
 
-import { join } from 'node:path';
-import { SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, SPEC_GEN_LOGS_SUBDIR, SPEC_GEN_OUTPUTS_SUBDIR, SPEC_GEN_VERIFICATION_SUBDIR, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_GENERATION_REPORT, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPAT_MODEL } from '../constants.js';
+import { join, resolve } from 'node:path';
+import { OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, OPENLORE_LOGS_SUBDIR, OPENLORE_OUTPUTS_SUBDIR, OPENLORE_VERIFICATION_SUBDIR, OPENSPEC_SPECS_SUBDIR, ARTIFACT_DEPENDENCY_GRAPH, ARTIFACT_GENERATION_REPORT } from '../constants.js';
 import { fileExists, readJsonFile } from '../utils/command-helpers.js';
-import { readSpecGenConfig } from '../core/services/config-manager.js';
+import { readOpenLoreConfig } from '../core/services/config-manager.js';
 import { createLLMService } from '../core/services/llm-service.js';
+import { isLlmLoggingEnabled } from '../core/services/llm-logging-policy.js';
 import type { LLMService } from '../core/services/llm-service.js';
 import { SpecVerificationEngine } from '../core/verifier/verification-engine.js';
 import type { DependencyGraphResult } from '../core/analyzer/dependency-graph.js';
 import type { GenerationReport } from '../core/generator/openspec-writer.js';
 import type { VerifyApiOptions, VerifyResult, ProgressCallback } from './types.js';
+import { resolveOpenspecDir } from '../utils/openspec-dir.js';
+import { resolveTrustedApiBase, resolveTrustedSslVerify } from '../core/services/repo-config-trust.js';
+import { errors, isOpenLoreError } from '../utils/errors.js';
+import { withLoggerOptions } from '../utils/logger.js';
+import { resolveGenerationProvider } from '../core/runtime/generation-core.js';
 
 function progress(onProgress: ProgressCallback | undefined, step: string, status: 'start' | 'progress' | 'complete' | 'skip', detail?: string): void {
   onProgress?.({ phase: 'verify', step, status, detail });
@@ -26,108 +32,112 @@ function progress(onProgress: ProgressCallback | undefined, step: string, status
  * Samples files and validates that specs accurately describe behavior
  * using an LLM to predict behavior from specs and compare against code.
  *
- * @throws Error if no spec-gen configuration found
- * @throws Error if no specs or analysis found
- * @throws Error if no LLM API key found
- * @throws Error if no verification candidates found
+ * @throws OpenLoreError with a stable API code when verification cannot complete
  */
-export async function specGenVerify(options: VerifyApiOptions = {}): Promise<VerifyResult> {
+async function verify(options: VerifyApiOptions): Promise<VerifyResult> {
   const startTime = Date.now();
-  const rootPath = options.rootPath ?? process.cwd();
+  const rootPath = resolve(options.rootPath ?? process.cwd());
   const samples = options.samples ?? 5;
   const threshold = options.threshold ?? 0.5;
   const { onProgress } = options;
 
+  if (!Number.isInteger(samples) || samples < 1) {
+    throw new Error('samples must be a positive integer');
+  }
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error('threshold must be a finite number between 0 and 1');
+  }
+
   // Load config
-  const specGenConfig = await readSpecGenConfig(rootPath);
-  if (!specGenConfig) {
-    throw new Error('No spec-gen configuration found. Run specGenInit() first.');
+  const openloreConfig = await readOpenLoreConfig(rootPath, options.configPath);
+  if (!openloreConfig) {
+    throw errors.noConfig(options.configPath);
   }
 
   // Check specs exist
-  const openspecPath = join(rootPath, specGenConfig.openspecPath ?? OPENSPEC_DIR);
+  const openspecPath = resolveOpenspecDir(rootPath, openloreConfig.openspecPath);
   const specsPath = join(openspecPath, OPENSPEC_SPECS_SUBDIR);
   if (!(await fileExists(specsPath))) {
-    throw new Error('No specs found. Run specGenGenerate() first.');
+    throw new Error('No specs found. Run openloreGenerate() first.');
   }
 
   // Load dependency graph
   progress(onProgress, 'Loading analysis', 'start');
-  const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
-  const depGraph = await readJsonFile<DependencyGraphResult>(
-    join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
-    ARTIFACT_DEPENDENCY_GRAPH,
-  );
+  const analysisPath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  let depGraph: DependencyGraphResult | null;
+  try {
+    depGraph = await readJsonFile<DependencyGraphResult>(
+      join(analysisPath, ARTIFACT_DEPENDENCY_GRAPH),
+      ARTIFACT_DEPENDENCY_GRAPH,
+    );
+  } catch (error) {
+    throw errors.noAnalysis(analysisPath, error);
+  }
   if (!depGraph) {
-    throw new Error('No analysis found. Run specGenAnalyze() first.');
+    throw errors.noAnalysis(analysisPath);
   }
 
   // Load generation report
   const genReport = await readJsonFile<GenerationReport>(
-    join(rootPath, SPEC_GEN_DIR, SPEC_GEN_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
+    join(rootPath, OPENLORE_DIR, OPENLORE_OUTPUTS_SUBDIR, ARTIFACT_GENERATION_REPORT),
     ARTIFACT_GENERATION_REPORT,
   );
   const generationContext: string[] = genReport?.filesWritten ?? [];
   progress(onProgress, 'Loading analysis', 'complete');
 
-  // Create LLM service — support all four providers
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  const openaiKey = process.env.OPENAI_API_KEY;
-  const openaiCompatKey = process.env.OPENAI_COMPAT_API_KEY;
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!anthropicKey && !openaiKey && !openaiCompatKey && !geminiKey) {
-    throw new Error('No LLM API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OPENAI_COMPAT_API_KEY.');
-  }
-
-  const envDetectedProvider = anthropicKey ? 'anthropic'
-    : geminiKey ? 'gemini'
-    : openaiCompatKey ? 'openai-compat'
-    : 'openai';
-  const provider = options.provider ?? envDetectedProvider;
-  const defaultModels: Record<string, string> = {
-    anthropic: DEFAULT_ANTHROPIC_MODEL,
-    gemini: DEFAULT_GEMINI_MODEL,
-    'openai-compat': DEFAULT_OPENAI_COMPAT_MODEL,
-    openai: DEFAULT_OPENAI_MODEL,
-  };
-  const effectiveModel = options.model ?? defaultModels[provider] ?? DEFAULT_ANTHROPIC_MODEL;
+  const resolved = resolveGenerationProvider(openloreConfig, {
+    provider: options.provider,
+    model: options.model,
+    openaiCompatBaseUrl: options.openaiCompatBaseUrl,
+  });
+  if (!resolved) throw errors.apiNoApiKey();
   let llm: LLMService;
   try {
     llm = createLLMService({
-      provider,
-      model: effectiveModel,
-      apiBase: options.apiBase ?? specGenConfig.llm?.apiBase,
-      sslVerify: options.sslVerify ?? specGenConfig.llm?.sslVerify ?? true,
-      openaiCompatBaseUrl: options.openaiCompatBaseUrl,
-      timeout: options.timeout ?? specGenConfig.generation?.timeout,
-      enableLogging: true,
-      logDir: join(rootPath, SPEC_GEN_DIR, SPEC_GEN_LOGS_SUBDIR),
+      provider: resolved.provider,
+      model: resolved.model,
+      apiBase: resolveTrustedApiBase(options.apiBase, openloreConfig.llm?.apiBase),
+      sslVerify: resolveTrustedSslVerify(
+        options.sslVerify === undefined ? undefined : !options.sslVerify,
+        openloreConfig.llm?.sslVerify,
+      ),
+      openaiCompatBaseUrl: resolved.openaiCompatBaseUrl,
+      timeout: options.timeout ?? openloreConfig.generation?.timeout,
+      disableResponseFormat: openloreConfig.generation?.disableResponseFormat,
+      enableLogging: isLlmLoggingEnabled(),
+      logDir: join(rootPath, OPENLORE_DIR, OPENLORE_LOGS_SUBDIR),
+      logRoot: rootPath,
     });
   } catch (error) {
-    throw new Error(`Failed to create LLM service: ${(error as Error).message}`);
+    throw new Error(`Failed to create LLM service: ${(error as Error).message}`, { cause: error });
   }
 
   // Run verification
   progress(onProgress, 'Selecting verification files', 'start');
-  const verificationDir = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_VERIFICATION_SUBDIR);
+  const verificationDir = join(rootPath, OPENLORE_DIR, OPENLORE_VERIFICATION_SUBDIR);
   const engine = new SpecVerificationEngine(llm, {
     rootPath,
     openspecPath,
     outputDir: verificationDir,
-    filesPerDomain: Math.ceil(samples / 4),
+    filesPerDomain: samples,
     passThreshold: threshold,
     generationContext,
   });
 
-  const candidates = engine.selectCandidates(depGraph);
-  if (candidates.length === 0) {
+  const selectedCandidates = await engine.prepareCandidates(depGraph, samples);
+  if (selectedCandidates.length === 0) {
     throw new Error('No suitable verification candidates found.');
   }
-  progress(onProgress, 'Selecting verification files', 'complete', `${Math.min(candidates.length, samples)} candidates`);
+  progress(onProgress, 'Selecting verification files', 'complete', `${selectedCandidates.length} candidates`);
 
   progress(onProgress, 'Verifying specs against codebase', 'start');
-  const report = await engine.verify(depGraph, specGenConfig.version);
-  progress(onProgress, 'Verifying specs against codebase', 'complete', `${(report.overallConfidence * 100).toFixed(0)}% confidence`);
+  const report = await engine.verify(depGraph, openloreConfig.version, selectedCandidates);
+  progress(
+    onProgress,
+    'Verifying specs against codebase',
+    'complete',
+    `${(report.overallConfidence * 100).toFixed(0)}% weighted mixed-evidence composite confidence`,
+  );
 
   // Save LLM logs
   await llm.saveLogs().catch(() => {});
@@ -136,4 +146,13 @@ export async function specGenVerify(options: VerifyApiOptions = {}): Promise<Ver
     report,
     duration: Date.now() - startTime,
   };
+}
+
+export async function openloreVerify(options: VerifyApiOptions = {}): Promise<VerifyResult> {
+  try {
+    return await withLoggerOptions({ quiet: options.quiet ?? true }, () => verify(options));
+  } catch (error) {
+    if (isOpenLoreError(error)) throw error;
+    throw errors.pipelineFailed(`Verification failed: ${(error as Error).message}`, error);
+  }
 }

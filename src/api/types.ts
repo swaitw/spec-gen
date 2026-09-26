@@ -1,7 +1,7 @@
 /**
- * Programmatic API types for spec-gen
+ * Programmatic API types for openlore
  *
- * These types define the options and results for the spec-gen API functions.
+ * These types define the options and results for the openlore API functions.
  * They are designed for programmatic consumers (like OpenSpec CLI) and are
  * free of CLI-specific concerns (no process.exit, no console.log).
  */
@@ -30,9 +30,20 @@ export type { DriftResult, DriftSeverity };
 /** Progress callback for consumers to show their own UI */
 export type ProgressCallback = (event: ProgressEvent) => void;
 
+/** Built-in API phases. The open string intersection permits third-party facade phases. */
+export type ProgressPhase =
+  | 'init'
+  | 'analyze'
+  | 'generate'
+  | 'verify'
+  | 'drift'
+  | 'run'
+  | 'decisions'
+  | (string & Record<never, never>);
+
 export interface ProgressEvent {
-  /** Which phase is reporting: 'init' | 'analyze' | 'generate' | 'verify' | 'drift' */
-  phase: string;
+  /** Built-in phase name, or a host-defined extension phase. */
+  phase: ProgressPhase;
   /** Human-readable step description */
   step: string;
   /** Current status of this step */
@@ -49,8 +60,12 @@ export interface ProgressEvent {
 export interface BaseOptions {
   /** Project root path. Default: process.cwd() */
   rootPath?: string;
-  /** Path to spec-gen config file. Default: '.spec-gen/config.json' */
+  /** Path to openlore config file. Default: '.openlore/config.json' */
   configPath?: string;
+  /** Suppress all logger output for this async API call. Default: true. */
+  quiet?: boolean;
+  /** Cancel while waiting for repository ownership. */
+  signal?: AbortSignal;
   /** Progress callback for status updates */
   onProgress?: ProgressCallback;
 }
@@ -82,7 +97,7 @@ export interface InitResult {
 // ============================================================================
 
 export interface AnalyzeApiOptions extends BaseOptions {
-  /** Maximum files to analyze. Default: 500 */
+  /** Maximum files to analyze. Default: 100,000 */
   maxFiles?: number;
   /** Additional glob patterns to include */
   includePatterns?: string[];
@@ -90,15 +105,43 @@ export interface AnalyzeApiOptions extends BaseOptions {
   excludePatterns?: string[];
   /** Force re-analysis even if recent analysis exists */
   force?: boolean;
-  /** Output directory for analysis artifacts. Default: '.spec-gen/analysis/' */
+  /**
+   * Also re-extract every file rather than reusing the per-file extraction cache
+   * (change: optimize-hash-keyed-analyze). Default false, because the reused lane is
+   * byte-identical and `force` alone is what a rebuilding daemon or a healing watcher
+   * wants — re-analysis without re-parsing. Set this only to verify the cache or to work
+   * around a suspected one; `openlore analyze --force` sets it.
+   */
+  reExtract?: boolean;
+  /** Output directory for analysis artifacts. Default: '.openlore/analysis/' */
   outputPath?: string;
+}
+
+export interface AnalyzeDegradation {
+  /** Analysis artifact that could not be loaded. */
+  artifact: string;
+  /** Why the artifact is unavailable. */
+  reason: 'missing' | 'corrupt';
+}
+
+export interface AnalyzeIndexDegradation {
+  /** Search index that could not be built at full fidelity. */
+  index: 'function' | 'text' | 'spec';
+  /** Stable human-readable explanation from the index builder. */
+  reason: string;
 }
 
 export interface AnalyzeResult {
   repoMap: CoreRepositoryMap;
-  depGraph: DependencyGraphResult;
+  depGraph?: DependencyGraphResult;
   artifacts: AnalysisArtifacts;
   duration: number;
+  /** True when the result was loaded from a current persisted analysis. */
+  fromCache: boolean;
+  /** Present when a missing or corrupt optional artifact makes the result partial. */
+  degraded?: AnalyzeDegradation;
+  /** Non-empty when one or more search indexes could not be built at full fidelity. */
+  indexDegradations?: AnalyzeIndexDegradation[];
 }
 
 // ============================================================================
@@ -107,7 +150,7 @@ export interface AnalyzeResult {
 
 export interface GenerateApiOptions extends BaseOptions {
   /** LLM provider to use */
-  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'antigravity-cli' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'cursor-agent';
   /** LLM model name */
   model?: string;
   /** Custom LLM API base URL */
@@ -128,19 +171,29 @@ export interface GenerateApiOptions extends BaseOptions {
   adrOnly?: boolean;
   /** Generate requirement-to-function mapping */
   mapping?: boolean;
-  /** Preview what would be generated without writing */
+  /** List what would be generated without constructing/calling a provider or writing */
   dryRun?: boolean;
-  /** Path to analysis directory. Default: '.spec-gen/analysis/' */
+  /** Path to analysis directory. Default: '.openlore/analysis/' */
   analysisPath?: string;
   /** Force regeneration from scratch, ignoring any cached stage results on disk */
   force?: boolean;
 }
 
-export interface GenerateResult {
+export interface GenerateDryRunResult {
+  dryRun: true;
+  report: GenerationReport;
+  duration: number;
+}
+
+export interface GenerateCompletedResult {
+  dryRun: false;
   report: GenerationReport;
   pipelineResult: PipelineResult;
   duration: number;
 }
+
+/** Dry runs never fabricate a pipeline result that did not execute. */
+export type GenerateResult = GenerateDryRunResult | GenerateCompletedResult;
 
 // ============================================================================
 // VERIFY
@@ -148,7 +201,7 @@ export interface GenerateResult {
 
 export interface VerifyApiOptions extends BaseOptions {
   /** LLM provider to use */
-  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'antigravity-cli' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'cursor-agent';
   /** LLM model name */
   model?: string;
   /** Custom LLM API base URL */
@@ -186,7 +239,7 @@ export interface DriftApiOptions extends BaseOptions {
   /** Use LLM for deeper semantic comparison */
   llmEnhanced?: boolean;
   /** LLM provider (required if llmEnhanced is true) */
-  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'antigravity-cli' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'cursor-agent';
   /** LLM model name (used when llmEnhanced is true) */
   model?: string;
   /** Custom LLM API base URL */
@@ -214,8 +267,14 @@ export interface RunApiOptions extends BaseOptions {
   force?: boolean;
   /** Force fresh analysis even if recent exists */
   reanalyze?: boolean;
+  /**
+   * Also re-extract every file rather than reusing the per-file extraction cache
+   * (change: optimize-hash-keyed-analyze). Default false: the reused lane is byte-identical,
+   * so `reanalyze` alone already produces a complete, current analysis.
+   */
+  reExtract?: boolean;
   /** LLM provider to use */
-  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'claude-code' | 'mistral-vibe' | 'cursor-agent';
+  provider?: 'anthropic' | 'openai' | 'openai-compat' | 'copilot' | 'gemini' | 'gemini-cli' | 'antigravity-cli' | 'claude-code' | 'codex-cli' | 'mistral-vibe' | 'cursor-agent';
   /** LLM model name */
   model?: string;
   /** Custom LLM API base URL */
@@ -226,20 +285,36 @@ export interface RunApiOptions extends BaseOptions {
   openaiCompatBaseUrl?: string;
   /** LLM request timeout in milliseconds. Default: 120000 (2 minutes) */
   timeout?: number;
-  /** Maximum files to analyze. Default: 500 */
+  /** Maximum files to analyze. Default: 100,000 */
   maxFiles?: number;
   /** Generate Architecture Decision Records */
   adr?: boolean;
   /** Preview what would happen without changes */
   dryRun?: boolean;
+  /** Optional host consent gate, called after analysis and before paid generation. */
+  confirmGeneration?: (estimate: { tokens: number; cost: number; provider: string; model: string }) => boolean | Promise<boolean>;
 }
 
-export interface RunResult {
-  init: InitResult;
-  analysis: AnalyzeResult;
-  generation: GenerateResult;
+export interface RunDryRunResult {
+  dryRun: true;
+  plan: {
+    init: boolean;
+    analyze: boolean;
+    generate: boolean;
+  };
+  generation: GenerateDryRunResult;
   duration: number;
 }
+
+export interface RunCompletedResult {
+  dryRun: false;
+  init: InitResult;
+  analysis: AnalyzeResult;
+  generation: GenerateCompletedResult;
+  duration: number;
+}
+
+export type RunResult = RunDryRunResult | RunCompletedResult;
 
 // ============================================================================
 // AUDIT
@@ -250,8 +325,12 @@ export interface AuditApiOptions extends BaseOptions {
   maxUncovered?: number;
   /** Minimum fanIn to flag a hub as a gap. Default: 5 */
   hubThreshold?: number;
-  /** Save audit report to .spec-gen/analysis/audit-report.json. Default: true */
+  /** Save audit report to .openlore/analysis/audit-report.json. Default: true */
   save?: boolean;
+  /** Optional normalized file scope applied before result limits. */
+  files?: string[];
+  /** Optional spec-domain scope applied before result limits. */
+  domains?: string[];
 }
 
 export type { AuditReport } from '../types/index.js';

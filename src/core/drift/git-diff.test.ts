@@ -4,10 +4,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { classifyFile, isSkippableFile, validateGitRef,
-  isGitRepository, getCurrentBranch, resolveBaseRef,
-  getFileDiff, getChangedFiles } from './git-diff.js';
+  isGitRepository, isGitRepositoryRoot, getRepoPrefix, reframeRepoPath, getCurrentBranch, resolveBaseRef, refExists,
+  resolveBaseRefDisclosed, getFileDiff, getChangedFiles } from './git-diff.js';
 import { execFile } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -255,7 +255,7 @@ describe('isGitRepository', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-git-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-git-'));
   });
   afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
 
@@ -267,6 +267,129 @@ describe('isGitRepository', () => {
     await initRepo(tmpDir);
     expect(await isGitRepository(tmpDir)).toBe(true);
   });
+
+  // fix-git-derived-signal-honesty: work-tree-aware detection. The old access(.git)
+  // test recognized only the repo ROOT, silently emptying every git-derived signal
+  // for a monorepo package directory.
+  it('returns true for a subdirectory of a repository (monorepo package)', async () => {
+    await initRepo(tmpDir);
+    const pkg = join(tmpDir, 'packages', 'foo');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(join(pkg, 'x.ts'), 'export const x = 1;');
+    await commit(tmpDir);
+    expect(await isGitRepository(pkg)).toBe(true);
+  });
+
+  it('returns false inside the .git directory (not a work tree)', async () => {
+    await initRepo(tmpDir);
+    await writeFile(join(tmpDir, 'a.ts'), 'export const a = 1;');
+    await commit(tmpDir);
+    // .git exists after init but is not itself a work tree.
+    expect(await isGitRepository(join(tmpDir, '.git'))).toBe(false);
+  });
+
+  it('returns true for a linked worktree (where .git is a file)', async () => {
+    await initRepo(tmpDir);
+    await writeFile(join(tmpDir, 'a.ts'), 'export const a = 1;');
+    await commit(tmpDir);
+    const wt = await mkdtemp(join(tmpdir(), 'openlore-worktree-'));
+    await rm(wt, { recursive: true, force: true }); // git worktree add wants a non-existent path
+    await execFileAsync('git', ['worktree', 'add', wt], { cwd: tmpDir });
+    try {
+      expect(await isGitRepository(wt)).toBe(true);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', wt], { cwd: tmpDir }).catch(() => {});
+      await rm(wt, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// getRepoPrefix / reframeRepoPath (below-root path re-framing)
+// ============================================================================
+
+describe('getRepoPrefix', () => {
+  let tmpDir: string;
+  beforeEach(async () => { tmpDir = await mkdtemp(join(tmpdir(), 'openlore-prefix-')); });
+  afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
+
+  it('is empty at the repository root', async () => {
+    await initRepo(tmpDir);
+    expect(await getRepoPrefix(tmpDir)).toBe('');
+  });
+
+  it('is the trailing-slash path from the repo root for a subdirectory', async () => {
+    await initRepo(tmpDir);
+    const pkg = join(tmpDir, 'packages', 'foo');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(join(pkg, 'x.ts'), 'export const x = 1;');
+    await commit(tmpDir);
+    expect(await getRepoPrefix(pkg)).toBe('packages/foo/');
+  });
+
+  it('is null outside any repository', async () => {
+    expect(await getRepoPrefix(tmpDir)).toBeNull();
+  });
+});
+
+describe('isGitRepositoryRoot', () => {
+  let tmpDir: string;
+  beforeEach(async () => { tmpDir = await mkdtemp(join(tmpdir(), 'openlore-reporoot-')); });
+  afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
+
+  // Root-only gate for path-frame-sensitive callers (drift, decisions, staleness):
+  // behaviorally identical to the old access(.git) test — true only AT the repo root.
+  it('is true at the repository root', async () => {
+    await initRepo(tmpDir);
+    expect(await isGitRepositoryRoot(tmpDir)).toBe(true);
+  });
+
+  it('is false in a subdirectory (unlike isGitRepository, which is true there)', async () => {
+    await initRepo(tmpDir);
+    const pkg = join(tmpDir, 'packages', 'foo');
+    await mkdir(pkg, { recursive: true });
+    await writeFile(join(pkg, 'x.ts'), 'export const x = 1;');
+    await commit(tmpDir);
+    expect(await isGitRepository(pkg)).toBe(true);      // work-tree-aware
+    expect(await isGitRepositoryRoot(pkg)).toBe(false); // but not the root
+  });
+
+  it('is false outside any repository', async () => {
+    expect(await isGitRepositoryRoot(tmpDir)).toBe(false);
+  });
+
+  it('is true at a linked worktree root (.git is a file)', async () => {
+    await initRepo(tmpDir);
+    await writeFile(join(tmpDir, 'a.ts'), 'export const a = 1;');
+    await commit(tmpDir);
+    const wt = await mkdtemp(join(tmpdir(), 'openlore-reporoot-wt-'));
+    await rm(wt, { recursive: true, force: true });
+    await execFileAsync('git', ['worktree', 'add', wt], { cwd: tmpDir });
+    try {
+      expect(await isGitRepositoryRoot(wt)).toBe(true);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', wt], { cwd: tmpDir }).catch(() => {});
+      await rm(wt, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('reframeRepoPath', () => {
+  it('is the identity at the repository root (empty prefix)', () => {
+    expect(reframeRepoPath('src/x.ts', '')).toBe('src/x.ts');
+  });
+
+  it('strips the prefix for a path inside the analyzed subtree', () => {
+    expect(reframeRepoPath('packages/foo/src/x.ts', 'packages/foo/')).toBe('src/x.ts');
+  });
+
+  it('returns null for a path outside the analyzed subtree', () => {
+    expect(reframeRepoPath('packages/bar/src/y.ts', 'packages/foo/')).toBeNull();
+  });
+
+  it('returns null for the analyzed directory itself (no file component)', () => {
+    expect(reframeRepoPath('packages/foo', 'packages/foo/')).toBeNull();
+  });
 });
 
 // ============================================================================
@@ -277,7 +400,7 @@ describe('getCurrentBranch', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-branch-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-branch-'));
     await initRepo(tmpDir);
     await writeFile(join(tmpDir, 'a.ts'), 'const x = 1;', 'utf-8');
     await commit(tmpDir);
@@ -305,7 +428,7 @@ describe('resolveBaseRef', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-ref-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-ref-'));
     await initRepo(tmpDir);
     await writeFile(join(tmpDir, 'a.ts'), 'v1', 'utf-8');
     await commit(tmpDir, 'initial');
@@ -339,6 +462,99 @@ describe('resolveBaseRef', () => {
   });
 });
 
+describe('refExists', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-refexists-'));
+    await initRepo(tmpDir);
+    await writeFile(join(tmpDir, 'a.ts'), 'v1', 'utf-8');
+    await commit(tmpDir, 'initial');
+  });
+  afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
+
+  it('returns true for a resolvable ref (HEAD)', async () => {
+    expect(await refExists(tmpDir, 'HEAD')).toBe(true);
+  });
+
+  it('returns false for a ref that does not exist (no silent fallback)', async () => {
+    expect(await refExists(tmpDir, 'totally-bogus-ref-xyz')).toBe(false);
+  });
+
+  it('returns false (never throws) for an injection-shaped ref', async () => {
+    expect(await refExists(tmpDir, '--upload-pack=evil')).toBe(false);
+  });
+
+  it('returns false for a non-git directory rather than throwing', async () => {
+    const nonRepo = await mkdtemp(join(tmpdir(), 'openlore-norepo-'));
+    try {
+      expect(await refExists(nonRepo, 'HEAD')).toBe(false);
+    } finally {
+      await rm(nonRepo, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// resolveBaseRefDisclosed — the shared resolve-or-disclose helper every --base
+// command routes through (fix-cli-conclusion-honesty). This is the ONE home of
+// the fallback-detection logic; the commands only surface/act on its verdict.
+// ============================================================================
+
+describe('resolveBaseRefDisclosed', () => {
+  const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf899d15f71049056';
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-disclosed-'));
+    await initRepo(tmpDir);
+    await writeFile(join(tmpDir, 'a.ts'), 'v1', 'utf-8');
+    await commit(tmpDir, 'initial');
+  });
+  afterEach(async () => { await rm(tmpDir, { recursive: true, force: true }); });
+
+  it('an explicit ref that resolves is NOT a fallback', async () => {
+    const r = await resolveBaseRefDisclosed(tmpDir, 'HEAD');
+    expect(r).toEqual({ requested: 'HEAD', resolved: 'HEAD', fellBack: false });
+  });
+
+  it('an explicit ref that does NOT resolve falls back and discloses both refs', async () => {
+    const r = await resolveBaseRefDisclosed(tmpDir, 'totally-bogus-ref-xyz');
+    expect(r.requested).toBe('totally-bogus-ref-xyz');
+    expect(r.resolved).toBe('main'); // main → master → HEAD~1 fallback
+    expect(r.fellBack).toBe(true);
+  });
+
+  it('the "auto" default explicitly requests the fallback chain and is never a fallback', async () => {
+    const r = await resolveBaseRefDisclosed(tmpDir, 'auto');
+    expect(r.resolved).toBe('main');
+    expect(r.fellBack).toBe(false);
+  });
+
+  it('prefers a remote-only default branch over the local HEAD parent', async () => {
+    await writeFile(join(tmpDir, 'a.ts'), 'v2', 'utf-8');
+    await commit(tmpDir, 'feature work');
+    await execFileAsync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD~1'], { cwd: tmpDir });
+    await execFileAsync('git', ['branch', '-m', 'feature'], { cwd: tmpDir });
+
+    const r = await resolveBaseRefDisclosed(tmpDir, 'auto');
+    expect(r).toEqual({ requested: 'auto', resolved: 'origin/main', fellBack: false });
+  });
+
+  it('an empty request is treated as auto (no fallback flag)', async () => {
+    const r = await resolveBaseRefDisclosed(tmpDir, '');
+    expect(r.fellBack).toBe(false);
+  });
+
+  it('does NOT false-flag a usable base that resolves to itself but is not a commit (empty-tree SHA)', async () => {
+    // resolveBaseRef returns the empty-tree SHA verbatim (it is a valid diff base), so the
+    // helper must NOT call it a fallback even though refExists (which peels ^{commit}) is false.
+    const r = await resolveBaseRefDisclosed(tmpDir, EMPTY_TREE);
+    expect(r.resolved).toBe(EMPTY_TREE);
+    expect(r.fellBack).toBe(false);
+  });
+});
+
 // ============================================================================
 // getFileDiff
 // ============================================================================
@@ -347,7 +563,7 @@ describe('getFileDiff', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-diff-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-diff-'));
     await initRepo(tmpDir);
     await writeFile(join(tmpDir, 'service.ts'), 'export const v = 1;', 'utf-8');
     await commit(tmpDir, 'initial');
@@ -388,7 +604,7 @@ describe('getChangedFiles', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-changed-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-changed-'));
     await initRepo(tmpDir);
     await writeFile(join(tmpDir, 'a.ts'), 'const a = 1;', 'utf-8');
     await commit(tmpDir, 'initial');
@@ -459,5 +675,38 @@ describe('getChangedFiles', () => {
     const result = await getChangedFiles({ rootPath: tmpDir, baseRef: 'HEAD~1', includeUnstaged: false });
     const testFile = result.files.find(f => f.path === 'a.test.ts');
     expect(testFile?.isTest).toBe(true);
+  });
+
+  // Regression: uncommitted (staged/working-tree) changes must carry real line
+  // counts — before the fix they always fell through to +0/-0, so gap severity
+  // could never cross the pre-commit hook's threshold (drift-gate blindness).
+  it('carries real line counts for a staged-only change (not +0/-0)', async () => {
+    const big = Array.from({ length: 40 }, (_, i) => `const x${i} = ${i};`).join('\n') + '\n';
+    await writeFile(join(tmpDir, 'a.ts'), big, 'utf-8');
+    await execFileAsync('git', ['add', 'a.ts'], { cwd: tmpDir });
+    const result = await getChangedFiles({ rootPath: tmpDir, baseRef: 'HEAD', includeUnstaged: true });
+    const file = result.files.find(f => f.path === 'a.ts');
+    expect(file).toBeDefined();
+    expect(file!.additions).toBeGreaterThan(30);
+  });
+
+  it('carries real line counts for a working-tree-only change (not +0/-0)', async () => {
+    await writeFile(join(tmpDir, 'a.ts'), 'const a = 1;\nconst b = 2;\nconst c = 3;\n', 'utf-8');
+    const result = await getChangedFiles({ rootPath: tmpDir, baseRef: 'HEAD', includeUnstaged: true });
+    const file = result.files.find(f => f.path === 'a.ts');
+    expect(file).toBeDefined();
+    expect(file!.additions).toBeGreaterThan(0);
+  });
+
+  it('merges (sums) counts for a file both staged and modified in the working tree', async () => {
+    // Stage two added lines, then add two more unstaged lines to the same file.
+    await writeFile(join(tmpDir, 'a.ts'), 'const a = 1;\nconst b = 2;\nconst c = 3;\n', 'utf-8');
+    await execFileAsync('git', ['add', 'a.ts'], { cwd: tmpDir });
+    await writeFile(join(tmpDir, 'a.ts'), 'const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;\n', 'utf-8');
+    const result = await getChangedFiles({ rootPath: tmpDir, baseRef: 'HEAD', includeUnstaged: true });
+    const file = result.files.find(f => f.path === 'a.ts');
+    expect(file).toBeDefined();
+    // staged diff (2 added) + working-tree diff (2 added) merged; never zero.
+    expect(file!.additions).toBeGreaterThanOrEqual(4);
   });
 });

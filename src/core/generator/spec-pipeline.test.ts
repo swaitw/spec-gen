@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdir, rm, readdir } from 'node:fs/promises';
+import { mkdir, rm, readdir, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -53,7 +53,16 @@ function createMockRepoStructure(): RepoStructure {
     },
     uiComponents: [],
     schemas: [],
-    routeInventory: { total: 0, byMethod: {}, byFramework: {}, routes: [] },
+    routeInventory: {
+      total: 3,
+      byMethod: { GET: 2, POST: 1 },
+      byFramework: { express: 3 },
+      routes: [
+        { method: 'GET', path: '/users/:id', handler: 'getUser', file: 'routes/user.ts', framework: 'express', contractSource: 'none' },
+        { method: 'POST', path: '/users', handler: 'createUser', file: 'routes/user.ts', framework: 'express', contractSource: 'none' },
+        { method: 'GET', path: '/api/health', handler: 'healthCheck', file: 'routes/api.ts', framework: 'express', contractSource: 'none' },
+      ],
+    },
     middleware: [],
         envVars: [],
     statistics: {
@@ -249,9 +258,9 @@ describe('SpecGenerationPipeline', () => {
 
       // Set up mock responses
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
-      provider.setResponse('services/modules', MOCK_RESPONSES.services);
-      provider.setResponse('API/route', MOCK_RESPONSES.api);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
+      provider.setResponse('logic and processing layer', MOCK_RESPONSES.services);
+      provider.setResponse('public API surface', MOCK_RESPONSES.api);
       provider.setResponse('Synthesize', MOCK_RESPONSES.architecture);
       provider.setDefaultResponse(MOCK_RESPONSES.survey);
 
@@ -305,6 +314,101 @@ describe('SpecGenerationPipeline', () => {
 
       expect(result.metadata.totalTokens).toBeGreaterThan(0);
     });
+
+    it('limits domain stages and their resume cache to the requested domains', async () => {
+      const { service, provider } = createMockLLMService();
+      provider.setResponse('categorize', MOCK_RESPONSES.survey);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
+      provider.setResponse('logic and processing layer', MOCK_RESPONSES.services);
+      provider.setResponse('public API surface', MOCK_RESPONSES.api);
+      provider.setResponse('Synthesize', MOCK_RESPONSES.architecture);
+      provider.setDefaultResponse(MOCK_RESPONSES.survey);
+
+      const repo = createMockRepoStructure();
+      repo.domains = [
+        { ...repo.domains[0], files: ['services/user-service.ts'] },
+        { ...repo.domains[1], files: ['auth.ts'] },
+      ];
+      const context = createMockLLMContext();
+      context.phase2_deep.files.push({ path: 'auth.ts', content: 'export function AUTH_ONLY() {}', tokens: 10 });
+
+      const pipeline = new SpecGenerationPipeline(service, {
+        outputDir: tempDir,
+        saveIntermediate: true,
+        domains: ['user'],
+      });
+      await pipeline.run(repo, context, createMockDepGraph());
+
+      const domainStageCalls = provider.callHistory.filter(call =>
+        /core data models|logic and processing layer|public API surface/.test(call.systemPrompt),
+      );
+      expect(domainStageCalls.some(call => call.userPrompt.includes('AUTH_ONLY'))).toBe(false);
+      expect(domainStageCalls.some(call => call.userPrompt.includes('models/user.ts'))).toBe(false);
+      expect(domainStageCalls.some(call => call.userPrompt.includes('routes/user.ts'))).toBe(false);
+      const cacheFiles = await readdir(tempDir);
+      expect(cacheFiles.some(file => /^stage3-services\.domains-[a-f0-9]{12}\.json$/.test(file))).toBe(true);
+      expect(cacheFiles).not.toContain('stage2-entities.json');
+    });
+
+    it('rejects every unknown requested domain even when another domain matches', async () => {
+      const { service, provider } = createMockLLMService();
+      provider.setDefaultResponse(MOCK_RESPONSES.survey);
+      const pipeline = new SpecGenerationPipeline(service, {
+        outputDir: tempDir,
+        domains: ['user', 'typo'],
+      });
+      await expect(pipeline.run(createMockRepoStructure(), createMockLLMContext()))
+        .rejects.toThrow('Requested domains were not found: typo');
+      expect(provider.callHistory).toHaveLength(0);
+    });
+
+    it('routes cross-file domain evidence through stages 2-4 end to end', async () => {
+      const { service, provider } = createMockLLMService();
+      provider.setResponse('categorize', MOCK_RESPONSES.survey);
+      provider.setResponse('core data models', JSON.stringify([
+        { name: 'Invoice', description: 'invoice', properties: [], relationships: [], validations: [], scenarios: [], location: 'invented.ts' },
+        { name: 'Payment', description: 'payment', properties: [], relationships: [], validations: [], scenarios: [], location: 'invented.ts' },
+      ]));
+      provider.setResponse('logic and processing layer', JSON.stringify([{ name: 'BillingService', purpose: 'billing', operations: [{ name: 'collect', description: '', scenarios: [], functionName: 'collectPayment' }], dependencies: [], sideEffects: [], domain: 'wrong' }]));
+      provider.setResponse('public API surface', JSON.stringify([{ method: 'POST', path: '/payments', purpose: 'collect', scenarios: [] }]));
+      provider.setResponse('Synthesize', MOCK_RESPONSES.architecture);
+
+      const repo = createMockRepoStructure();
+      repo.domains = [{
+        name: 'billing', suggestedSpecPath: 'openspec/specs/billing/spec.md',
+        files: ['models/invoice.ts', 'models/payment.ts', 'services/billing.ts', 'routes/billing.ts'],
+        entities: ['Invoice', 'Payment'], keyFile: 'services/billing.ts',
+      }];
+      repo.schemas = [
+        { name: 'Invoice', file: 'models/invoice.ts', orm: 'prisma', line: 1, fields: [{ name: 'id', type: 'string', nullable: false }] },
+        { name: 'Payment', file: 'models/payment.ts', orm: 'prisma', line: 1, fields: [{ name: 'amount', type: 'decimal', nullable: false }] },
+      ];
+      repo.routeInventory = {
+        total: 1, byMethod: { POST: 1 }, byFramework: { express: 1 },
+        routes: [{ method: 'POST', path: '/payments', handler: 'collectPayment', file: 'routes/billing.ts', framework: 'express', contractSource: 'none' }],
+      };
+      const context = createMockLLMContext();
+      context.phase2_deep.files = [
+        { path: 'models/invoice.ts', content: 'model Invoice { id String }', tokens: 8 },
+        { path: 'models/payment.ts', content: 'model Payment { amount Decimal }', tokens: 8 },
+        { path: 'services/billing.ts', content: 'export function collectPayment() {}', tokens: 8 },
+        { path: 'routes/billing.ts', content: 'router.post("/payments", collectPayment)', tokens: 8 },
+      ];
+      context.signatures = [{
+        path: 'services/billing.ts', language: 'TypeScript',
+        entries: [{ kind: 'function', name: 'collectPayment', signature: 'function collectPayment(): void' }],
+      }];
+
+      const pipeline = new SpecGenerationPipeline(service, { outputDir: tempDir });
+      const result = await pipeline.run(repo, context, createMockDepGraph());
+
+      expect(result.entities.map(entity => [entity.name, entity.location])).toEqual([
+        ['Invoice', 'models/invoice.ts'], ['Payment', 'models/payment.ts'],
+      ]);
+      expect(result.services[0]).toMatchObject({ domain: 'billing', locationFile: 'services/billing.ts' });
+      expect(result.services[0].operations[0].functionName).toBe('collectPayment');
+      expect(result.endpoints.map(endpoint => `${endpoint.method} ${endpoint.path}`)).toEqual(['POST /payments']);
+    });
   });
 
   describe('Stage 1: Project Survey', () => {
@@ -351,7 +455,7 @@ describe('SpecGenerationPipeline', () => {
     it('should extract entities from schema files', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
       provider.setDefaultResponse(MOCK_RESPONSES.architecture);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -372,7 +476,7 @@ describe('SpecGenerationPipeline', () => {
     it('should include entity scenarios', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
       provider.setDefaultResponse(MOCK_RESPONSES.architecture);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -396,8 +500,8 @@ describe('SpecGenerationPipeline', () => {
     it('should extract services', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
-      provider.setResponse('services/modules', MOCK_RESPONSES.services);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
+      provider.setResponse('logic and processing layer', MOCK_RESPONSES.services);
       provider.setDefaultResponse(MOCK_RESPONSES.architecture);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -418,8 +522,8 @@ describe('SpecGenerationPipeline', () => {
     it('should include service dependencies', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
-      provider.setResponse('services/modules', MOCK_RESPONSES.services);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
+      provider.setResponse('logic and processing layer', MOCK_RESPONSES.services);
       provider.setDefaultResponse(MOCK_RESPONSES.architecture);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -440,9 +544,9 @@ describe('SpecGenerationPipeline', () => {
     it('should extract API endpoints', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('schema/model', MOCK_RESPONSES.entities);
-      provider.setResponse('service/business', MOCK_RESPONSES.services);
-      provider.setResponse('API/route', MOCK_RESPONSES.api);
+      provider.setResponse('core data models', MOCK_RESPONSES.entities);
+      provider.setResponse('logic and processing layer', MOCK_RESPONSES.services);
+      provider.setResponse('public API surface', MOCK_RESPONSES.api);
       provider.setDefaultResponse(MOCK_RESPONSES.architecture);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -463,7 +567,7 @@ describe('SpecGenerationPipeline', () => {
     it('should include endpoint scenarios', async () => {
       const { service, provider } = createMockLLMService();
       provider.setResponse('categorize', MOCK_RESPONSES.survey);
-      provider.setResponse('API/route', MOCK_RESPONSES.api);
+      provider.setResponse('public API surface', MOCK_RESPONSES.api);
       provider.setDefaultResponse(MOCK_RESPONSES.survey);
 
       const pipeline = new SpecGenerationPipeline(service, {
@@ -812,6 +916,26 @@ describe('SpecGenerationPipeline', () => {
   });
 
   describe('loadStageResult', () => {
+    it('invalidates a cached stage when the analysis is newer', async () => {
+      const { service: llm } = createMockLLMService();
+      const outputDir = join(tempDir, '.openlore', 'generation');
+      const analysisDir = join(tempDir, '.openlore', 'analysis');
+      await mkdir(outputDir, { recursive: true });
+      await mkdir(analysisDir, { recursive: true });
+      const pipeline = new SpecGenerationPipeline(llm, { outputDir, rootPath: tempDir });
+      await pipeline.saveResult('stage1-survey', {
+        success: true,
+        data: { cached: true },
+        tokens: 1,
+      });
+      const analysisPath = join(analysisDir, 'llm-context.json');
+      await writeFile(analysisPath, '{}');
+      const future = new Date(Date.now() + 10_000);
+      await utimes(analysisPath, future, future);
+
+      expect(await pipeline.loadStageResult('survey')).toBeNull();
+    });
+
     it('returns null when stage result file does not exist', async () => {
       const { service: llm } = createMockLLMService();
       const pipeline = new SpecGenerationPipeline(llm, { outputDir: tempDir });
@@ -929,5 +1053,31 @@ describe('SpecGenerationPipeline', () => {
       expect(result.metadata.completedStages).toContain('survey');
       expect(result.metadata.skippedStages).toContain('api');
     });
+  });
+});
+
+describe('generation evidence path confinement', () => {
+  it('rejects sibling-prefix traversal and symlinks outside the project', async () => {
+    const parent = await createTempDir();
+    const root = join(parent, 'project');
+    const sibling = join(parent, 'project-secret');
+    await mkdir(root);
+    await mkdir(sibling);
+    await writeFile(join(sibling, 'secret.ts'), 'TOP_SECRET');
+    await symlink(join(sibling, 'secret.ts'), join(root, 'linked.ts'));
+    const { service } = createMockLLMService();
+    const pipeline = new SpecGenerationPipeline(service, {
+      outputDir: join(root, '.openlore', 'generation'), rootPath: root, saveIntermediate: false,
+    });
+    const resolveFiles = (pipeline as unknown as {
+      resolveFiles(context: LLMContext, paths: string[], fallback: Array<{ path: string; content: string }>): Promise<Array<{ path: string; content: string }>>;
+    }).resolveFiles.bind(pipeline);
+    const context = { phase2_deep: { files: [] } } as unknown as LLMContext;
+    try {
+      expect(await resolveFiles(context, ['../project-secret/secret.ts'], [])).toEqual([]);
+      expect(await resolveFiles(context, ['linked.ts'], [])).toEqual([]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
   });
 });

@@ -1,38 +1,87 @@
 /**
- * spec-gen doctor command
+ * openlore doctor command
  *
  * Self-diagnostic tool that checks all prerequisites and surfaces actionable
  * fixes when something is misconfigured or missing.
  */
 
 import { Command } from 'commander';
-import { access, stat } from 'node:fs/promises';
-import { join } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { sanitizeForTerminal as safe } from '../../utils/misc.js';
+import { embeddingTlsRelaxed, withRelaxedTls } from '../../core/services/tls-scope.js';
+import { access, stat, readFile, realpath } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { join, relative, isAbsolute, win32 } from 'node:path';
 import { logger } from '../../utils/logger.js';
-import { readSpecGenConfig } from '../../core/services/config-manager.js';
+import { palette } from '../../utils/colors.js';
+import {
+  InvalidOpenLoreConfigError,
+  readOpenLoreConfig,
+  normalizeOpenLoreConfig,
+  resolveOpenLoreConfigPath,
+} from '../../core/services/config-manager.js';
+import { validateOpenLoreConfig } from '../../core/services/config-schema.js';
+import type { OpenLoreConfig } from '../../types/index.js';
+import type { Embedder } from '../../core/analyzer/embedding-service.js';
+import {
+  indexCapabilityAgreement,
+  resolveEmbedder,
+  semanticProviderConfigured,
+  servedRetrievalMode,
+} from '../../core/analyzer/embedder.js';
+import { readIndexReceipt } from '../../core/analyzer/analysis-indexes.js';
+import { VectorIndex } from '../../core/analyzer/vector-index.js';
+import { EdgeStore } from '../../core/services/edge-store.js';
 import { createLLMService, ProviderName } from '../../core/services/llm-service.js';
+import { isSqliteAvailable } from '../node-version-guard.js';
 import {
   MIN_NODE_MAJOR_VERSION,
+  MIN_NODE_MINOR_VERSION,
   ANALYSIS_AGE_WARNING_HOURS,
   MIN_DISK_SPACE_FAIL_MB,
   MIN_DISK_SPACE_WARN_MB,
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
-  SPEC_GEN_CONFIG_FILENAME,
-  SPEC_GEN_CONFIG_REL_PATH,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
+  OPENLORE_CONFIG_REL_PATH,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
   ARTIFACT_REPO_STRUCTURE,
+  ARTIFACT_PARSE_HEALTH,
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_OPENAI_MODEL,
   DEFAULT_OPENAI_COMPAT_MODEL,
   DEFAULT_GEMINI_MODEL,
   DEFAULT_COPILOT_MODEL,
+  DEFAULT_MAX_FILES,
+  FINGERPRINT_BUDGET_TOP_OFFENDERS,
 } from '../../constants.js';
+import { analysisConfigFingerprintInput, analysisGeneratedExcludes } from '../../core/analyzer/analysis-core.js';
+import { formatBytes } from '../../core/analyzer/memory-strategy.js';
+import {
+  DEFAULT_FINGERPRINT_MAX_BYTES,
+  largestCorpusPaths,
+  walkFingerprintCorpus,
+} from '../../core/services/mcp-handlers/utils.js';
+import {
+  refuseRepoConfiguredEndpoint,
+  rejectRepoConfiguredTlsOptOut,
+  resolveTrustedCompatBase,
+  resolveTrustedSslVerify,
+} from '../../core/services/repo-config-trust.js';
+import { describeExclusions, totalExcluded, type ParseHealthReport } from '../../core/analyzer/parse-health.js';
+import { describeScriptContainerBoundaries } from '../../core/analyzer/sfc-script-extractor.js';
+import { describeMemoryDegradation } from '../../core/analyzer/memory-strategy.js';
+import type { GovernanceFinding } from '../../core/services/mcp-handlers/enforcement-policy.js';
+import { detectCorpusIntegrity } from '../../core/decisions/corpus-integrity.js';
+import { detectInjectionShapes, INJECTION_SHAPE_LIMITS } from '../../core/services/served-content.js';
+import { redactSecretTextWithKnownValues } from '../../core/services/secret-redaction.js';
+import { execFileGit as execFileAsync } from '../../utils/git-exec.js';
+import { toRepositoryPath } from '../../core/analyzer/file-walker.js';
+import {
+  hookManagerWarning,
+  isResolvedGitRepository,
+  resolveGitHookTarget,
+} from '../git-hooks.js';
 
-const execFileAsync = promisify(execFile);
 
 // ============================================================================
 // TYPES
@@ -40,11 +89,55 @@ const execFileAsync = promisify(execFile);
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 
-interface CheckResult {
+/**
+ * A machine-readable remediation for a check `--fix` can execute (change:
+ * make-index-self-healing). Present ONLY on checks whose printed `fix:` hint maps
+ * to a safe, in-process action, so `--fix` runs exactly what a check surfaced and
+ * nothing more. Internal — stripped from `--json` so the read-only output contract
+ * is byte-compatible.
+ */
+type Remediation =
+  | { kind: 'analyze'; label: string }
+  | { kind: 'rewire-mcp'; label: string };
+
+export interface CheckResult {
   name: string;
   status: CheckStatus;
   detail: string;
   fix?: string;
+  remediation?: Remediation;
+  findings?: GovernanceFinding[];
+}
+
+const DOCTOR_CREDENTIAL_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_COMPAT_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'EMBED_API_KEY',
+] as const;
+
+async function knownDoctorCredentials(rootPath: string): Promise<string[]> {
+  const values = DOCTOR_CREDENTIAL_ENV_VARS.flatMap(name => process.env[name] ? [process.env[name]!] : []);
+  try {
+    const config = await readOpenLoreConfig(rootPath);
+    if (config?.embedding?.apiKey) values.push(config.embedding.apiKey);
+  } catch {
+    // A malformed config is already reported by its check; environment credentials
+    // still cross the redaction boundary below.
+  }
+  return values;
+}
+
+function redactDoctorResults(checks: CheckResult[], knownCredentials: readonly string[]): CheckResult[] {
+  return checks.map(check => ({
+    ...check,
+    detail: redactSecretTextWithKnownValues(check.detail, knownCredentials).value,
+    ...(check.fix === undefined
+      ? {}
+      : { fix: redactSecretTextWithKnownValues(check.fix, knownCredentials).value }),
+  }));
 }
 
 // ============================================================================
@@ -52,15 +145,31 @@ interface CheckResult {
 // ============================================================================
 
 async function checkNodeVersion(): Promise<CheckResult> {
-  const [major] = process.versions.node.split('.').map(Number);
-  if (major >= MIN_NODE_MAJOR_VERSION) {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  const min = `${MIN_NODE_MAJOR_VERSION}.${MIN_NODE_MINOR_VERSION}`;
+  const versionOk =
+    major > MIN_NODE_MAJOR_VERSION ||
+    (major === MIN_NODE_MAJOR_VERSION && minor >= MIN_NODE_MINOR_VERSION);
+  // Probe the capability itself, not just the version number: a Node whose version
+  // satisfies the floor but on which `node:sqlite` is not loadable (e.g. 23.0–23.3,
+  // or a stripped distro build) must not be blessed as `ok`.
+  const sqliteOk = isSqliteAvailable();
+  if (versionOk && sqliteOk) {
     return { name: 'Node.js version', status: 'ok', detail: `v${process.versions.node}` };
+  }
+  if (!sqliteOk) {
+    return {
+      name: 'Node.js version',
+      status: 'fail',
+      detail: `v${process.versions.node} — node:sqlite unavailable on this Node`,
+      fix: `Switch to Node ${min}+ (\`nvm use ${MIN_NODE_MAJOR_VERSION}\`) or install from https://nodejs.org/ — node:sqlite must be available without runtime flags or the MCP server will crash at first import`,
+    };
   }
   return {
     name: 'Node.js version',
     status: 'fail',
-    detail: `v${process.versions.node} (requires >=${MIN_NODE_MAJOR_VERSION})`,
-    fix: `Install Node.js ${MIN_NODE_MAJOR_VERSION}+ from https://nodejs.org/`,
+    detail: `v${process.versions.node} (requires >=${min} for node:sqlite)`,
+    fix: `Switch to Node ${min}+ (\`nvm use ${MIN_NODE_MAJOR_VERSION}\`) or install from https://nodejs.org/ — a .nvmrc pinned to an older Node will crash the MCP server`,
   };
 }
 
@@ -90,36 +199,273 @@ async function checkGit(rootPath: string): Promise<CheckResult> {
   }
 }
 
+const OPENLORE_PRE_COMMIT_MARKER = /# openlore-(?:enforcement|decisions|drift|blast-radius|impact-certificate)-hook/;
+
+/** Verify that an installed OpenLore gate is on Git's active, executable hook path. */
+export async function checkHookReachability(rootPath: string): Promise<CheckResult> {
+  const target = await resolveGitHookTarget(rootPath, 'pre-commit');
+  if (!(await isResolvedGitRepository(rootPath, target))) {
+    return { name: 'Git hook reachability', status: 'ok', detail: 'not a Git repository; no hook to check' };
+  }
+
+  let activeContent = '';
+  try { activeContent = await readFile(target.hookPath, 'utf-8'); } catch { /* absent */ }
+  if (OPENLORE_PRE_COMMIT_MARKER.test(activeContent)) {
+    try {
+      await access(target.executionPath, fsConstants.X_OK);
+      return {
+        name: 'Git hook reachability',
+        status: 'ok',
+        detail: target.executionPath === target.hookPath
+          ? `OpenLore gate is installed and executable at ${target.hookPath}`
+          : `OpenLore gate is installed at ${target.hookPath} and reachable through ${target.executionPath}`,
+      };
+    } catch {
+      return {
+        name: 'Git hook reachability',
+        status: 'warn',
+        detail: `OpenLore gate is installed at ${target.hookPath} but Git cannot execute ${target.executionPath}`,
+        fix: target.manager
+          ? hookManagerWarning(target, 'openlore enforce --hook')
+          : `Run chmod +x ${JSON.stringify(target.executionPath)}`,
+      };
+    }
+  }
+
+  const legacyPath = join(rootPath, '.git', 'hooks', 'pre-commit');
+  if (legacyPath !== target.hookPath) {
+    try {
+      const shadowed = await readFile(legacyPath, 'utf-8');
+      if (OPENLORE_PRE_COMMIT_MARKER.test(shadowed)) {
+        return {
+          name: 'Git hook reachability',
+          status: 'warn',
+          detail: `OpenLore gate is installed but unreachable at ${legacyPath}; Git uses ${target.effectiveHooksDir}`,
+          fix: target.canInstall
+            ? 'Re-run the OpenLore hook installer so it writes to the effective hooks directory'
+            : hookManagerWarning(target, 'openlore enforce --hook'),
+        };
+      }
+    } catch { /* no shadowed legacy hook */ }
+  }
+
+  if (!target.canInstall) {
+    return {
+      name: 'Git hook reachability',
+      status: 'warn',
+      detail: `No reachable OpenLore gate is wired through ${target.manager}`,
+      fix: hookManagerWarning(target, 'openlore enforce --hook'),
+    };
+  }
+  return { name: 'Git hook reachability', status: 'ok', detail: 'No OpenLore Git gate installed (optional)' };
+}
+
 async function checkConfig(rootPath: string): Promise<CheckResult> {
-  const configPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_CONFIG_FILENAME);
+  const configPath = resolveOpenLoreConfigPath(rootPath);
+  // Report the path actually read: the relative form for the default in-repo
+  // location, the real path when --config redirected it elsewhere (never a
+  // hardcoded ".openlore/config.json" that would misname an explicit --config).
+  const rel = relative(rootPath, configPath);
+  const shown = rel && !rel.startsWith('..') ? rel : configPath;
   try {
     await access(configPath);
-    const config = await readSpecGenConfig(rootPath);
+    const config = await readOpenLoreConfig(rootPath);
     if (!config) {
       return {
-        name: 'spec-gen config',
+        name: 'openlore config',
         status: 'fail',
-        detail: `${SPEC_GEN_CONFIG_REL_PATH} exists but could not be parsed`,
-        fix: `Delete ${SPEC_GEN_CONFIG_REL_PATH} and run 'spec-gen init'`,
+        detail: `${shown} exists but could not be parsed`,
+        fix: `Delete ${shown} and run 'openlore init'`,
       };
     }
     return {
-      name: 'spec-gen config',
+      name: 'openlore config',
       status: 'ok',
-      detail: `${SPEC_GEN_CONFIG_REL_PATH} (project: ${config.projectType})`,
+      detail: `${shown} (project: ${config.projectType})`,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof InvalidOpenLoreConfigError) {
+      return {
+        name: 'openlore config',
+        status: 'fail',
+        detail: error.message,
+        fix: `Correct the named keys in ${shown}, or re-run 'openlore init'`,
+      };
+    }
     return {
-      name: 'spec-gen config',
+      name: 'openlore config',
       status: 'warn',
-      detail: `${SPEC_GEN_CONFIG_REL_PATH} not found`,
-      fix: "Run 'spec-gen init' to create the configuration",
+      detail: `${shown} not found`,
+      fix: "Run 'openlore install' for one-command setup (wires your agent + builds the index), or 'openlore init' to configure manually",
     };
   }
 }
 
+/**
+ * Config-schema check (change: add-config-schema-validation): surface unknown keys
+ * (typo'd sections silently dropped today), type mismatches, and version skew in
+ * `.openlore/config.json`. Reads the raw file and validates directly so the findings
+ * appear as one structured check. Clean/absent configs report ok; unusable configs also
+ * make `checkConfig` fail through the same validator-backed read boundary.
+ */
+async function checkConfigSchema(rootPath: string): Promise<CheckResult> {
+  const configPath = resolveOpenLoreConfigPath(rootPath);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(configPath, 'utf-8'));
+  } catch {
+    // No config, or unparseable JSON — checkConfig already reports both. Nothing to add.
+    return { name: 'Config schema', status: 'ok', detail: 'no config to validate' };
+  }
+  const normalized = normalizeOpenLoreConfig(parsed);
+  const findings = [...normalized.findings, ...validateOpenLoreConfig(normalized.config)];
+  if (findings.length === 0) {
+    return { name: 'Config schema', status: 'ok', detail: 'all required fields present and all declared fields well-typed' };
+  }
+  const missing = findings.filter(f => f.kind === 'missing-required');
+  const backfilled = findings.filter(f => f.kind === 'default-added');
+  const other = findings.filter(f => f.kind !== 'missing-required' && f.kind !== 'default-added');
+  const parts = [
+    ...(missing.length > 0
+      ? [`missing required keys: ${missing.map(f => f.key).join(', ')} — re-run 'openlore init'`]
+      : []),
+    ...(backfilled.length > 0
+      ? [`using compatibility defaults: ${backfilled.map(f => f.message).join('; ')}`]
+      : []),
+    ...other.slice(0, 3).map(f => f.message),
+  ];
+  const undisclosed = Math.max(0, other.length - 3);
+  const summary = parts.join('; ');
+  const more = undisclosed > 0 ? ` (+${undisclosed} more)` : '';
+  return {
+    name: 'Config schema',
+    status: 'warn',
+    detail: `${findings.length} config finding(s): ${summary}${more}`,
+    fix: missing.length > 0 || other.length > 0
+      ? `Edit ${OPENLORE_CONFIG_REL_PATH} to correct the key(s), or re-run 'openlore init'`
+      : `Add the listed default key(s) to ${OPENLORE_CONFIG_REL_PATH} to silence this compatibility warning`,
+  };
+}
+
+/**
+ * Diagnose instruction-shaped text at the human-review boundary. By default we
+ * inspect locally recorded memory plus changed spec/decision files; already
+ * reviewed corpus content is not re-litigated on every doctor run.
+ */
+export async function checkServedContentTrust(
+  rootPath: string,
+  explicitFiles?: string[],
+): Promise<CheckResult> {
+  // POSIX, because `candidate` becomes a governance finding's `subject` — a value an operator's
+  // enforcement policy matches on (#458). The other branch of this same set, harvested from
+  // `git status --porcelain`, is POSIX on every platform, so a native `join` here made ONE result
+  // array carry two separator conventions at once, and only on Windows. The read below re-joins
+  // against `rootPath`, and Node accepts `/` there.
+  const candidates = new Set<string>(explicitFiles ?? [
+    toRepositoryPath(join(OPENLORE_DIR, 'memory', 'notes.json')),
+    toRepositoryPath(join(OPENLORE_DIR, 'decisions', 'pending.json')),
+  ]);
+  if (!explicitFiles) {
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        { cwd: rootPath },
+      );
+      for (const record of stdout.split('\0')) {
+        if (record.length < 4) continue;
+        const path = record.slice(3);
+        if (path.startsWith('openspec/') && path.endsWith('.md')) {
+          candidates.add(path);
+        }
+      }
+    } catch {
+      // Non-git roots still get the local-memory check.
+    }
+  }
+
+  const findings: GovernanceFinding[] = [];
+  for (const candidate of [...candidates].sort()) {
+    let content: string;
+    try { content = await readFile(join(rootPath, candidate), 'utf8'); } catch { continue; }
+    for (const text of servedContentStrings(candidate, content)) {
+      for (const match of detectInjectionShapes(text)) {
+        findings.push({
+          code: 'injection-shaped-content',
+          severity: 'warning',
+          source: 'doctor',
+          subject: candidate,
+          message: `${match.shape}: ${JSON.stringify(match.excerpt)}. ${INJECTION_SHAPE_LIMITS}`,
+        });
+      }
+    }
+  }
+
+  if (findings.length === 0) {
+    return {
+      name: 'Served content trust',
+      status: 'ok',
+      detail: `no lexical injection shapes found. ${INJECTION_SHAPE_LIMITS}`,
+    };
+  }
+  return {
+    name: 'Served content trust',
+    status: 'warn',
+    detail: `${findings.length} advisory finding(s). ${INJECTION_SHAPE_LIMITS}`,
+    findings,
+    fix: 'Review the named content and its provenance; do not rewrite it automatically.',
+  };
+}
+
+/** Validate the governance corpus as a closed typed graph. Read-only and offline. */
+export async function checkCorpusIntegrity(rootPath: string): Promise<CheckResult> {
+  try {
+    const config = await readOpenLoreConfig(rootPath);
+    const findings = await detectCorpusIntegrity(rootPath, { openspecPath: config?.openspecPath });
+    if (findings.length === 0) {
+      return {
+        name: 'Corpus integrity',
+        status: 'ok',
+        detail: 'all declared governance references resolve',
+      };
+    }
+    const errors = findings.filter((finding) => finding.severity === 'error').length;
+    return {
+      name: 'Corpus integrity',
+      status: errors > 0 ? 'fail' : 'warn',
+      detail: `${findings.length} finding(s): ${errors} graph error(s), ${findings.length - errors} advisory`,
+      findings,
+      fix: 'Repair the named corpus references; OpenLore never rewrites governance edges automatically.',
+    };
+  } catch (error) {
+    return {
+      name: 'Corpus integrity',
+      status: 'warn',
+      detail: `check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      fix: 'Restore readable OpenSpec and .openlore decision/memory stores, then rerun doctor.',
+    };
+  }
+}
+
+/** JSON stores serve their string values, not their serialized line layout. */
+function servedContentStrings(candidate: string, content: string): string[] {
+  if (!candidate.endsWith('.json')) return [content];
+  try {
+    const values: string[] = [];
+    const visit = (value: unknown): void => {
+      if (typeof value === 'string') values.push(value);
+      else if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === 'object') Object.values(value).forEach(visit);
+    };
+    visit(JSON.parse(content));
+    return values;
+  } catch {
+    return [content];
+  }
+}
+
 async function checkAnalysis(rootPath: string): Promise<CheckResult> {
-  const analysisPath = join(rootPath, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
+  const analysisPath = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_REPO_STRUCTURE);
   try {
     const s = await stat(analysisPath);
     const ageHours = (Date.now() - s.mtime.getTime()) / 3_600_000;
@@ -129,45 +475,306 @@ async function checkAnalysis(rootPath: string): Promise<CheckResult> {
       name: 'Analysis artifacts',
       status,
       detail: `repo-structure.json exists (${ageLabel})`,
-      fix: status === 'warn' ? "Run 'spec-gen analyze' to refresh stale analysis" : undefined,
+      fix: status === 'warn' ? "Run 'openlore analyze' to refresh stale analysis" : undefined,
+      ...(status === 'warn'
+        ? { remediation: { kind: 'analyze', label: 'openlore analyze --force' } as const }
+        : {}),
     };
   } catch {
     return {
       name: 'Analysis artifacts',
       status: 'warn',
-      detail: 'No analysis found — run spec-gen analyze first',
-      fix: "Run 'spec-gen analyze'",
+      detail: 'No analysis found — run openlore analyze first',
+      fix: "Run 'openlore install' (one-command setup) or 'openlore analyze' to build the index",
+      remediation: { kind: 'analyze', label: 'openlore analyze --force' },
     };
+  }
+}
+
+/**
+ * Corpus-size check (issue #504): walk exactly what `openlore analyze` would fingerprint
+ * and compare its size with the byte budget, so a repository that would abort analyze
+ * is caught here, with the paths to exclude, before anyone runs it. It costs one walk,
+ * the same walk analyze starts with (which reads files up to 10 MB to count lines); it
+ * does not hash content or read past the walk.
+ */
+export async function checkAnalysisCorpus(rootPath: string): Promise<CheckResult> {
+  const name = 'Analysis corpus size';
+  let config: Awaited<ReturnType<typeof readOpenLoreConfig>> = null;
+  try {
+    config = await readOpenLoreConfig(rootPath);
+  } catch {
+    // A malformed config is reported by its own check; size the default corpus.
+  }
+  try {
+    const root = await realpath(rootPath);
+    const protectedExcludePatterns = analysisGeneratedExcludes(
+      root, join(root, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR), config?.openspecPath,
+    );
+    const walk = await walkFingerprintCorpus(root, {
+      configuration: analysisConfigFingerprintInput(config?.analysis, [], [], DEFAULT_MAX_FILES, protectedExcludePatterns),
+      protectedExcludePatterns,
+    });
+    const total = walk.files.reduce((sum, file) => sum + file.size, 0);
+    const summary = `${walk.files.length} file(s), ${formatBytes(total)} selected for indexing `
+      + `(cap ${formatBytes(DEFAULT_FINGERPRINT_MAX_BYTES)})`;
+    if (total <= DEFAULT_FINGERPRINT_MAX_BYTES) return { name, status: 'ok', detail: summary };
+    const offenders = largestCorpusPaths(walk.files, FINGERPRINT_BUDGET_TOP_OFFENDERS)
+      .map(offender => `${offender.path} (${formatBytes(offender.bytes)})`);
+    return {
+      name,
+      status: 'fail',
+      detail: `${summary}: openlore analyze will stop with "fingerprint byte budget exceeded". `
+        + `Largest: ${offenders.join(', ')}`,
+      fix: 'Add the paths you do not want indexed to analysis.excludePatterns in .openlore/config.json',
+    };
+  } catch (err) {
+    return { name, status: 'warn', detail: `could not size the corpus: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * Graph-store lifecycle check (change: harden-index-store-lifecycle): a read never
+ * destroys the index, so a schema-version mismatch or a quarantined (corrupt) store
+ * persists until the next analyze. Surface it here with the recovery command instead of
+ * leaving the user to wonder why graph tools return not-ready. Read-only: opens on the
+ * non-destructive read path, which cannot mutate the store.
+ */
+async function checkGraphStore(rootPath: string): Promise<CheckResult> {
+  const analysisDir = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  if (!EdgeStore.exists(analysisDir)) {
+    return { name: 'Graph store', status: 'ok', detail: 'No graph index yet (build with openlore analyze)' };
+  }
+  const fixHint = "Run 'openlore analyze' to rebuild the graph index";
+  const remediation = { kind: 'analyze', label: 'openlore analyze --force' } as const;
+  let fault;
+  try {
+    const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
+    fault = store.notReady;
+    store.close();
+  } catch (err) {
+    return {
+      name: 'Graph store',
+      status: 'warn',
+      detail: `graph index could not be opened (${err instanceof Error ? err.message : String(err)})`,
+      fix: fixHint,
+      remediation,
+    };
+  }
+  if (fault) {
+    return {
+      name: 'Graph store',
+      status: 'warn',
+      detail:
+        fault.reason === 'quarantined'
+          ? `graph index was corrupt and quarantined${fault.quarantinePath ? ` to ${fault.quarantinePath}` : ''} — rebuild needed`
+          : `graph index built by a different OpenLore (on-disk schema v${fault.onDiskVersion}) — rebuild needed`,
+      fix: fixHint,
+      remediation,
+    };
+  }
+  return { name: 'Graph store', status: 'ok', detail: 'graph index opens cleanly at the current schema' };
+}
+
+/**
+ * Parse-health check (change: add-parse-health-boundary-disclosure): surface files that parsed with
+ * errors (grammar drift, syntax errors, lossy encoding) so a degraded index isn't mistaken for a
+ * genuinely small one. Absent artifact → clean (ok). A spike after a `tree-sitter-*` bump is the
+ * signal this check exists to catch.
+ *
+ * Exclusions are read from the SAME record `analyze` reports from (change:
+ * fix-analyze-native-abort-and-file-cost-budget), and via the same `describeExclusions` helper, so
+ * this check cannot bless a repository whose analysis excluded files — the contradiction the
+ * `EveryExcludedFileIsRecordedWithAReason` requirement exists to prevent.
+ */
+/** Exported for test: the exclusion-vs-degradation verdict must be pinned behaviorally. */
+export async function checkParseHealth(rootPath: string): Promise<CheckResult> {
+  const path = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR, ARTIFACT_PARSE_HEALTH);
+  try {
+    const report = JSON.parse(await readFile(path, 'utf-8')) as ParseHealthReport;
+    const excluded = describeExclusions(report);
+    const excludedCount = totalExcluded(report);
+    // A file the analyzer NEVER PARSED (size cap, budget) must not be counted as one that "parsed
+    // with errors" — it is a different cause with a different remedy, and the grammar-bump advice
+    // below would send the reader after the wrong subsystem entirely.
+    const degradedByParse = Math.max(0, (report.totalDegradedFiles ?? 0) - excludedCount);
+    // A repo analyzed under memory pressure shed the CFG/def-use overlay (and possibly LLM
+    // deep-analysis breadth) — its coverage is REDUCED even when no file parsed with errors and
+    // nothing was excluded. Disclose it so doctor cannot bless a false-clean degraded index.
+    const memoryReduction = describeMemoryDegradation(report.memoryDegradation);
+    const scriptContainers = describeScriptContainerBoundaries(report.scriptContainers);
+    if (degradedByParse === 0 && !excluded && !memoryReduction && !scriptContainers) {
+      return { name: 'Parse health', status: 'ok', detail: 'no files parsed with errors' };
+    }
+    const langs = (report.byLanguage ?? [])
+      .slice(0, 3)
+      .map(l => `${l.language} (${l.degradedFiles})`)
+      .join(', ');
+    const parts: string[] = [];
+    if (degradedByParse > 0) {
+      parts.push(`${degradedByParse} file(s) parsed with errors — symbols/edges there are a lower bound: ${langs}`);
+    }
+    if (excluded) parts.push(`${excluded} — those files were not analyzed at all`);
+    if (memoryReduction) parts.push(memoryReduction);
+    if (scriptContainers) parts.push(`script-container boundary: ${scriptContainers}`);
+    const fixes: string[] = [];
+    if (memoryReduction) {
+      fixes.push(
+        'give analyze a larger heap: --max-old-space-size or OPENLORE_HEAP_MB, or OPENLORE_FORCE_MEMORY_TIER=full if it fits; then re-run analyze',
+      );
+    }
+    if (degradedByParse > 0) {
+      // Only a genuine parse degradation points at a grammar; an exclusion points at cost or size.
+      fixes.push(
+        'Inspect via get_language_support; if this spiked after a grammar bump, revert or re-pin the tree-sitter-* dep',
+      );
+    } else if (excluded) {
+      fixes.push('Raise or disable the per-file bound with OPENLORE_PARSE_BUDGET_MS, or exclude the file from analysis');
+    }
+    if (scriptContainers) {
+      fixes.push('Treat template expressions and framework macros as unanalyzed when reviewing graph conclusions');
+    }
+    return {
+      name: 'Parse health',
+      status: 'warn',
+      detail: parts.join('; '),
+      fix: fixes.join('; '),
+    };
+  } catch {
+    // No artifact → nothing degraded (clean repos don't write it).
+    return { name: 'Parse health', status: 'ok', detail: 'no files parsed with errors' };
   }
 }
 
 async function checkOpenSpecDir(rootPath: string): Promise<CheckResult> {
-  const specsDir = join(rootPath, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
+  // Read the *configured* openspecPath rather than assuming the default — a
+  // project may point OpenLore at docs/specs/ or another root (Spec 26 B5).
+  let configuredRoot = OPENSPEC_DIR;
+  try {
+    const config = await readOpenLoreConfig(rootPath);
+    if (config?.openspecPath) configuredRoot = config.openspecPath;
+  } catch {
+    /* no config — fall back to the default */
+  }
+  const specsDir = join(rootPath, configuredRoot, OPENSPEC_SPECS_SUBDIR);
+  const rel = `${configuredRoot.replace(/^\.\//, '').replace(/\/$/, '')}/${OPENSPEC_SPECS_SUBDIR}/`;
   try {
     await access(specsDir);
-    return { name: 'OpenSpec directory', status: 'ok', detail: 'openspec/specs/ exists' };
+    return { name: 'OpenSpec directory', status: 'ok', detail: `${rel} exists` };
   } catch {
     return {
       name: 'OpenSpec directory',
       status: 'warn',
-      detail: 'openspec/specs/ not found',
-      fix: "Run 'spec-gen init' then 'spec-gen generate'",
+      detail: `${rel} not found`,
+      fix: "Run 'openlore init' then 'openlore generate'",
     };
   }
 }
 
-const CLI_PROVIDERS: Record<string, string> = {
-  'claude-code': 'claude',
-  'gemini-cli': 'gemini',
-  'cursor-agent': 'cursor',
-  'mistral-vibe': 'vibe',
+/**
+ * Claude Code loads MCP servers only from `.mcp.json` (project scope), never
+ * from `.claude/settings.json`. A stale `mcpServers.openlore` in settings.json
+ * (written by OpenLore <= 2.0.8) means the server silently never loads. Catch
+ * that wrong-file wiring and point at the one-line fix. Returns null when there
+ * is no Claude Code MCP wiring to check.
+ */
+async function checkMcpWiring(rootPath: string): Promise<CheckResult | null> {
+  const readJson = async (rel: string): Promise<Record<string, unknown> | null> => {
+    try {
+      const parsed = JSON.parse(await readFile(join(rootPath, rel), 'utf8'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const hasOpenlore = (doc: Record<string, unknown> | null): boolean =>
+    !!(doc?.mcpServers as Record<string, unknown> | undefined)?.openlore;
+
+  const inSettings = hasOpenlore(await readJson('.claude/settings.json'));
+  const inMcp = hasOpenlore(await readJson('.mcp.json'));
+
+  if (inSettings && !inMcp) {
+    return {
+      name: 'MCP wiring',
+      status: 'warn',
+      detail: 'openlore MCP server is in .claude/settings.json, which Claude Code never reads for MCP',
+      fix: "Run 'openlore install --agent claude-code --force' to move it to .mcp.json",
+      remediation: { kind: 'rewire-mcp', label: 'openlore install --agent claude-code --force' },
+    };
+  }
+  if (inSettings && inMcp) {
+    return {
+      name: 'MCP wiring',
+      status: 'warn',
+      detail: 'stale openlore entry still in .claude/settings.json (Claude Code reads .mcp.json)',
+      fix: "Run 'openlore install --agent claude-code --force' to remove the stale entry",
+      remediation: { kind: 'rewire-mcp', label: 'openlore install --agent claude-code --force' },
+    };
+  }
+  if (inMcp) {
+    // Since fix-windows-console-flash-from-npx-shim the entry names an ABSOLUTE launcher
+    // (this Node binary, this build's CLI) instead of `npx`, which resolved afresh every
+    // time. That removes a console window per agent turn on Windows and a resolution hop
+    // everywhere — at the cost of a path that a moved install, an uninstalled global, or a
+    // removed Node version can invalidate. Without this check the only symptom is a hook
+    // that fails silently on every turn.
+    const missing = await missingLauncherPaths(
+      (await readJson('.mcp.json'))?.mcpServers as Record<string, unknown> | undefined,
+    );
+    if (missing.length > 0) {
+      return {
+        name: 'MCP wiring',
+        status: 'warn',
+        detail: `.mcp.json points at a launcher that no longer exists: ${missing.join(', ')}`,
+        fix: "Run 'openlore install --agent claude-code --force' to re-wire it to this install",
+        remediation: { kind: 'rewire-mcp', label: 'openlore install --agent claude-code --force' },
+      };
+    }
+    return { name: 'MCP wiring', status: 'ok', detail: '.mcp.json registers the openlore MCP server' };
+  }
+  return null;
+}
+
+/**
+ * Absolute paths in the wired MCP entry that are no longer on disk.
+ *
+ * Only ABSOLUTE paths are checked: a bare command (`npx`, `node`) is resolved through
+ * PATH by the host, so its absence here would say nothing. Empty means nothing to report,
+ * which is also the answer for a malformed entry — doctor reports what it observed, and
+ * this check cannot see anything wrong with a shape it does not recognise.
+ */
+async function missingLauncherPaths(servers: Record<string, unknown> | undefined): Promise<string[]> {
+  const entry = servers?.openlore as { command?: unknown; args?: unknown } | undefined;
+  if (!entry) return [];
+  const candidates = [entry.command, Array.isArray(entry.args) ? entry.args[0] : undefined]
+    .filter((v): v is string => typeof v === 'string' && (isAbsolute(v) || win32.isAbsolute(v)));
+  const missing: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, fsConstants.F_OK);
+    } catch {
+      missing.push(candidate);
+    }
+  }
+  return missing;
+}
+
+const CLI_PROVIDERS: Record<string, () => string> = {
+  'claude-code': () => 'claude',
+  'codex-cli': () => process.env.CODEX_CLI ?? 'codex',
+  'gemini-cli': () => process.env.GEMINI_CLI ?? 'gemini',
+  'antigravity-cli': () => process.env.ANTIGRAVITY_CLI ?? 'agy',
+  'cursor-agent': () => process.env.CURSOR_AGENT_CLI ?? 'cursor-agent',
+  'mistral-vibe': () => process.env.MISTRAL_VIBE_CLI ?? 'vibe',
 };
 
 const DOCTOR_TIMEOUT_MS = 10_000;
 
 async function checkLLMConnection(rootPath: string): Promise<CheckResult> {
   let config;
-  try { config = await readSpecGenConfig(rootPath); } catch { /* no config */ }
+  try { config = await readOpenLoreConfig(rootPath); } catch { /* no config */ }
 
   const gen = config?.generation;
 
@@ -189,35 +796,41 @@ async function checkLLMConnection(rootPath: string): Promise<CheckResult> {
     copilot: DEFAULT_COPILOT_MODEL,
     openai: DEFAULT_OPENAI_MODEL,
     'claude-code': 'claude-code',
+    'codex-cli': 'codex-cli',
     'mistral-vibe': 'mistral-vibe',
     'gemini-cli': 'gemini-cli',
+    'antigravity-cli': 'antigravity-cli',
     'cursor-agent': 'cursor-agent',
   };
   const model = gen?.model ?? defaultModels[provider] ?? provider;
 
   // CLI-based providers: just check binary availability
   if (provider in CLI_PROVIDERS) {
-    const bin = CLI_PROVIDERS[provider];
+    const bin = CLI_PROVIDERS[provider]();
     try {
       await execFileAsync(bin, ['--version']);
       return { name: 'LLM connection', status: 'ok', detail: `${provider} · ${bin} CLI detected` };
     } catch {
       return {
         name: 'LLM connection',
-        status: 'fail',
+        status: 'warn',
         detail: `${provider} · '${bin}' not found on PATH`,
-        fix: `Install the ${bin} CLI and ensure it is on your PATH`,
+        fix: `Optional — only 'openlore generate' needs an LLM. Install the ${bin} CLI to enable it`,
       };
     }
   }
 
-  // Apply SSL setting before creating provider
-  const sslVerify = config?.llm?.sslVerify ?? true;
-  if (!sslVerify || gen?.skipSslVerify) {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  }
+  // A repo-supplied TLS opt-out is refused here as it is on every other LLM path:
+  // `doctor` runs against a clone just like `generate` does.
+  const sslVerify = resolveTrustedSslVerify(undefined, config?.llm?.sslVerify);
+  rejectRepoConfiguredTlsOptOut('generation.skipSslVerify', gen?.skipSslVerify);
 
-  const baseUrl = gen?.openaiCompatBaseUrl ?? process.env.OPENAI_COMPAT_BASE_URL;
+  const baseUrl = provider === 'openai-compat'
+    ? resolveTrustedCompatBase(
+        process.env.OPENAI_COMPAT_BASE_URL,
+        gen?.openaiCompatBaseUrl,
+      )
+    : undefined;
 
   let llm;
   try {
@@ -232,9 +845,9 @@ async function checkLLMConnection(rootPath: string): Promise<CheckResult> {
   } catch (err) {
     return {
       name: 'LLM connection',
-      status: 'fail',
+      status: 'warn',
       detail: `${provider} · ${(err as Error).message}`,
-      fix: 'Check that the required API key environment variable is set',
+      fix: 'Optional — set the provider API key only if you use \'openlore generate\'',
     };
   }
 
@@ -252,50 +865,156 @@ async function checkLLMConnection(rootPath: string): Promise<CheckResult> {
     const msg = (err as Error).message ?? String(err);
     return {
       name: 'LLM connection',
-      status: 'fail',
+      status: 'warn',
       detail: `${provider} · ${msg} (${ms}ms)`,
-      fix: 'Check your API key, base URL, and network connectivity',
+      fix: 'Optional — needed only for \'openlore generate\'. Check API key, base URL, and connectivity',
     };
   }
 }
 
+/**
+ * What retrieval this repository actually SERVES — read off the index, not off the
+ * configuration and not off the endpoint.
+ *
+ * `Embedding connection` answers a different question ("can I reach the endpoint"), and
+ * on 2026-09-20 it answered it correctly — `✓ … 384 dims · 1952ms` — while every query
+ * in this repository and in a second one had been served from a vectorless index for
+ * days. Two questions, two lines, two verdicts (spec `cli`
+ * DoctorReportsTheRetrievalModeActuallyServed).
+ */
+export async function checkRetrievalMode(rootPath: string): Promise<CheckResult> {
+  let config: OpenLoreConfig | null = null;
+  // An unreadable config is NOT "no provider configured": saying so would repeat the
+  // exact silence this check exists to remove. The config check owns that verdict; this
+  // one states that it could not tell, and stops.
+  let configUnreadable = false;
+  try { config = await readOpenLoreConfig(rootPath); } catch { configUnreadable = true; }
+  const analysisDir = join(rootPath, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+
+  if (configUnreadable) {
+    return {
+      name: 'Retrieval mode',
+      status: 'warn',
+      detail: 'the configuration could not be read, so the configured provider is unknown — see the configuration check',
+      fix: 'Fix .openlore/config.json (the configuration check names the problem), then re-run doctor',
+    };
+  }
+
+  const configured = semanticProviderConfigured(config);
+  const agreement = indexCapabilityAgreement(config, analysisDir);
+  const receipt = await readIndexReceipt(analysisDir);
+  const failure = receipt?.embedFailure;
+  const failureDetail = failure
+    ? ` Last embedding failure: ${failure.reason}${failure.endpoint ? ` (${failure.endpoint})` : ''} at ${failure.at}.`
+    : '';
+
+  if (!VectorIndex.exists(analysisDir)) {
+    return {
+      name: 'Retrieval mode',
+      status: 'warn',
+      detail: `no search index in ${OPENLORE_DIR}/${OPENLORE_ANALYSIS_SUBDIR}${failureDetail}`,
+      fix: 'Run "openlore analyze" to build one',
+    };
+  }
+
+  // The same resolver every query uses, so doctor cannot report a mode no search serves.
+  let embedder: Embedder | null = null;
+  // A resolver failure is not this check's verdict to render — the endpoint check owns
+  // that — so it simply leaves the keyword default in place.
+  try { embedder = await resolveEmbedder(config); } catch { /* keyword default */ }
+  const mode = servedRetrievalMode(embedder, analysisDir);
+
+  if (!agreement.agrees && agreement.mismatch === 'configured-but-unrealized') {
+    return {
+      name: 'Retrieval mode',
+      status: 'warn',
+      detail: `serving ${mode} — a semantic embedding provider is configured but this index carries no vectors.${failureDetail}`,
+      fix: 'Run "openlore analyze --force" to rebuild the index with the configured provider',
+    };
+  }
+
+  // A keyword index with nothing configured is the supported default, never a finding.
+  return {
+    name: 'Retrieval mode',
+    status: failure ? 'warn' : 'ok',
+    detail: configured
+      ? `serving ${mode}${failureDetail}`
+      : `serving ${mode} — no embedding provider configured (the first-class default)${failureDetail}`,
+    ...(failure ? { fix: 'Re-run "openlore analyze" once the embedding provider is reachable' } : {}),
+  };
+}
+
 async function checkEmbeddingConnection(rootPath: string): Promise<CheckResult | null> {
   let config;
-  try { config = await readSpecGenConfig(rootPath); } catch { /* no config */ }
+  try { config = await readOpenLoreConfig(rootPath); } catch { /* no config */ }
 
   const emb = config?.embedding;
 
-  // Resolve base URL from config or env
-  const baseUrl = emb?.baseUrl ?? process.env.EMBED_BASE_URL;
-  if (!baseUrl) return null; // Embedding not configured — skip
-
-  if (emb?.skipSslVerify) {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  // Local provider: nothing to connect to. Confirm it's recognised (so a local
+  // setup doesn't look like "no embeddings") rather than silently skipping.
+  if (emb?.provider === 'local') {
+    return {
+      name: 'Embedding connection',
+      status: 'ok',
+      detail: `local on-device embedder · ${emb.model ?? 'default model'} · no endpoint/key (model cached under ~/.openlore/models)`,
+    };
   }
 
-  const apiKey = emb?.apiKey ?? process.env.EMBED_API_KEY ?? 'none';
-  const model = emb?.model ?? process.env.EMBED_MODEL ?? 'text-embedding-ada-002';
+  // Environment configuration is operator-authorized. A repository-selected remote
+  // endpoint is refused here just as it is in the normal embedding path: `doctor`
+  // must not become a credential-exfiltration side channel.
+  const envBaseUrl = process.env.EMBED_BASE_URL;
+  const baseUrl = envBaseUrl ?? refuseRepoConfiguredEndpoint(
+    'embedding.baseUrl',
+    emb?.baseUrl,
+    'The doctor embedding check is skipped; search/orient still use BM25.',
+  );
+  if (!baseUrl) return null; // Embedding not configured — keyword default; skip
+
+  // Refused, not honoured: this value comes from the analyzed repo's config.
+  rejectRepoConfiguredTlsOptOut('embedding.skipSslVerify', emb?.skipSslVerify);
+
+  // Mirror `EmbeddingService.fromEnv` exactly. When EMBED_BASE_URL is set the real
+  // embedding path is env-ONLY (fromEnv wins in `resolveEmbedder` and never consults
+  // the config), so preferring config values here would test a different model or key
+  // than the one actually used — a doctor that reports on a setup nobody runs.
+  const envConfigured = envBaseUrl != null;
+  const apiKey =
+    (envConfigured ? process.env.EMBED_API_KEY : emb?.apiKey ?? process.env.EMBED_API_KEY) ?? 'none';
+  const model =
+    (envConfigured ? process.env.EMBED_MODEL : emb?.model ?? process.env.EMBED_MODEL) ??
+    'text-embedding-ada-002';
+  // The operator's env opt-out is honoured (the repo's, refused above, is not). Without
+  // this the check reported a certificate failure against a self-signed endpoint that
+  // `openlore analyze` talks to perfectly well.
+  const relaxTls = embeddingTlsRelaxed();
   const url = baseUrl.replace(/\/$/, '');
 
   const t0 = Date.now();
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DOCTOR_TIMEOUT_MS);
-    const response = await fetch(`${url}/embeddings`, {
+    // INTENTIONAL EGRESS: doctor sends a constant probe to the operator-selected endpoint or repo-selected loopback.
+    // codeql[js/file-access-to-http]
+    const response = await withRelaxedTls(() => fetch(`${url}/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ model, input: 'ping' }),
       signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+      // Never follow a redirect: `Authorization` is dropped on a cross-origin hop but the
+      // probe would still be replayed, and a repo-selected loopback endpoint could use one
+      // to point the check (and any non-standard header) at an internal host. Refuse instead.
+      redirect: 'error',
+    }), relaxTls).finally(() => clearTimeout(timeout));
 
     const ms = Date.now() - t0;
     if (!response.ok) {
       const body = (await response.text().catch(() => '')).trim() || '(empty)';
       return {
         name: 'Embedding connection',
-        status: 'fail',
+        status: 'warn',
         detail: `HTTP ${response.status}: ${body} (${ms}ms)`,
-        fix: 'Check your embedding server URL, API key, and that the server is running',
+        fix: 'Optional — search/orient fall back to BM25 without embeddings. Check the server URL, API key, and that it is running',
       };
     }
     const data = await response.json() as { data?: Array<{ embedding: number[] }> };
@@ -310,9 +1029,9 @@ async function checkEmbeddingConnection(rootPath: string): Promise<CheckResult |
     const msg = (err as Error).message ?? String(err);
     return {
       name: 'Embedding connection',
-      status: 'fail',
+      status: 'warn',
       detail: `${url} · ${msg} (${ms}ms)`,
-      fix: 'Check your embedding server is running (npm run embed:up) and the URL is correct',
+      fix: 'Optional — search/orient fall back to BM25. Start the embedding server (npm run embed:up) and check the URL',
     };
   }
 }
@@ -357,19 +1076,21 @@ async function checkDiskSpace(rootPath: string): Promise<CheckResult> {
 // ============================================================================
 
 function printResult(r: CheckResult, useColor: boolean): void {
-  const icons: Record<CheckStatus, string> = { ok: '✓', warn: '⚠', fail: '✗' };
-  const colors: Record<CheckStatus, string> = {
-    ok: useColor ? '\x1b[32m' : '',
-    warn: useColor ? '\x1b[33m' : '',
-    fail: useColor ? '\x1b[31m' : '',
+  const c = palette(useColor);
+  const paint: Record<CheckStatus, (s: string) => string> = {
+    ok: (s) => c.green(s),
+    warn: (s) => c.yellow(s),
+    fail: (s) => c.red(s),
   };
-  const reset = useColor ? '\x1b[0m' : '';
-  const dim = useColor ? '\x1b[2m' : '';
+  const glyph: Record<CheckStatus, string> = { ok: '✓', warn: '⚠', fail: '✗' };
 
-  const icon = `${colors[r.status]}${icons[r.status]}${reset}`;
-  console.log(`  ${icon}  ${r.name.padEnd(22)} ${dim}${r.detail}${reset}`);
+  const icon = paint[r.status](glyph[r.status]);
+  console.log(`  ${icon}  ${safe(r.name).padEnd(22)} ${c.dim(safe(r.detail))}`);
+  for (const finding of r.findings ?? []) {
+    console.log(`       ${' '.repeat(22)} ${c.yellow(`→ ${safe(finding.subject)}: ${safe(finding.message)}`)}`);
+  }
   if (r.fix) {
-    console.log(`       ${' '.repeat(22)} ${colors.warn}→ ${r.fix}${reset}`);
+    console.log(`       ${' '.repeat(22)} ${c.yellow(`→ ${safe(r.fix)}`)}`);
   }
 }
 
@@ -383,51 +1104,78 @@ export const doctorCommand = new Command('doctor')
     'after',
     `
 Examples:
-  $ spec-gen doctor           Run all checks
-  $ spec-gen doctor --json    Output results as JSON
+  $ openlore doctor            Run all checks (read-only)
+  $ openlore doctor --json     Output results as JSON
+  $ openlore doctor --fix      Apply the printed remediations (confirms each in a TTY)
+  $ openlore doctor --fix --yes  Apply every remediation non-interactively
 
 Checks performed:
-  • Node.js version (>=${MIN_NODE_MAJOR_VERSION} required)
+  • Node.js version (>=${MIN_NODE_MAJOR_VERSION}.${MIN_NODE_MINOR_VERSION} required for node:sqlite)
   • Git repository detection
-  • spec-gen configuration (${SPEC_GEN_CONFIG_REL_PATH})
+  • openlore configuration (${OPENLORE_CONFIG_REL_PATH})
+  • Config schema (unknown keys, type mismatches, version skew)
   • Analysis artifacts freshness
+  • Graph store lifecycle (schema mismatch / quarantined index)
   • OpenSpec directory presence
+  • Governance corpus reference integrity
+  • Injection-shaped unreviewed content (lexical advisory; never a guarantee)
+  • MCP wiring (Claude Code reads .mcp.json, not .claude/settings.json)
   • LLM connection (live request with 10s timeout)
   • Embedding connection (if configured)
   • Available disk space
+  • Analysis corpus size (would analyze exceed its byte budget?)
 `
   )
   .option('--json', 'Output results as JSON', false)
-  .action(async (options: { json: boolean }) => {
+  .option('--fix', 'Apply the remediations the checks printed (re-analyze, re-wire); TTY confirms each unless --yes', false)
+  .option('--yes', 'With --fix, run every remediation non-interactively (no confirmation prompt)', false)
+  .action(async (options: { json: boolean; fix: boolean; yes: boolean }) => {
     const rootPath = process.cwd();
     const useColor = process.stdout.isTTY && !options.json;
 
     if (!options.json) {
-      logger.section('spec-gen doctor');
+      logger.section('openlore doctor');
       console.log('');
     }
 
-    const [staticChecks, llmCheck, embeddingCheck] = await Promise.all([
+    const [staticChecks, mcpCheck, llmCheck, embeddingCheck, retrievalModeCheck] = await Promise.all([
       Promise.all([
         checkNodeVersion(),
         checkGit(rootPath),
+        checkHookReachability(rootPath),
         checkConfig(rootPath),
+        checkConfigSchema(rootPath),
         checkAnalysis(rootPath),
+        checkGraphStore(rootPath),
+        checkParseHealth(rootPath),
         checkOpenSpecDir(rootPath),
+        checkCorpusIntegrity(rootPath),
+        checkServedContentTrust(rootPath),
         checkDiskSpace(rootPath),
+        checkAnalysisCorpus(rootPath),
       ]),
+      checkMcpWiring(rootPath),
       checkLLMConnection(rootPath),
       checkEmbeddingConnection(rootPath),
+      checkRetrievalMode(rootPath),
     ]);
 
-    const checks = [
+    const unredactedChecks = [
       ...staticChecks,
+      ...(mcpCheck ? [mcpCheck] : []),
       llmCheck,
       ...(embeddingCheck ? [embeddingCheck] : []),
+      retrievalModeCheck,
     ];
+    // One shared output boundary covers human and JSON rendering. Provider error
+    // bodies are attacker-controlled and may reflect the exact credential they
+    // received, including test/local keys that have no recognizable token shape.
+    const checks = redactDoctorResults(unredactedChecks, await knownDoctorCredentials(rootPath));
 
     if (options.json) {
-      console.log(JSON.stringify(checks, null, 2));
+      // Strip the internal `remediation` field so the --json contract is
+      // byte-compatible with pre-`--fix` output (bare doctor stays read-only).
+      console.log(JSON.stringify(checks.map(({ remediation: _r, ...c }) => c), null, 2));
       return;
     }
 
@@ -441,12 +1189,120 @@ Checks performed:
     const warnings = checks.filter(c => c.status === 'warn');
 
     if (failures.length > 0) {
-      logger.error(`${failures.length} check(s) failed — fix the issues above before proceeding`);
+      const warnSuffix = warnings.length > 0 ? `, ${warnings.length} warning(s)` : '';
+      logger.error(`${failures.length} check(s) failed${warnSuffix} — fix the failures above before proceeding`);
       process.exitCode = 1;
     } else if (warnings.length > 0) {
-      logger.warning(`${warnings.length} warning(s) — some features may not work correctly`);
+      // Summarize the checks that actually warned, not a hardcoded assumption
+      // (a staleness warning must not read as "LLM/embeddings may be limited").
+      const warned = warnings.map(w => w.name).join(', ');
+      logger.warning(`${warnings.length} warning(s): ${warned} — see the details above`);
     } else {
       logger.success('All checks passed!');
     }
     console.log('');
+
+    // --fix: execute exactly the remediations the read-only checks surfaced above,
+    // nothing a check did not print (change: make-index-self-healing). Bare doctor
+    // never reaches here, so its output is unchanged.
+    if (options.fix) {
+      await applyRemediations(rootPath, checks, options.yes);
+    }
   });
+
+/** Ask one yes/no question on a TTY. Resolves false when no TTY is attached. */
+async function confirmTty(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(`${question} [y/N] `)).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/** Run the single in-process action a remediation maps to. Returns a status line. */
+async function runRemediation(rootPath: string, r: Remediation): Promise<string> {
+  switch (r.kind) {
+    case 'analyze': {
+      const { openloreAnalyze } = await import('../../api/analyze.js');
+      // `reExtract` too, so this runs exactly the `analyze --force` it printed. This is the
+      // operator's repair path: if the graph is wrong BECAUSE the extraction cache is wrong,
+      // a run that reuses that cache cannot fix it (change: optimize-hash-keyed-analyze).
+      await openloreAnalyze({ rootPath, force: true, reExtract: true });
+      return 'analysis rebuilt';
+    }
+    case 'rewire-mcp': {
+      const { runInstall } = await import('../install/index.js');
+      // Re-wire only — do NOT also re-analyze here (that is the 'analyze'
+      // remediation's job, run separately if its own check surfaced it).
+      await runInstall({ agent: 'claude-code', force: true, analyze: false, cwd: rootPath });
+      return 'MCP wiring corrected (.mcp.json)';
+    }
+  }
+}
+
+/**
+ * The deduped set of remediations `--fix` will run: only non-ok checks that
+ * surfaced a machine-readable remediation, each action at most once (two checks
+ * may both print "re-analyze"). Pure and exported so the "fixes exactly what it
+ * printed, nothing else" contract is unit-testable without executing anything.
+ */
+export function planRemediations(
+  checks: CheckResult[],
+): Array<{ check: CheckResult; remediation: Remediation }> {
+  const seen = new Set<string>();
+  const queue: Array<{ check: CheckResult; remediation: Remediation }> = [];
+  for (const c of checks) {
+    if (c.status === 'ok' || !c.remediation) continue;
+    if (seen.has(c.remediation.label)) continue;
+    seen.add(c.remediation.label);
+    queue.push({ check: c, remediation: c.remediation });
+  }
+  return queue;
+}
+
+/**
+ * Execute the remediations attached to non-ok checks, one confirmation per mutating
+ * action in a TTY (or all of them with --yes). Deduplicates repeated actions (two
+ * checks may both print "re-analyze") so each runs at most once. Re-run bare doctor
+ * afterward to confirm.
+ */
+async function applyRemediations(rootPath: string, checks: CheckResult[], yes: boolean): Promise<void> {
+  const queue = planRemediations(checks);
+  if (queue.length === 0) {
+    logger.info('doctor --fix', 'Nothing to fix — no check surfaced an automatic remediation.');
+    return;
+  }
+
+  logger.section('openlore doctor --fix');
+  let applied = 0;
+  let skipped = 0;
+  for (const { check, remediation } of queue) {
+    const proceed = yes
+      ? true
+      : await confirmTty(`Fix "${check.name}" — run \`${remediation.label}\`?`);
+    if (!proceed) {
+      skipped++;
+      if (!process.stdin.isTTY && !yes) {
+        logger.warning(`Skipped "${check.name}" — re-run with --yes to apply non-interactively.`);
+      } else {
+        logger.info('Skipped', check.name);
+      }
+      continue;
+    }
+    try {
+      logger.discovery(`Applying: ${remediation.label}`);
+      const outcome = await runRemediation(rootPath, remediation);
+      logger.success(`Fixed "${check.name}" — ${outcome}.`);
+      applied++;
+    } catch (err) {
+      logger.error(`Could not fix "${check.name}": ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  }
+  console.log('');
+  logger.info('doctor --fix', `${applied} applied, ${skipped} skipped. Re-run 'openlore doctor' to confirm.`);
+}

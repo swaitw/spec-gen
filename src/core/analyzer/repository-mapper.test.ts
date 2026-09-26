@@ -7,12 +7,14 @@ import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { RepositoryMapper, mapRepository } from './repository-mapper.js';
+import { renderBlock } from '../../cli/install/block.js';
+import { mergeEntries } from '../../cli/install/json-managed.js';
 
 describe('RepositoryMapper', () => {
   let testDir: string;
 
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
 
@@ -21,6 +23,39 @@ describe('RepositoryMapper', () => {
   });
 
   describe('basic mapping', () => {
+    it('keeps installer-owned artifacts out of repository characterization', async () => {
+      await mkdir(join(testDir, 'src'));
+      await mkdir(join(testDir, 'scripts'));
+      await writeFile(join(testDir, 'src', 'index.ts'), 'export function main() {}');
+      await writeFile(join(testDir, 'src', 'payments.ts'), 'export function charge() {}');
+      await writeFile(join(testDir, 'scripts', 'report.py'), 'def report():\n    return 1\n');
+      await writeFile(join(testDir, 'AGENTS.md'), renderBlock('OpenLore instructions'));
+      await writeFile(join(testDir, '.clinerules'), renderBlock('OpenLore instructions'));
+      await writeFile(join(testDir, '.mcp.json'), JSON.stringify(mergeEntries({}, [{
+        path: 'mcpServers.openlore', value: { command: 'openlore' },
+      }]).next));
+
+      const map = await new RepositoryMapper(testDir).map();
+
+      expect(map.summary.languages.map(language => language.language)).toContain('Python');
+      expect(map.highValueFiles.map(file => file.path)).not.toContain('AGENTS.md');
+      expect(map.highValueFiles.map(file => file.path)).not.toContain('.mcp.json');
+      expect(map.allFiles.find(file => file.path === 'AGENTS.md')?.tooling).toBe(true);
+      expect(map.allFiles.find(file => file.path === '.mcp.json')?.tooling).toBe(true);
+      expect(map.allFiles.find(file => file.path === '.clinerules')?.tooling).toBe(true);
+      expect(Object.values(map.clusters.byDomain).flat().map(file => file.path)).not.toContain('AGENTS.md');
+    });
+
+    it('characterizes a user AGENTS.md that also contains an OpenLore block', async () => {
+      await writeFile(join(testDir, 'AGENTS.md'), `# User instructions\n\n${renderBlock('OpenLore instructions')}`);
+      await writeFile(join(testDir, 'index.ts'), 'export function main() {}');
+
+      const map = await new RepositoryMapper(testDir).map();
+
+      expect(map.allFiles.find(file => file.path === 'AGENTS.md')?.tooling).not.toBe(true);
+      expect(map.summary.languages.map(language => language.language)).toContain('Markdown');
+    });
+
     it('should map a simple project structure', async () => {
       // Create a simple Node.js project
       await writeFile(
@@ -297,13 +332,33 @@ describe('RepositoryMapper', () => {
       expect(map.clusters.byDomain['users']).toBeDefined();
       expect(map.clusters.byDomain['orders']).toBeDefined();
     });
+
+    it('infers leaf Java packages as domains, not the reverse-DNS org root (#138)', async () => {
+      const pkg = join(testDir, 'src', 'main', 'java', 'com', 'example');
+      await mkdir(join(pkg, 'inventory'), { recursive: true });
+      await mkdir(join(pkg, 'billing'), { recursive: true });
+
+      await writeFile(join(pkg, 'inventory', 'Item.java'), 'class Item {}');
+      await writeFile(join(pkg, 'inventory', 'Warehouse.java'), 'class Warehouse {}');
+      await writeFile(join(pkg, 'billing', 'Invoice.java'), 'class Invoice {}');
+      await writeFile(join(pkg, 'billing', 'Ledger.java'), 'class Ledger {}');
+
+      const mapper = new RepositoryMapper(testDir);
+      const map = await mapper.map();
+
+      expect(map.clusters.byDomain['inventory']).toBeDefined();
+      expect(map.clusters.byDomain['billing']).toBeDefined();
+      // The bug: every file collapsed into the org root instead of leaf packages.
+      expect(map.clusters.byDomain['example']).toBeUndefined();
+      expect(map.clusters.byDomain['com']).toBeUndefined();
+    });
   });
 
   describe('output generation', () => {
     it('should write repository-map.json', async () => {
       await writeFile(join(testDir, 'app.ts'), 'export const x = 1;');
 
-      const outputDir = join(testDir, '.spec-gen', 'analysis');
+      const outputDir = join(testDir, '.openlore', 'analysis');
       const mapper = new RepositoryMapper(testDir, { outputDir });
       const map = await mapper.map();
       await mapper.writeOutput(map);
@@ -320,7 +375,7 @@ describe('RepositoryMapper', () => {
     it('should write SUMMARY.md', async () => {
       await writeFile(join(testDir, 'app.ts'), 'export const x = 1;');
 
-      const outputDir = join(testDir, '.spec-gen', 'analysis');
+      const outputDir = join(testDir, '.openlore', 'analysis');
       const mapper = new RepositoryMapper(testDir, { outputDir });
       const map = await mapper.map();
       await mapper.writeOutput(map);
@@ -343,7 +398,7 @@ describe('RepositoryMapper', () => {
       await writeFile(join(testDir, 'app.ts'), 'export const x = 1;');
 
       const map = await mapRepository(testDir, {
-        outputDir: join(testDir, '.spec-gen', 'analysis'),
+        outputDir: join(testDir, '.openlore', 'analysis'),
       });
 
       expect(map.metadata.projectName).toBe('convenience-test');
@@ -427,6 +482,39 @@ describe('RepositoryMapper', () => {
       expect(map.clusters.byLayer.business.length).toBeGreaterThan(0);
       expect(map.clusters.byLayer.data.length).toBeGreaterThan(0);
       expect(map.clusters.byLayer.infrastructure.length).toBeGreaterThan(0);
+    });
+  });
+
+  // A truncated walk analyzed only a prefix of the repository. The map must carry that receipt so
+  // `analyze` can disclose the partial corpus instead of reporting a smaller count as if it were
+  // the whole repo (change: harden-walker-corpus-boundary).
+  describe('partial-corpus disclosure', () => {
+    it('propagates the truncation receipt when maxFiles is hit and renders it in the summary', async () => {
+      for (let i = 0; i < 6; i++) {
+        await writeFile(join(testDir, `mod${i}.ts`), `export const v${i} = ${i};`);
+      }
+
+      const outputDir = join(testDir, '.out');
+      const mapper = new RepositoryMapper(testDir, { maxFiles: 2, outputDir });
+      const map = await mapper.map();
+
+      expect(map.summary.truncated).toBeDefined();
+      expect(map.summary.truncated?.limit).toBe(2);
+
+      await mapper.writeOutput(map);
+      const summary = await import('node:fs/promises').then((fs) =>
+        fs.readFile(join(outputDir, 'SUMMARY.md'), 'utf-8'),
+      );
+      expect(summary).toContain('Partial corpus');
+    });
+
+    it('leaves no truncation receipt when the walk completes within the cap', async () => {
+      await writeFile(join(testDir, 'a.ts'), 'export const a = 1;');
+      await writeFile(join(testDir, 'b.ts'), 'export const b = 2;');
+
+      const map = await new RepositoryMapper(testDir, { maxFiles: 100 }).map();
+
+      expect(map.summary.truncated).toBeUndefined();
     });
   });
 });

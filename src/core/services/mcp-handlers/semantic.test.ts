@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { classifyRole, deriveStrategy, buildReason, compositeScore } from './semantic.js';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, utimes } from 'node:fs/promises';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EdgeStore } from '../edge-store.js';
+// Real function (the ./utils.js mock below is partial — `...actual`). Closes cached
+// EdgeStore handles in afterEach so Windows can rm the temp dir holding call-graph.db.
+import { _resetContextCacheForTesting } from './utils.js';
+import { TextLineIndex } from '../../analyzer/text-line-index.js';
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -22,17 +26,32 @@ function makeRecord(overrides: Partial<{
   };
 }
 
+const TEST_MATCH_EVIDENCE = { field: 'symbol' as const, terms: ['do'], tier: 1 as const };
+
 async function writeAnalysisFile(dir: string, filename: string, content: object) {
-  const analysisDir = join(dir, '.spec-gen', 'analysis');
+  const analysisDir = join(dir, '.openlore', 'analysis');
   await mkdir(analysisDir, { recursive: true });
   await writeFile(join(analysisDir, filename), JSON.stringify(content), 'utf-8');
+}
+
+async function writeOpenLoreConfig(dir: string, openspecPath: string) {
+  await mkdir(join(dir, '.openlore'), { recursive: true });
+  await writeFile(join(dir, '.openlore', 'config.json'), JSON.stringify({
+    version: '1.0.0',
+    projectType: 'nodejs',
+    openspecPath,
+    analysis: { maxFiles: 100, includePatterns: [], excludePatterns: [] },
+    generation: { domains: 'auto' },
+    createdAt: '2026-08-30T00:00:00.000Z',
+    lastRun: null,
+  }), 'utf-8');
 }
 
 // ============================================================================
 // MOCK validateDirectory
 // ============================================================================
 
-// We mock validateDirectory so tests don't need a real .spec-gen/config.json.
+// We mock validateDirectory so tests don't need a real .openlore/config.json.
 // loadMappingIndex is kept as the real implementation (it gracefully returns null if file absent).
 vi.mock('./utils.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./utils.js')>();
@@ -142,7 +161,7 @@ describe('handleListSpecDomains', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-semantic-test-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-semantic-test-'));
   });
 
   it('returns empty domains when openspec/specs/ does not exist', async () => {
@@ -177,6 +196,32 @@ describe('handleListSpecDomains', () => {
     const result = await handleListSpecDomains(tmpDir) as { domains: string[]; count: number };
     expect(result.count).toBe(result.domains.length);
   });
+
+  it('reads domains from the configured in-project spec root', async () => {
+    await writeOpenLoreConfig(tmpDir, 'contracts');
+    const specsDir = join(tmpDir, 'contracts', 'specs', 'billing');
+    await mkdir(specsDir, { recursive: true });
+    await writeFile(join(specsDir, 'spec.md'), '# Billing', 'utf-8');
+
+    const { handleListSpecDomains } = await import('./semantic.js');
+    const result = await handleListSpecDomains(tmpDir) as { domains: string[]; count: number };
+    expect(result).toMatchObject({ domains: ['billing'], count: 1 });
+  });
+
+  it('confines a configured spec root that escapes the project', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'openlore-semantic-outside-'));
+    try {
+      await mkdir(join(outside, 'specs', 'secret'), { recursive: true });
+      await writeFile(join(outside, 'specs', 'secret', 'spec.md'), '# Secret', 'utf-8');
+      await writeOpenLoreConfig(tmpDir, outside);
+
+      const { handleListSpecDomains } = await import('./semantic.js');
+      const result = await handleListSpecDomains(tmpDir) as { domains: string[] };
+      expect(result.domains).not.toContain('secret');
+    } finally {
+      await rm(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
 });
 
 // ============================================================================
@@ -187,7 +232,7 @@ describe('handleSearchSpecs', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-search-specs-test-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-search-specs-test-'));
   });
 
   it('returns an error object when no spec index exists', async () => {
@@ -201,9 +246,9 @@ describe('handleSearchSpecs', () => {
     }));
 
     const { handleSearchSpecs } = await import('./semantic.js');
-    const result = await handleSearchSpecs(tmpDir, 'email validation') as { error: string };
+    const result = await handleSearchSpecs(tmpDir, 'email validation') as { error: string; hint: string };
     expect(result.error).toContain('No spec index found');
-    expect(result.error).toContain('--reindex-specs');
+    expect(result.hint).toContain('keyword');
   });
 });
 
@@ -215,7 +260,7 @@ describe('handleGetSpec', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-get-spec-test-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-get-spec-test-'));
   });
 
   it('returns error when domain spec file does not exist', async () => {
@@ -231,10 +276,45 @@ describe('handleGetSpec', () => {
     await writeFile(join(specsDir, 'spec.md'), '# Auth Spec\n\nThis is the auth domain.', 'utf-8');
 
     const { handleGetSpec } = await import('./semantic.js');
-    const result = await handleGetSpec(tmpDir, 'auth') as { domain: string; content: string; specFile: string };
+    const result = await handleGetSpec(tmpDir, 'auth') as { domain: string; content: string; specFile: string; provenance: string };
     expect(result.domain).toBe('auth');
     expect(result.content).toContain('Auth Spec');
     expect(result.specFile).toBe('openspec/specs/auth/spec.md');
+    expect(result.provenance).toBe('local-unreviewed');
+  });
+
+  it('returns spec content from the configured in-project spec root', async () => {
+    await writeOpenLoreConfig(tmpDir, './contracts/');
+    const specsDir = join(tmpDir, 'contracts', 'specs', 'auth');
+    await mkdir(specsDir, { recursive: true });
+    await writeFile(join(specsDir, 'spec.md'), '# Relocated Auth', 'utf-8');
+
+    const { handleGetSpec } = await import('./semantic.js');
+    const result = await handleGetSpec(tmpDir, 'auth') as {
+      content: string; specFile: string; provenance: string;
+    };
+    expect(result.content).toContain('Relocated Auth');
+    expect(result.specFile).toBe('contracts/specs/auth/spec.md');
+    expect(result.provenance).toBe('local-unreviewed');
+  });
+
+  it('blocks path traversal via the domain arg (must not read outside the repo)', async () => {
+    // Plant a spec.md two levels up; a traversing domain must NOT reach it.
+    const outside = join(tmpDir, '..', `escape-${Date.now()}`);
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'spec.md'), '# SECRET should not be readable', 'utf-8');
+    try {
+      const { handleGetSpec } = await import('./semantic.js');
+      const result = await handleGetSpec(tmpDir, `../escape-${Date.now()}`) as { error?: string; content?: string };
+      expect(result.content).toBeUndefined();
+      expect(result.error).toContain('list_spec_domains');
+      // also the classic deep escape
+      const deep = await handleGetSpec(tmpDir, '../../../../../../etc') as { error?: string; content?: string };
+      expect(deep.content).toBeUndefined();
+      expect(deep.error).toBeTruthy();
+    } finally {
+      await rm(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
   });
 });
 
@@ -246,7 +326,7 @@ describe('handleSearchCode', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-search-code-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-search-code-'));
   });
 
   it('returns error when no vector index exists', async () => {
@@ -259,7 +339,7 @@ describe('handleSearchCode', () => {
 
     const { handleSearchCode } = await import('./semantic.js');
     const result = await handleSearchCode(tmpDir, 'auth handler') as { error: string };
-    expect(result.error).toContain('No vector index found');
+    expect(result.error).toContain('No search index found');
   });
 
   it('returns results with bm25_fallback when embedding service unavailable', async () => {
@@ -268,6 +348,7 @@ describe('handleSearchCode', () => {
         exists: vi.fn().mockReturnValue(true),
         search: vi.fn().mockResolvedValue([{
           score: 0.1,
+          matchEvidence: TEST_MATCH_EVIDENCE,
           record: { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', signature: 'fn doA()', docstring: '', language: 'TypeScript', fanIn: 1, fanOut: 1, isHub: false, isEntryPoint: false },
         }]),
       },
@@ -284,6 +365,31 @@ describe('handleSearchCode', () => {
     expect(result.searchMode).toBe('bm25_fallback');
     expect(result.count).toBe(1);
     expect(Array.isArray(result.results)).toBe(true);
+    expect((result.indexStaleness as { staleFiles: string[] }).staleFiles).toEqual(['src/a.ts']);
+  });
+
+  it('checks stale text-index citations outside the programming-language allowlist', async () => {
+    const analysisDir = join(tmpDir, '.openlore', 'analysis');
+    const cssPath = join(tmpDir, 'src', 'styles.css');
+    await mkdir(join(tmpDir, 'src'), { recursive: true });
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(cssPath, '.button { color: blue; }\n');
+    await TextLineIndex.build(analysisDir, [{
+      filePath: 'src/styles.css',
+      content: '.button { color: blue; }\n',
+    }]);
+    await writeAnalysisFile(tmpDir, 'llm-context.json', {});
+    const now = Date.now() / 1000;
+    await utimes(join(analysisDir, 'llm-context.json'), now - 10, now - 10);
+    await writeFile(cssPath, '.button { color: red; }\n');
+    await utimes(cssPath, now, now);
+
+    const { handleSearchCode } = await import('./semantic.js');
+    const result = await handleSearchCode(tmpDir, 'button', 10, undefined, undefined, undefined, 'text') as {
+      indexStaleness?: { staleFiles: string[] };
+    };
+
+    expect(result.indexStaleness?.staleFiles).toEqual(['src/styles.css']);
   });
 });
 
@@ -295,7 +401,7 @@ describe('handleSuggestInsertionPoints', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-insertion-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-insertion-'));
   });
 
   it('returns error when no vector index exists', async () => {
@@ -308,12 +414,15 @@ describe('handleSuggestInsertionPoints', () => {
 
     const { handleSuggestInsertionPoints } = await import('./semantic.js');
     const result = await handleSuggestInsertionPoints(tmpDir, 'add logging') as { error: string };
-    expect(result.error).toContain('No vector index found');
+    expect(result.error).toContain('No search index found');
   });
 
-  it('returns error when embedding service is unavailable and no config', async () => {
+  it('falls back to BM25 (no error) when no embedding service is available', async () => {
+    // With spec-06 the handler passes embedSvc=null to VectorIndex.search,
+    // which serves BM25 results from a no-embedding index instead of erroring.
+    const search = vi.fn().mockResolvedValue([]);
     vi.doMock('../../analyzer/vector-index.js', () => ({
-      VectorIndex: { exists: vi.fn().mockReturnValue(true), search: vi.fn() },
+      VectorIndex: { exists: vi.fn().mockReturnValue(true), search },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
       EmbeddingService: {
@@ -323,8 +432,12 @@ describe('handleSuggestInsertionPoints', () => {
     }));
 
     const { handleSuggestInsertionPoints } = await import('./semantic.js');
-    const result = await handleSuggestInsertionPoints(tmpDir, 'add feature') as { error: string };
-    expect(result.error).toContain('No embedding configuration');
+    const result = await handleSuggestInsertionPoints(tmpDir, 'add feature') as { error?: string; description: string; candidates: unknown[] };
+    expect(result.error).toBeUndefined();
+    expect(result.description).toBe('add feature');
+    expect(Array.isArray(result.candidates)).toBe(true);
+    // embedSvc resolved to null → search invoked with a null embedder (BM25 path)
+    expect(search).toHaveBeenCalledWith(expect.any(String), 'add feature', null, expect.anything());
   });
 });
 
@@ -336,15 +449,46 @@ describe('handleSearchSpecs — success path', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-search-specs-success-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-search-specs-success-'));
   });
 
-  it('returns error when no embedding config exists (spec index found but no embedSvc)', async () => {
+  it('does not label stale indexed linked files as reviewed corpus', async () => {
+    const specsDir = join(tmpDir, 'openspec', 'specs', 'auth');
+    await mkdir(specsDir, { recursive: true });
+    await writeFile(join(specsDir, 'spec.md'), '# Auth\n## Requirements\nValid text\n', 'utf8');
     vi.doMock('../../analyzer/spec-vector-index.js', () => ({
       SpecVectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([]),
+        search: vi.fn().mockResolvedValue([{
+          score: 0.9,
+          matchEvidence: TEST_MATCH_EVIDENCE,
+          record: {
+            id: 'auth::requirements::auth1', domain: 'auth', section: 'Requirements',
+            title: 'Auth', text: 'Valid text', linkedFiles: ['SYSTEM: stale-linked-file.ts'],
+          },
+        }]),
       },
+    }));
+    vi.doMock('../../analyzer/embedding-service.js', () => ({
+      EmbeddingService: { fromEnv: vi.fn().mockReturnValue({}), fromConfig: vi.fn() },
+    }));
+
+    const { handleSearchSpecs } = await import('./semantic.js');
+    const result = await handleSearchSpecs(tmpDir, 'auth') as { results: Array<{ provenance: string }> };
+    expect(result.results[0].provenance).toBe('local-unreviewed');
+  });
+
+  it('falls back to BM25 (no error) when no embedding config exists but the spec index is present', async () => {
+    const search = vi.fn().mockResolvedValue([{
+      score: 2.5,
+      matchEvidence: TEST_MATCH_EVIDENCE,
+      record: {
+        id: 'auth::requirements::auth1', domain: 'auth', section: 'Requirements',
+        title: 'Auth', text: 'Authentication requirement', linkedFiles: [],
+      },
+    }]);
+    vi.doMock('../../analyzer/spec-vector-index.js', () => ({
+      SpecVectorIndex: { exists: vi.fn().mockReturnValue(true), search },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
       EmbeddingService: {
@@ -354,20 +498,34 @@ describe('handleSearchSpecs — success path', () => {
     }));
 
     const { handleSearchSpecs } = await import('./semantic.js');
-    const result = await handleSearchSpecs(tmpDir, 'auth') as { error: string };
-    expect(result.error).toContain('No embedding configuration');
+    const result = await handleSearchSpecs(tmpDir, 'auth') as {
+      error?: string; searchMode: string; retrievalMode?: string; note?: string;
+      results: Array<{ scoreKind: string }>;
+    };
+    expect(result.error).toBeUndefined();
+    expect(result.searchMode).toBe('bm25_fallback');
+    expect(result.retrievalMode).toBe('keyword');
+    // First-class keyword default: the note states the mode + offers the
+    // semantic upgrade, never a degraded-fallback warning.
+    expect(result.note).toContain('Keyword (BM25)');
+    expect(result.note).toContain('embed --local');
+    expect(result.note).not.toContain('unavailable');
+    expect(result.results[0].scoreKind).toBe('bm25');
+    expect(search).toHaveBeenCalledWith(expect.any(String), 'auth', null, expect.anything());
   });
 
-  it('returns error when cfg exists but fromConfig returns null', async () => {
-    // Create minimal .spec-gen/config.json so readSpecGenConfig returns a config
-    await mkdir(join(tmpDir, '.spec-gen'), { recursive: true });
-    await writeFile(join(tmpDir, '.spec-gen', 'config.json'), JSON.stringify({ version: '1' }), 'utf-8');
+  it('uses BM25 fallback when cfg exists but fromConfig returns null', async () => {
+    // Create a valid .openlore/config.json so readOpenLoreConfig returns a config.
+    await mkdir(join(tmpDir, '.openlore'), { recursive: true });
+    await writeFile(join(tmpDir, '.openlore', 'config.json'), JSON.stringify({
+      version: '1.0.0', projectType: 'nodejs', openspecPath: 'openspec',
+      analysis: { maxFiles: 100, includePatterns: [], excludePatterns: [] },
+      generation: { domains: 'auto' }, createdAt: '2026-01-01T00:00:00Z', lastRun: null,
+    }), 'utf-8');
 
+    const search = vi.fn().mockResolvedValue([]);
     vi.doMock('../../analyzer/spec-vector-index.js', () => ({
-      SpecVectorIndex: {
-        exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([]),
-      },
+      SpecVectorIndex: { exists: vi.fn().mockReturnValue(true), search },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
       EmbeddingService: {
@@ -377,8 +535,114 @@ describe('handleSearchSpecs — success path', () => {
     }));
 
     const { handleSearchSpecs } = await import('./semantic.js');
-    const result = await handleSearchSpecs(tmpDir, 'auth') as { error: string };
-    expect(result.error).toContain('No embedding configuration');
+    const result = await handleSearchSpecs(tmpDir, 'auth') as { error?: string; searchMode: string };
+    expect(result.error).toBeUndefined();
+    expect(result.searchMode).toBe('bm25_fallback');
+  });
+
+  it('reports the keyword mode actually served after a semantic fallback', async () => {
+    vi.doMock('../../analyzer/spec-vector-index.js', () => ({
+      SpecVectorIndex: {
+        exists: vi.fn().mockReturnValue(true),
+        searchWithFreshness: vi.fn().mockResolvedValue({
+          results: [],
+          indexFreshness: null,
+          retrievalMode: 'keyword',
+        }),
+      },
+    }));
+    vi.doMock('../../analyzer/embedder.js', async importOriginal => ({
+      ...await importOriginal<typeof import('../../analyzer/embedder.js')>(),
+      resolveEmbedder: vi.fn().mockResolvedValue({ modelName: 'model-b' }),
+      embedderMode: vi.fn().mockReturnValue('remote-semantic'),
+    }));
+
+    const { handleSearchSpecs } = await import('./semantic.js');
+    const result = await handleSearchSpecs(tmpDir, 'auth') as {
+      searchMode: string;
+      retrievalMode: string;
+      note?: string;
+    };
+
+    expect(result.searchMode).toBe('bm25_fallback');
+    expect(result.retrievalMode).toBe('keyword');
+    expect(result.note).toContain('Keyword (BM25)');
+  });
+
+  it.each(['local-semantic', 'remote-semantic'] as const)(
+    'preserves %s provider provenance when a rebuild makes retrieval semantic',
+    async expectedMode => {
+      vi.doMock('../../analyzer/spec-vector-index.js', () => ({
+        SpecVectorIndex: {
+          exists: vi.fn().mockReturnValue(true),
+          searchWithFreshness: vi.fn().mockResolvedValue({
+            results: [],
+            indexFreshness: null,
+            retrievalMode: 'semantic',
+          }),
+        },
+      }));
+      vi.doMock('../../analyzer/embedder.js', async importOriginal => ({
+        ...await importOriginal<typeof import('../../analyzer/embedder.js')>(),
+        resolveEmbedder: vi.fn().mockResolvedValue({ modelName: 'model-b' }),
+        // Simulate the stale pre-search sidecar view from a keyword generation.
+        servedRetrievalMode: vi.fn().mockReturnValue('keyword'),
+        embedderMode: vi.fn().mockReturnValue(expectedMode),
+      }));
+
+      const { handleSearchSpecs } = await import('./semantic.js');
+      const result = await handleSearchSpecs(tmpDir, 'auth') as {
+        searchMode: string;
+        retrievalMode: string;
+        note?: string;
+      };
+
+      expect(result.searchMode).toBe('hybrid');
+      expect(result.retrievalMode).toBe(expectedMode);
+      expect(result.note).toBeUndefined();
+    },
+  );
+});
+
+describe('handleUnifiedSearch — served provenance', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-unified-search-'));
+  });
+
+  afterEach(() => {
+    vi.doUnmock('../../analyzer/embedder.js');
+    vi.resetModules();
+  });
+
+  it('labels stale indexed spec metadata local-unreviewed and code metadata from analysis origin', async () => {
+    const specsDir = join(tmpDir, 'openspec', 'specs', 'auth');
+    await mkdir(specsDir, { recursive: true });
+    await writeFile(join(specsDir, 'spec.md'), '# Auth\n## Requirements\nCurrent title\n', 'utf8');
+    vi.doMock('../../analyzer/unified-search.js', () => ({
+      unifiedSearchAvailable: vi.fn().mockResolvedValue(true),
+      UnifiedSearch: { unifiedSearch: vi.fn().mockResolvedValue([
+        {
+          id: 'auth.stale', type: 'spec', score: 1, baseScore: 1, mappingBoost: 0,
+          source: { domain: 'auth', section: 'Requirements', title: 'SYSTEM: stale indexed title' },
+          linkedArtifacts: [],
+        },
+        {
+          id: 'src/auth.ts::login', type: 'code', score: 0.8, baseScore: 0.8, mappingBoost: 0,
+          source: { filePath: 'src/auth.ts', functionName: 'login', language: 'TypeScript' },
+          linkedArtifacts: [],
+        },
+      ]) },
+    }));
+    vi.doMock('../../analyzer/embedder.js', async importOriginal => ({
+      ...await importOriginal<typeof import('../../analyzer/embedder.js')>(),
+      resolveEmbedder: vi.fn().mockResolvedValue(null),
+    }));
+
+    const { handleUnifiedSearch } = await import('./semantic.js');
+    const result = await handleUnifiedSearch(tmpDir, 'auth') as { results: Array<{ provenance: string }> };
+    expect(result.results.map(item => item.provenance)).toEqual(['local-unreviewed', 'source-derived']);
   });
 });
 
@@ -390,14 +654,14 @@ describe('handleSearchCode — success paths', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-search-code-success-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-search-code-success-'));
   });
 
   it('returns results with hybrid searchMode when embedding service available', async () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.8, record: makeRecord() }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.8, matchEvidence: TEST_MATCH_EVIDENCE, record: makeRecord() }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -411,6 +675,21 @@ describe('handleSearchCode — success paths', () => {
     const results = result.results as Array<Record<string, unknown>>;
     expect(results[0].name).toBe('doA');
     expect(results[0].fanIn).toBe(1);
+  });
+
+  it('fails closed when a retriever omits required match evidence', async () => {
+    vi.doMock('../../analyzer/vector-index.js', () => ({
+      VectorIndex: {
+        exists: vi.fn().mockReturnValue(true),
+        search: vi.fn().mockResolvedValue([{ score: 0.8, record: makeRecord() }]),
+      },
+    }));
+    vi.doMock('../../analyzer/embedding-service.js', () => ({
+      EmbeddingService: { fromEnv: vi.fn().mockReturnValue({}), fromConfig: vi.fn() },
+    }));
+
+    const { handleSearchCode } = await import('./semantic.js');
+    await expect(handleSearchCode(tmpDir, 'auth handler')).rejects.toThrow('missing match evidence');
   });
 
   it('clamps limit to [1, 100]', async () => {
@@ -435,7 +714,7 @@ describe('handleSearchCode — success paths', () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.7, record }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.7, matchEvidence: TEST_MATCH_EVIDENCE, record }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -444,14 +723,14 @@ describe('handleSearchCode — success paths', () => {
     await writeAnalysisFile(tmpDir, 'llm-context.json', {
       callGraph: {
         nodes: [
-          { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', language: 'TypeScript', fanIn: 1, fanOut: 0 },
+          { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', language: 'TypeScript', fanIn: 1, fanOut: 0, startLine: 17 },
           { id: 'src/b.ts::doB', name: 'doB', filePath: 'src/b.ts', language: 'TypeScript', fanIn: 0, fanOut: 1 },
         ],
         edges: [{ callerId: 'src/b.ts::doB', calleeId: 'src/a.ts::doA' }],
       },
     });
     {
-      const analysisDir = join(tmpDir, '.spec-gen', 'analysis');
+      const analysisDir = join(tmpDir, '.openlore', 'analysis');
       const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
       store.insertNodes([
         { id: 'src/a.ts::doA', name: 'doA', filePath: 'src/a.ts', language: 'TypeScript', fanIn: 1, fanOut: 0, isAsync: false, startIndex: 0, endIndex: 100 },
@@ -467,6 +746,29 @@ describe('handleSearchCode — success paths', () => {
     const callers = results[0].callers as Array<{ name: string }> | undefined;
     expect(callers).toBeDefined();
     expect(callers?.some(c => c.name === 'doB')).toBe(true);
+    expect(results[0].startLine).toBe(17);
+  });
+
+  it('preserves indexed TypeScript, Python, and Go start lines by canonical id', async () => {
+    const records = [
+      makeRecord({ id: 'src/a.ts::same', filePath: 'src/a.ts', language: 'TypeScript' }),
+      makeRecord({ id: 'src/a.py::same', filePath: 'src/a.py', language: 'Python' }),
+      makeRecord({ id: 'src/a.go::same', filePath: 'src/a.go', language: 'Go' }),
+    ];
+    vi.doMock('../../analyzer/vector-index.js', () => ({
+      VectorIndex: { exists: vi.fn().mockReturnValue(true), search: vi.fn().mockResolvedValue(records.map(record => ({ score: 0.8, matchEvidence: TEST_MATCH_EVIDENCE, record }))) },
+    }));
+    vi.doMock('../../analyzer/embedding-service.js', () => ({
+      EmbeddingService: { fromEnv: vi.fn().mockReturnValue({}), fromConfig: vi.fn() },
+    }));
+    await writeAnalysisFile(tmpDir, 'llm-context.json', {
+      callGraph: { nodes: records.map((record, index) => ({ ...record, startLine: [11, 22, 33][index] })), edges: [] },
+    });
+    const { handleSearchCode } = await import('./semantic.js');
+    const result = await handleSearchCode(tmpDir, 'same') as { results: Array<{ language: string; startLine?: number }> };
+    expect(result.results.map(item => [item.language, item.startLine])).toEqual([
+      ['TypeScript', 11], ['Python', 22], ['Go', 33],
+    ]);
   });
 
   it('includes specPeers for files that share a domain via mapping.json', async () => {
@@ -474,7 +776,7 @@ describe('handleSearchCode — success paths', () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.6, record }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.6, matchEvidence: TEST_MATCH_EVIDENCE, record }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -510,7 +812,7 @@ describe('handleSuggestInsertionPoints — success paths', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-insertion-success-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-insertion-success-'));
   });
 
   it('returns ranked candidates with correct roles and strategies', async () => {
@@ -539,7 +841,7 @@ describe('handleSuggestInsertionPoints — success paths', () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.8, record: makeRecord() }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.8, matchEvidence: TEST_MATCH_EVIDENCE, record: makeRecord() }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -573,7 +875,7 @@ describe('handleSuggestInsertionPoints — success paths', () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.7, record: seedRecord }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.7, matchEvidence: TEST_MATCH_EVIDENCE, record: seedRecord }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -590,7 +892,7 @@ describe('handleSuggestInsertionPoints — success paths', () => {
       },
     });
     {
-      const analysisDir = join(tmpDir, '.spec-gen', 'analysis');
+      const analysisDir = join(tmpDir, '.openlore', 'analysis');
       const store = EdgeStore.open(EdgeStore.dbPath(analysisDir));
       store.insertNodes([
         { id: 'seed::fn', name: 'seedFn', filePath: 'src/seed.ts', language: 'TypeScript', fanIn: 1, fanOut: 0, isAsync: false, startIndex: 0, endIndex: 100 },
@@ -631,12 +933,13 @@ describe('handleSearchSpecs — success path', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-search-specs-ok-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-search-specs-ok-'));
   });
 
   it('returns formatted spec results', async () => {
     const mockResults = [{
       score: 0.9,
+      matchEvidence: TEST_MATCH_EVIDENCE,
       record: {
         id: 'auth::requirements::auth1', domain: 'auth',
         section: 'requirements', title: 'Auth requirement',
@@ -648,6 +951,12 @@ describe('handleSearchSpecs — success path', () => {
       SpecVectorIndex: {
         exists: vi.fn().mockReturnValue(true),
         search: vi.fn().mockResolvedValue(mockResults),
+        freshness: vi.fn().mockReturnValue({
+          builtAt: '2026-08-30T12:00:00.000Z',
+          tracking: 'tracked',
+          changedFileCount: 1,
+          changedFiles: ['openspec/specs/auth/spec.md'],
+        }),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -661,8 +970,15 @@ describe('handleSearchSpecs — success path', () => {
     const results = result.results as Array<Record<string, unknown>>;
     expect(results[0].domain).toBe('auth');
     expect(results[0].score).toBe(0.9);
+    expect(results[0].scoreKind).toBe('cosine_distance');
     expect(results[0].text).toContain('authenticate');
     expect(results[0].linkedFiles).toEqual(['src/auth.ts']);
+    expect(result.indexFreshness).toEqual({
+      builtAt: '2026-08-30T12:00:00.000Z',
+      tracking: 'tracked',
+      changedFileCount: 1,
+      changedFiles: ['openspec/specs/auth/spec.md'],
+    });
   });
 
   it('clamps limit to [1, 50]', async () => {
@@ -689,7 +1005,7 @@ describe('handleGetSpec — with mapping', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'spec-gen-get-spec-mapping-'));
+    tmpDir = await mkdtemp(join(tmpdir(), 'openlore-get-spec-mapping-'));
   });
 
   it('returns linkedFunctions when mapping.json covers the domain', async () => {
@@ -723,8 +1039,8 @@ describe('handleSearchCode — edgeStore fast path', () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'semantic-edgestore-test-'));
-    const analysisDir = join(tmpDir, '.spec-gen', 'analysis');
-    rmSync(analysisDir, { recursive: true, force: true });
+    const analysisDir = join(tmpDir, '.openlore', 'analysis');
+    rmSync(analysisDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     mkdirSync(analysisDir, { recursive: true });
     // Write minimal llm-context.json (no callGraph — edgeStore is the only source)
     writeFileSync(
@@ -741,14 +1057,15 @@ describe('handleSearchCode — edgeStore fast path', () => {
   });
 
   afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    _resetContextCacheForTesting();
+    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('enriches results with callers from edgeStore (not JSON scan)', async () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.9, record: makeRecord({ id: 'src/a.ts::doA' }) }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.9, matchEvidence: TEST_MATCH_EVIDENCE, record: makeRecord({ id: 'src/a.ts::doA' }) }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({
@@ -769,7 +1086,7 @@ describe('handleSuggestInsertionPoints — edgeStore RIG-13 fast path', () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'semantic-suggest-edgestore-test-'));
-    const analysisDir = join(tmpDir, '.spec-gen', 'analysis');
+    const analysisDir = join(tmpDir, '.openlore', 'analysis');
     mkdirSync(analysisDir, { recursive: true });
     writeFileSync(
       join(analysisDir, 'llm-context.json'),
@@ -786,14 +1103,15 @@ describe('handleSuggestInsertionPoints — edgeStore RIG-13 fast path', () => {
   });
 
   afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    _resetContextCacheForTesting();
+    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('RIG-13 expands results with caller from edgeStore', async () => {
     vi.doMock('../../analyzer/vector-index.js', () => ({
       VectorIndex: {
         exists: vi.fn().mockReturnValue(true),
-        search: vi.fn().mockResolvedValue([{ score: 0.8, record: makeRecord({ id: 'src/a.ts::handler', name: 'handler', filePath: 'src/a.ts', fanOut: 0 }) }]),
+        search: vi.fn().mockResolvedValue([{ score: 0.8, matchEvidence: TEST_MATCH_EVIDENCE, record: makeRecord({ id: 'src/a.ts::handler', name: 'handler', filePath: 'src/a.ts', fanOut: 0 }) }]),
       },
     }));
     vi.doMock('../../analyzer/embedding-service.js', () => ({

@@ -10,23 +10,29 @@
  *   1. GEMINI_API_KEY                -> Gemini
  *   2. ANTHROPIC_API_KEY             -> Anthropic Claude
  *   3. OPENAI_COMPAT_BASE_URL        -> any OpenAI-compatible endpoint
- *   4. specGenConfig.generation      -> reads provider + openaiCompatBaseUrl from config
+ *   4. openloreConfig.generation      -> reads provider + openaiCompatBaseUrl from config
  *   5. OPENAI_API_KEY                -> OpenAI directly
  *
- * Model: OPENAI_COMPAT_MODEL env var -> specGenConfig.generation.model -> provider default.
+ * Model overrides are provider-scoped; a model configured for one provider never
+ * crosses into another provider's request.
  *
  * Max iterations: 8 (prevents runaway loops).
+ * change: harden-chat-agent-surface
  */
 
 import { CHAT_TOOLS, toChatToolDefinitions } from './chat-tools.js';
-import { readSpecGenConfig } from './config-manager.js';
+import { llmTlsRelaxed, withRelaxedTls } from './tls-scope.js';
+import { readOpenLoreConfig } from './config-manager.js';
 import {
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_GEMINI_MODEL,
   DEFAULT_CHAT_OPENAI_MODEL,
   CHAT_AGENT_MAX_TOKENS,
   API_ERROR_PREVIEW_LENGTH,
+  DEFAULT_LLM_TIMEOUT_MS,
 } from '../../constants.js';
+import { resolveTrustedCompatBase } from './repo-config-trust.js';
+import { createPromptBoundary, type PromptBoundary } from '../../utils/prompt-boundary.js';
 
 // ============================================================================
 // TYPES -- OpenAI
@@ -103,6 +109,7 @@ interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  requiredApiKeyEnv?: string;
 }
 
 /**
@@ -123,11 +130,28 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
   let cfgBase: string | undefined;
   let cfgModel: string | undefined;
   try {
-    const cfg = await readSpecGenConfig(directory);
+    const cfg = await readOpenLoreConfig(directory);
     cfgProvider = cfg?.generation?.provider;
     cfgBase     = cfg?.generation?.openaiCompatBaseUrl;
     cfgModel    = cfg?.generation?.model;
   } catch { /* ignore */ }
+
+  const configModelFor = (kind: ProviderKind): string | undefined => {
+    if (!cfgModel) return undefined;
+    if (cfgProvider) {
+      const matches = kind === 'openai-compat'
+        ? cfgProvider === 'openai' || cfgProvider === 'openai-compat'
+        : cfgProvider === kind;
+      return matches ? cfgModel : undefined;
+    }
+    // The generated default config has no provider tag but stamps the Anthropic
+    // default model. Keep that known default scoped to Anthropic; a model the
+    // user changed explicitly remains attached to the key-selected provider.
+    if (cfgModel === DEFAULT_ANTHROPIC_MODEL) {
+      return kind === 'anthropic' ? cfgModel : undefined;
+    }
+    return cfgModel;
+  };
 
   // Priority: explicit config provider > env key signals > fallback openai-compat
   // Explicit config always wins so users can override a globally-set env key.
@@ -136,7 +160,8 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
       kind:    'gemini',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
       apiKey:  geminiKey,
-      model:   envModel || cfgModel || DEFAULT_GEMINI_MODEL,
+      model:   configModelFor('gemini') || DEFAULT_GEMINI_MODEL,
+      requiredApiKeyEnv: 'GEMINI_API_KEY',
     };
   }
 
@@ -145,17 +170,28 @@ export async function resolveProviderConfig(directory: string): Promise<Provider
       kind:    'anthropic',
       baseUrl: 'https://api.anthropic.com/v1',
       apiKey:  anthropicKey,
-      model:   envModel || cfgModel || DEFAULT_ANTHROPIC_MODEL,
+      model:   configModelFor('anthropic') || DEFAULT_ANTHROPIC_MODEL,
+      requiredApiKeyEnv: 'ANTHROPIC_API_KEY',
     };
   }
 
-  const base = compatBase || cfgBase || 'https://api.openai.com/v1';
-  const key  = compatKey  || openaiKey;
+  // The environment value is operator-supplied. A committed repository value is
+  // accepted only for loopback; a clone cannot choose where an operator credential
+  // and repository-derived chat content are sent.
+  const trustedCompatBase = resolveTrustedCompatBase(compatBase || undefined, cfgBase);
+  const usesCompatEndpoint = trustedCompatBase !== undefined;
+  const base = trustedCompatBase || 'https://api.openai.com/v1';
+  const key = usesCompatEndpoint ? (compatKey || openaiKey) : openaiKey;
   return {
     kind:    'openai-compat',
     baseUrl: base.replace(/\/$/, ''),
     apiKey:  key,
-    model:   envModel || cfgModel || DEFAULT_CHAT_OPENAI_MODEL,
+    model:   (usesCompatEndpoint ? envModel || configModelFor('openai-compat') : undefined)
+      || (!cfgProvider || cfgProvider === 'openai' ? configModelFor('openai-compat') : undefined)
+      || DEFAULT_CHAT_OPENAI_MODEL,
+    requiredApiKeyEnv: usesCompatEndpoint
+      ? 'OPENAI_COMPAT_API_KEY (or OPENAI_API_KEY)'
+      : 'OPENAI_API_KEY',
   };
 }
 
@@ -193,25 +229,96 @@ function isRetryable(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+interface BufferedChatResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+}
+
+function waitForRetry(delay: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Aborted'));
+      return;
+    }
+    const abort = (): void => {
+      clearTimeout(timer);
+      reject(new Error('Aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, delay);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
 async function fetchWithRetry(
-  url: string,
-  init: RequestInit,
+  request: (signal: AbortSignal) => Promise<Response>,
   signal?: AbortSignal
-): Promise<Response> {
+): Promise<BufferedChatResponse> {
   let lastError: Error = new Error('fetch failed');
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error('Aborted');
     if (attempt > 0) {
       const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
-      await new Promise(r => setTimeout(r, delay));
-      if (signal?.aborted) throw new Error('Aborted');
+      await waitForRetry(delay, signal);
     }
-    const response = await fetch(url, { ...init, signal });
-    if (response.ok || !isRetryable(response.status)) return response;
-    const errText = await response.text().catch(() => '');
-    lastError = new Error(`${response.status}: ${errText.slice(0, 200)}`);
+    const attemptController = new AbortController();
+    let timedOut = false;
+    const abortFromCaller = (): void => attemptController.abort(signal?.reason);
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      attemptController.abort(new Error(`Chat API request timed out after ${DEFAULT_LLM_TIMEOUT_MS}ms`));
+    }, DEFAULT_LLM_TIMEOUT_MS);
+    timeout.unref?.();
+
+    let response: Response;
+    let responseBody: string;
+    try {
+      response = await request(attemptController.signal);
+      // Native fetch resolves when headers arrive. Consume the body while the
+      // same timeout and caller-abort listener are still active so a provider
+      // that stalls mid-stream cannot hang the chat loop indefinitely.
+      responseBody = await response.text();
+    } catch (error) {
+      if (signal?.aborted) throw new Error('Aborted', { cause: error });
+      if (!timedOut) throw error;
+      lastError = new Error(`Chat API request timed out after ${DEFAULT_LLM_TIMEOUT_MS}ms`, { cause: error });
+      if (attempt === MAX_RETRIES) throw lastError;
+      continue;
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abortFromCaller);
+    }
+    if (response.ok || !isRetryable(response.status)) {
+      return {
+        ok: response.ok,
+        status: response.status,
+        text: async () => responseBody,
+        json: async () => JSON.parse(responseBody) as unknown,
+      };
+    }
+    lastError = new Error(`${response.status}: ${responseBody.slice(0, 200)}`);
   }
   throw lastError;
+}
+
+function chatSystemPrompt(directory: string, boundary: PromptBoundary): string {
+  return `${buildSystemPrompt(directory)}\n\n${boundary.instruction}`;
+}
+
+function protectToolResult(boundary: PromptBoundary, toolName: string, content: string): string {
+  return boundary.wrap(`Source: OpenLore chat tool "${toolName}" (repository-derived)\n${content}`);
+}
+
+function stoppedReply(aborted: boolean, partial: string): string {
+  const reason = aborted
+    ? 'stopped: aborted'
+    : 'stopped: iteration budget exhausted — partial results';
+  return partial.trim() ? `${reason}\n\n${partial.trim()}` : reason;
 }
 
 function buildSystemPrompt(directory: string): string {
@@ -260,10 +367,18 @@ async function executeTool(
     return { content: JSON.stringify({ error: `Unknown tool: ${name}` }), filePaths: [] };
   }
   try {
-    const { result, filePaths } = await tool.execute(directory, args);
+    // `directory` is an authorization boundary supplied by the viewer server,
+    // not a model-controlled tool argument. Force it into every call so hostile
+    // prompt content cannot redirect a tool to another readable repository.
+    const trustedArgs = { ...args, directory };
+    const { result, filePaths } = await tool.execute(directory, trustedArgs);
     let content = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
     if (content.length > MAX_TOOL_RESULT_CHARS) {
-      content = content.slice(0, MAX_TOOL_RESULT_CHARS) + '\n... [truncated]';
+      const receipt = result && typeof result === 'object' && !Array.isArray(result)
+        ? (result as Record<string, unknown>).redactions
+        : undefined;
+      const suffix = `\n... [truncated]${receipt === undefined ? '' : `\nRedactions: ${JSON.stringify(receipt)}`}`;
+      content = content.slice(0, Math.max(0, MAX_TOOL_RESULT_CHARS - suffix.length)) + suffix;
     }
     callbacks?.onToolEnd?.(name);
     return { content, filePaths };
@@ -290,9 +405,10 @@ async function runOpenAILoop(
   const toolDefs = toChatToolDefinitions();
   const toolMap  = new Map(CHAT_TOOLS.map(t => [t.name, t]));
   const allFilePaths: string[] = [];
+  const boundary = createPromptBoundary();
 
   const history: OAIMessage[] = [
-    { role: 'system', content: buildSystemPrompt(directory) },
+    { role: 'system', content: chatSystemPrompt(directory, boundary) },
     ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })),
   ];
 
@@ -302,15 +418,28 @@ async function runOpenAILoop(
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     if (signal?.aborted) break;
 
-    const response = await fetchWithRetry(
-      `${cfg.baseUrl}/chat/completions`,
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ model: cfg.model, messages: history, tools: toolDefs, tool_choice: 'auto' }),
-      },
-      signal,
-    );
+    let response: BufferedChatResponse;
+    try {
+      response = await fetchWithRetry(
+        attemptSignal => withRelaxedTls(() => fetch(`${cfg.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers,
+          // INTENTIONAL EGRESS: prompt-wrapped repository results go to the operator-selected LLM.
+          // codeql[js/file-access-to-http]
+          body: JSON.stringify({ model: cfg.model, messages: history, tools: toolDefs, tool_choice: 'auto' }),
+          signal: attemptSignal,
+          // Never follow a redirect: a cross-origin redirect strips only Authorization,
+          // Cookie and Proxy-Authorization, and a 307/308 replays the body — so a followed
+          // hop would forward the conversation (and, for key-in-header providers, the key)
+          // to a host the first response chose. Same rule as serve-client.ts.
+          redirect: 'error',
+        }), llmTlsRelaxed()),
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) break;
+      throw error;
+    }
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
@@ -337,13 +466,17 @@ async function runOpenAILoop(
       }
       const { content, filePaths } = await executeTool(toolMap, directory, tc.function.name, args, callbacks);
       allFilePaths.push(...filePaths);
-      history.push({ role: 'tool', tool_call_id: tc.id, content });
+      history.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        content: protectToolResult(boundary, tc.function.name, content),
+      });
     }
   }
 
   const lastAssistant = [...history].reverse().find(m => m.role === 'assistant' && m.content);
   return {
-    reply: lastAssistant?.content ?? 'Analysis complete. Check highlighted nodes.',
+    reply: stoppedReply(signal?.aborted === true, lastAssistant?.content ?? ''),
     filePaths: [...new Set(allFilePaths)],
   };
 }
@@ -361,6 +494,7 @@ async function runGeminiLoop(
 ): Promise<ChatAgentResult> {
   const toolMap = new Map(CHAT_TOOLS.map(t => [t.name, t]));
   const allFilePaths: string[] = [];
+  const boundary = createPromptBoundary();
 
   // Build function declarations for Gemini
   const functionDeclarations = CHAT_TOOLS.map(t => ({
@@ -375,20 +509,46 @@ async function runGeminiLoop(
     parts: [{ text: m.content }],
   }));
 
-  const url = `${cfg.baseUrl}/${cfg.model}:generateContent?key=${cfg.apiKey}`;
+  // A model can come from the analyzed repository's config. Keep it as one path
+  // segment so repository data cannot become request-path or query syntax.
+  const url = `${cfg.baseUrl}/${encodeURIComponent(cfg.model)}:generateContent?key=${cfg.apiKey}`;
   const headers = { 'Content-Type': 'application/json' };
 
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     if (signal?.aborted) break;
 
     const body = {
-      systemInstruction: { parts: [{ text: buildSystemPrompt(directory) }] },
+      systemInstruction: { parts: [{ text: chatSystemPrompt(directory, boundary) }] },
       contents,
       tools: [{ function_declarations: functionDeclarations }],
       tool_config: { function_calling_config: { mode: 'AUTO' } },
     };
 
-    const response = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify(body) }, signal);
+    let response: BufferedChatResponse;
+    try {
+      response = await fetchWithRetry(
+        attemptSignal => withRelaxedTls(() => fetch(
+          // INTENTIONAL EGRESS: the encoded model selects a resource only at Google's fixed origin.
+          // codeql[js/file-access-to-http]
+          url,
+          {
+            method: 'POST',
+            headers,
+            // INTENTIONAL EGRESS: prompt-wrapped repository results go to the fixed Gemini provider.
+            // codeql[js/file-access-to-http]
+            body: JSON.stringify(body),
+            signal: attemptSignal,
+            // Never follow a redirect: the API key rides in the URL here, and a 307/308
+            // replays the body. Same reason as the compat provider above.
+            redirect: 'error',
+          },
+        ), llmTlsRelaxed()),
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) break;
+      throw error;
+    }
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
@@ -422,16 +582,26 @@ async function runGeminiLoop(
       let parsed: Record<string, unknown>;
       try { parsed = JSON.parse(content) as Record<string, unknown>; }
       catch { parsed = { result: content }; }
-      responseParts.push({ functionResponse: { name: fc.functionCall.name, response: parsed } });
+      responseParts.push({
+        functionResponse: {
+          name: fc.functionCall.name,
+          response: {
+            openloreUntrustedData: protectToolResult(boundary, fc.functionCall.name, JSON.stringify(parsed)),
+          },
+        },
+      });
     }
     contents.push({ role: 'user', parts: responseParts });
   }
 
   // Max iterations -- extract last model text
-  const lastModel = [...contents].reverse().find(c => c.role === 'model');
-  const lastText  = lastModel?.parts.filter((p): p is { text: string } => 'text' in p).map(p => p.text).join('') ?? '';
+  const lastText = [...contents]
+    .reverse()
+    .filter(c => c.role === 'model')
+    .map(c => c.parts.filter((p): p is { text: string } => 'text' in p).map(p => p.text).join(''))
+    .find(text => text.trim()) ?? '';
   return {
-    reply: lastText || 'Analysis complete. Check highlighted nodes.',
+    reply: stoppedReply(signal?.aborted === true, lastText),
     filePaths: [...new Set(allFilePaths)],
   };
 }
@@ -449,6 +619,7 @@ async function runAnthropicLoop(
 ): Promise<ChatAgentResult> {
   const toolMap = new Map(CHAT_TOOLS.map(t => [t.name, t]));
   const allFilePaths: string[] = [];
+  const boundary = createPromptBoundary();
 
   const tools = CHAT_TOOLS.map(t => ({
     name: t.name,
@@ -470,21 +641,32 @@ async function runAnthropicLoop(
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     if (signal?.aborted) break;
 
-    const response = await fetchWithRetry(
-      `${cfg.baseUrl}/messages`,
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          model: cfg.model,
-          max_tokens: CHAT_AGENT_MAX_TOKENS,
-          system: buildSystemPrompt(directory),
-          tools,
-          messages: history,
-        }),
-      },
-      signal,
-    );
+    let response: BufferedChatResponse;
+    try {
+      response = await fetchWithRetry(
+        attemptSignal => withRelaxedTls(() => fetch(`${cfg.baseUrl}/messages`, {
+          method: 'POST',
+          headers,
+          // INTENTIONAL EGRESS: prompt-wrapped repository results go to the fixed Anthropic provider.
+          // codeql[js/file-access-to-http]
+          body: JSON.stringify({
+            model: cfg.model,
+            max_tokens: CHAT_AGENT_MAX_TOKENS,
+            system: chatSystemPrompt(directory, boundary),
+            tools,
+            messages: history,
+          }),
+          signal: attemptSignal,
+          // Never follow a redirect: `x-api-key` is not stripped cross-origin and a
+          // 307/308 replays the body. Same reason as the compat provider above.
+          redirect: 'error',
+        }), llmTlsRelaxed()),
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) break;
+      throw error;
+    }
 
     if (!response.ok) {
       const errText = await response.text().catch(() => '');
@@ -513,20 +695,27 @@ async function runAnthropicLoop(
     for (const tu of toolUseBlocks) {
       const { content, filePaths } = await executeTool(toolMap, directory, tu.name, tu.input, callbacks);
       allFilePaths.push(...filePaths);
-      resultBlocks.push({ type: 'tool_result', tool_use_id: tu.id, content });
+      resultBlocks.push({
+        type: 'tool_result',
+        tool_use_id: tu.id,
+        content: protectToolResult(boundary, tu.name, content),
+      });
     }
     history.push({ role: 'user', content: resultBlocks });
   }
 
   // Max iterations -- extract last assistant text
-  const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
-  const lastText = Array.isArray(lastAssistant?.content)
-    ? (lastAssistant.content as AnthropicContentBlock[])
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text).join('')
-    : (lastAssistant?.content as string | undefined) ?? '';
+  const lastText = [...history]
+    .reverse()
+    .filter(m => m.role === 'assistant')
+    .map(m => Array.isArray(m.content)
+      ? m.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text).join('')
+      : m.content)
+    .find(text => text.trim()) ?? '';
   return {
-    reply: lastText || 'Analysis complete. Check highlighted nodes.',
+    reply: stoppedReply(signal?.aborted === true, lastText),
     filePaths: [...new Set(allFilePaths)],
   };
 }
@@ -538,6 +727,9 @@ async function runAnthropicLoop(
 export async function runChatAgent(options: ChatAgentOptions): Promise<ChatAgentResult> {
   const { directory, messages, modelOverride, signal, onToolStart, onToolEnd } = options;
   const cfg = await resolveProviderConfig(directory);
+  if (cfg.requiredApiKeyEnv && !cfg.apiKey) {
+    throw new Error(`No API key configured for chat — set ${cfg.requiredApiKeyEnv} and try again.`);
+  }
   if (modelOverride) cfg.model = modelOverride;
   const callbacks = { onToolStart, onToolEnd };
   if (cfg.kind === 'gemini')    return runGeminiLoop(cfg, directory, messages, callbacks, signal);

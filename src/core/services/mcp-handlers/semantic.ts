@@ -3,7 +3,7 @@
  * search_code, suggest_insertion_points, search_specs.
  */
 
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import {
   INSERTION_SEMANTIC_WEIGHT,
   INSERTION_STRUCTURAL_WEIGHT,
@@ -13,14 +13,30 @@ import {
   INSERTION_ROLE_BONUS_INTERNAL,
   INSERTION_ROLE_BONUS_UTILITY,
   INSERTION_ORCHESTRATOR_FAN_OUT_THRESHOLD,
-  SPEC_GEN_DIR,
-  SPEC_GEN_ANALYSIS_SUBDIR,
+  OPENLORE_DIR,
+  OPENLORE_ANALYSIS_SUBDIR,
   OPENSPEC_DIR,
   OPENSPEC_SPECS_SUBDIR,
 } from '../../../constants.js';
 import { fileExists } from '../../../utils/command-helpers.js';
-import { validateDirectory, loadMappingIndex, specsForFile, functionsForDomain } from './utils.js';
-import { readSpecGenConfig } from '../config-manager.js';
+import { resolveOpenspecDir } from '../../../utils/openspec-dir.js';
+import { validateDirectory, safeJoin, loadMappingIndex, specsForFile, functionsForDomain, queryTooLongError, notReadyResult, readCachedContext, getCachedNodeStartLine } from './utils.js';
+import { expandHandle, applyTokenBudget, collapseExactDuplicates, omissionNote } from './progressive.js';
+import { readOpenLoreConfig } from '../config-manager.js';
+import {
+  readAnalysisContentProvenance,
+  indexedSpecContentProvenance,
+  reviewedFileContentProvenance,
+  type AnalysisContentProvenance,
+} from '../served-content.js';
+import { computeIndexStaleness, withIndexStaleness } from './index-staleness.js';
+import { dirtySourcePaths, overlayResults } from './overlay-results.js';
+import {
+  coverageDisclosure,
+  coverageVerdict,
+  requireMatchEvidence,
+  type QuestionKind,
+} from '../../analyzer/retrieval-evidence.js';
 
 // ============================================================================
 // INSERTION POINT HELPERS
@@ -132,50 +148,135 @@ export function compositeScore(semanticRelevance: number, role: InsertionRole): 
  * - callers / callees from the call graph (graph-first context)
  * - linkedSpecs from mapping.json (bidirectional code↔spec linking)
  */
+/**
+ * Query the literal-text line index and shape the response. Returns the result
+ * object, or — in `text_fallback` mode only — `null` when the index is absent or
+ * yields no matches, so the caller can fall through to its normal empty
+ * response. In forced `text` mode it always returns an object.
+ */
+interface TextSearchPayload {
+  query: string;
+  searchMode: 'text' | 'text_fallback';
+  retrievalMode: 'keyword' | 'keyword+vocabulary';
+  count: number;
+  results: Array<{
+    filePath: string;
+    line: number;
+    text: string;
+    score: number;
+    scoreKind: 'bm25';
+    kind: 'text';
+    matchEvidence: import('../../analyzer/retrieval-evidence.js').MatchEvidence;
+    expansionTerms?: string[];
+    provenance: AnalysisContentProvenance;
+  }>;
+  note?: string;
+}
+
+async function searchTextLines(
+  outputDir: string,
+  query: string,
+  limit: number,
+  searchMode: 'text' | 'text_fallback',
+  provenance: AnalysisContentProvenance,
+  vocabularyExpansion = true,
+): Promise<TextSearchPayload | null> {
+  const { TextLineIndex } = await import('../../analyzer/text-line-index.js');
+  const { servedRetrievalMode } = await import('../../analyzer/embedder.js');
+  const retrievalMode = servedRetrievalMode(null, outputDir, 'code', vocabularyExpansion) as 'keyword' | 'keyword+vocabulary';
+  if (!TextLineIndex.exists(outputDir)) {
+    return searchMode === 'text'
+      ? { query, searchMode, retrievalMode, count: 0, results: [], note: 'No text line index found. Run "openlore analyze".' }
+      : null;
+  }
+  const hits = await TextLineIndex.searchText(outputDir, query, {
+    limit: Math.max(1, Math.min(limit, 100)),
+    vocabularyExpansion,
+  });
+  if (hits.length === 0 && searchMode === 'text_fallback') return null;
+  return {
+    query,
+    searchMode,
+    retrievalMode,
+    ...(searchMode === 'text_fallback'
+      ? { note: 'No code symbols matched; these are literal-text matches from markup/text files.' }
+      : {}),
+    count: hits.length,
+    results: hits.map((h) => ({
+      filePath: h.filePath,
+      line: h.lineNumber,
+      text: h.text,
+      score: h.score,
+      scoreKind: 'bm25' as const,
+      kind: 'text' as const,
+      matchEvidence: h.matchEvidence,
+      ...(h.expansionTerms?.length ? { expansionTerms: h.expansionTerms } : {}),
+      provenance,
+    })),
+  };
+}
+
 export async function handleSearchCode(
   directory: string,
   query: string,
   limit = 10,
   language?: string,
-  minFanIn?: number
+  minFanIn?: number,
+  tokenBudget?: number,
+  mode?: 'text',
+  /** What the caller is asking. Declared, never inferred from the query's wording. */
+  questionKind: QuestionKind = 'where-is',
 ): Promise<unknown> {
+  const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
+  const analysisProvenance = await readAnalysisContentProvenance(absDir);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
+  const { embedderMode, resolveEmbedder, servedRetrievalMode, isKeywordRetrievalMode } = await import('../../analyzer/embedder.js');
+  const cfg = await readOpenLoreConfig(absDir);
+  const vocabularyExpansion = cfg?.retrieval?.vocabularyExpansion !== false;
+
+  // Forced literal-text mode: query the separate line index directly, bypassing
+  // symbol search. Use when hunting a literal string (UI copy, error text).
+  if (mode === 'text') {
+    const [result, freshnessCtx] = await Promise.all([
+      searchTextLines(outputDir, query, limit, 'text', analysisProvenance, vocabularyExpansion),
+      readCachedContext(absDir),
+    ]);
+    return result
+      ? withIndexStaleness(absDir, result, freshnessCtx, result.results.map(hit => hit.filePath))
+      : result;
+  }
 
   if (!VectorIndex.exists(outputDir)) {
     return {
-      error:
-        'No vector index found. Run "spec-gen analyze --embed" first, ' +
-        'then configure EMBED_BASE_URL and EMBED_MODEL.',
+      ...notReadyResult('No search index found. Run "openlore analyze" first.', 'index-absent'),
+      hint: 'Plain "openlore analyze" builds a keyword (BM25) index; add EMBED_BASE_URL/EMBED_MODEL for semantic search.',
     };
   }
 
-  // Resolve embedding service — fall back to BM25-only search if unavailable
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  let searchMode = 'hybrid';
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readSpecGenConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    } else {
-      searchMode = 'bm25_fallback';
-    }
-  }
+  // Resolve the active embedder (env → local provider → remote config); null is
+  // the first-class keyword default. retrievalMode is the honest, served mode.
+  const embedSvc = await resolveEmbedder(cfg);
+  let retrievalMode = servedRetrievalMode(embedSvc, outputDir, 'code', vocabularyExpansion);
 
   limit = Math.max(1, Math.min(limit, 100));
-  const { readCachedContext } = await import('./utils.js');
   const [results, mappingIdx, llmCtx] = await Promise.all([
-    VectorIndex.search(outputDir, query, embedSvc, { limit, language, minFanIn }),
+    VectorIndex.search(outputDir, query, embedSvc, {
+      limit,
+      language,
+      minFanIn,
+      vocabularyExpansion,
+      onRetrievalMode: mode => {
+        retrievalMode = mode === 'semantic' ? embedderMode(embedSvc) : mode;
+      },
+    }),
     loadMappingIndex(absDir),
     readCachedContext(absDir),
   ]);
-
+  const searchMode = isKeywordRetrievalMode(retrievalMode) ? 'bm25_fallback' : 'hybrid';
+  const indexDegraded = VectorIndex.degradationNotice?.(outputDir) ?? null;
   type Neighbour = { name: string; filePath: string };
 
   // ── RIG-20: cross-graph spec traversal — seed → spec domains → peer functions ──
@@ -200,19 +301,18 @@ export async function handleSearchCode(
     }
   }
 
-  return {
-    query,
-    searchMode,
-    ...(searchMode === 'bm25_fallback'
-      ? {
-          note: 'Embedding server unavailable — results based on keyword matching only. Configure EMBED_BASE_URL + EMBED_MODEL for semantic search.',
-        }
-      : {}),
-    count: results.length,
-    results: results.map((r) => ({
+  const allResults = results.map((r) => {
+    const startLine = getCachedNodeStartLine(llmCtx, r.record.id);
+    return {
       score: r.score,
+      scoreKind: r.scoreKind ?? (isKeywordRetrievalMode(retrievalMode) ? 'bm25' : 'rrf'),
+      matchEvidence: requireMatchEvidence(r.matchEvidence),
+      ...(r.expansionTerms?.length ? { expansionTerms: r.expansionTerms } : {}),
       name: r.record.name,
       filePath: r.record.filePath,
+      ...(startLine !== undefined ? { startLine } : {}),
+      // Exact expansion handle (Spec 25 P2): get_function_body(directory, filePath, name).
+      expand: expandHandle(r.record.name, r.record.filePath),
       className: r.record.className || undefined,
       language: r.record.language,
       signature: r.record.signature || undefined,
@@ -221,6 +321,7 @@ export async function handleSearchCode(
       fanOut: r.record.fanOut,
       isHub: r.record.isHub,
       isEntryPoint: r.record.isEntryPoint,
+      provenance: analysisProvenance,
       linkedSpecs: mappingIdx ? specsForFile(mappingIdx, r.record.filePath) : undefined,
       callers: llmCtx?.edgeStore
         ? llmCtx.edgeStore.getCallers(r.record.id)
@@ -232,9 +333,98 @@ export async function handleSearchCode(
             .map(e => { const n = llmCtx!.edgeStore!.getNode(e.calleeId); return n && !n.isExternal ? { name: n.name, filePath: n.filePath } : null; })
             .filter((x): x is Neighbour => x !== null)
         : undefined,
-    })),
+    };
+  });
+
+  // Progressive disclosure (Spec 25 P2–P4): default returns all hits; with a
+  // tokenBudget, collapse exact duplicates then greedily keep the highest-scored
+  // hits that fit. Every hit carries an `expand` handle for get_function_body.
+  // A ranked list of incidental matches is shaped exactly like an answer. The verdict
+  // says which one this is, folded from the evidence each result already carries
+  // (spec `mcp-quality` NoFalseCoverage).
+  const citedStaleness = await computeIndexStaleness(absDir, { results: allResults }, llmCtx);
+  // A zero-hit index has no citation from which the normal freshness check can
+  // discover a newly written symbol. Inspect only bounded Git changes in that case.
+  const dirty = allResults.length === 0 ? await dirtySourcePaths(absDir) : [];
+  const dirtyStaleness = dirty.length > 0
+    ? await computeIndexStaleness(absDir, null, llmCtx, dirty)
+    : undefined;
+  const staleFiles = [...new Set([
+    ...(citedStaleness?.staleFiles ?? []),
+    ...(dirtyStaleness?.staleFiles ?? []),
+  ])];
+  const overlaid = await overlayResults(absDir, query, allResults, staleFiles);
+  const verdict = overlaid.additions.length > 0
+    ? 'covered'
+    : coverageVerdict(overlaid.results.map(r => r.matchEvidence));
+
+  // Static markup and literal strings may have no extracted symbol. Try the text
+  // index only after the working tree has had a chance to supply a new one.
+  if (results.length === 0 && overlaid.additions.length === 0) {
+    try {
+      const textFallback = await searchTextLines(
+        outputDir, query, limit, 'text_fallback', analysisProvenance, vocabularyExpansion,
+      );
+      if (textFallback) {
+        return withIndexStaleness(absDir, {
+          ...textFallback,
+          ...(indexDegraded ? { indexDegraded } : {}),
+        }, llmCtx, textFallback.results.map(hit => hit.filePath));
+      }
+    } catch { /* text index unavailable: return the symbol answer below */ }
+  }
+  if (verdict === 'uncovered') {
+    return withIndexStaleness(absDir, {
+      query,
+      searchMode,
+      retrievalMode,
+      coverage: coverageDisclosure(verdict, questionKind),
+      ...(isKeywordRetrievalMode(retrievalMode)
+        ? {
+            note: 'Keyword (BM25) search — the zero-config default. For semantic ranking, run "openlore embed --local" (on-device, no API key) or set EMBED_* for a remote endpoint.',
+          }
+        : {}),
+      count: 0,
+      // No ranked list: withholding it IS the abstention. `explain_retrieval_miss`
+      // answers which field would have had to match.
+      results: [],
+      ...(overlaid.disclosure ? { workingTreeOverlay: overlaid.disclosure } : {}),
+      ...(overlaid.removed.length > 0 ? { removedInWorkingTree: overlaid.removed } : {}),
+      nextStep: 'explain_retrieval_miss(directory, query, target) names why an expected symbol did not come back.',
+      ...(indexDegraded ? { indexDegraded } : {}),
+    }, llmCtx);
+  }
+
+  const budgetedRows = tokenBudget
+    ? applyTokenBudget(collapseExactDuplicates(overlaid.results), tokenBudget)
+    : { kept: overlaid.results, omitted: 0 };
+
+  const result = {
+    query,
+    searchMode,
+    retrievalMode,
+    coverage: verdict === 'covered'
+      ? { verdict, questionKind }
+      : coverageDisclosure(verdict, questionKind),
+    ...(isKeywordRetrievalMode(retrievalMode)
+      ? {
+          note: 'Keyword (BM25) search — the zero-config default. For semantic ranking, run "openlore embed --local" (on-device, no API key) or set EMBED_* for a remote endpoint.',
+        }
+      : {}),
+    count: budgetedRows.kept.length,
+    results: budgetedRows.kept,
+    ...(budgetedRows.omitted > 0
+      ? { resultsOmitted: omissionNote(budgetedRows.omitted, 'raise tokenBudget or narrow the query') }
+      : {}),
+    // Symbols the index has never seen, read from the working tree. Unranked on purpose:
+    // a fabricated score would be worse than none.
+    ...(overlaid.additions.length > 0 ? { workingTreeAdditions: overlaid.additions } : {}),
+    ...(overlaid.removed.length > 0 ? { removedInWorkingTree: overlaid.removed } : {}),
+    ...(overlaid.disclosure ? { workingTreeOverlay: overlaid.disclosure } : {}),
     ...(specPeers.length > 0 ? { specLinkedFunctions: specPeers } : {}),
+    ...(indexDegraded ? { indexDegraded } : {}),
   };
+  return withIndexStaleness(absDir, result, llmCtx);
 }
 
 /**
@@ -246,47 +436,63 @@ export async function handleSuggestInsertionPoints(
   limit = 5,
   language?: string
 ): Promise<unknown> {
+  const tooLong = queryTooLongError(description, 'description'); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
 
   const { VectorIndex } = await import('../../analyzer/vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
+  const { resolveEmbedder } = await import('../../analyzer/embedder.js');
 
   if (!VectorIndex.exists(outputDir)) {
     return {
-      error:
-        'No vector index found. Run "spec-gen analyze --embed" first, ' +
-        'then configure EMBED_BASE_URL and EMBED_MODEL.',
+      ...notReadyResult('No search index found. Run "openlore analyze" first.', 'index-absent'),
+      hint: 'Plain "openlore analyze" builds a keyword (BM25) index; add EMBED_BASE_URL/EMBED_MODEL for semantic search.',
     };
   }
 
-  let embedSvc: InstanceType<typeof EmbeddingService>;
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readSpecGenConfig(absDir);
-    if (!cfg) {
-      return {
-        error:
-          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, or add an "embedding" section to .spec-gen/config.json.',
-      };
-    }
-    const svcFromConfig = EmbeddingService.fromConfig(cfg);
-    if (!svcFromConfig) {
-      return {
-        error:
-          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, or add an "embedding" section to .spec-gen/config.json.',
-      };
-    }
-    embedSvc = svcFromConfig;
-  }
+  // Resolve the active embedder (env → local provider → remote config); null
+  // triggers the first-class BM25 path in VectorIndex.search().
+  const cfg = await readOpenLoreConfig(absDir);
+  const embedSvc = await resolveEmbedder(cfg);
 
   limit = Math.max(1, Math.min(limit, 20));
   const { readCachedContext } = await import('./utils.js');
   const [rawResults, llmCtx] = await Promise.all([
-    VectorIndex.search(outputDir, description, embedSvc, { limit: limit * 4, language }),
+    VectorIndex.search(outputDir, description, embedSvc, {
+      limit: limit * 4,
+      language,
+      vocabularyExpansion: cfg?.retrieval?.vocabularyExpansion !== false,
+    }),
     readCachedContext(absDir),
   ]);
+  const indexDegraded = VectorIndex.degradationNotice?.(outputDir) ?? null;
+
+  // A wrong insertion point costs more than no insertion point: it sends an agent to
+  // edit a function that has nothing to do with the task, with the product's confidence
+  // behind it. That is what happened on 2026-09-20 — a new step was recommended inside
+  // `restartServer` for a spinner bug it had no part in (spec `mcp-handlers`
+  // InsertionPointsAbstainWhenRetrievalIsUncovered).
+  // Judge only on evidence actually present. A retriever that supplied none is a case
+  // where coverage CANNOT be judged — abstaining there would suppress real answers on
+  // the strength of a missing field, which is its own dishonesty.
+  const insertionEvidence = rawResults.map(r => r.matchEvidence).filter((e): e is NonNullable<typeof e> => e !== undefined);
+  const evidenceComplete = insertionEvidence.length === rawResults.length;
+  const retrievalVerdict = evidenceComplete ? coverageVerdict(insertionEvidence) : 'covered';
+  if (retrievalVerdict === 'uncovered') {
+    return withIndexStaleness(absDir, {
+      description,
+      coverage: coverageDisclosure(retrievalVerdict, 'where-is'),
+      count: 0,
+      // Same key as the answering shape, so a consumer reading `candidates` sees an
+      // empty list with a reason rather than a missing field.
+      candidates: [],
+      nextSteps: [
+        'No candidates: nothing in the index matched this description beyond noise.',
+        'Name an existing symbol or file this feature touches, or run "openlore analyze" if the index predates it.',
+      ],
+      ...(indexDegraded ? { indexDegraded } : {}),
+    }, llmCtx);
+  }
 
   // Normalise search scores to [0, 1] for compositeScore (scores are RRF/BM25: higher = better)
   const maxScore = rawResults.length > 0 ? Math.max(...rawResults.map((r) => r.score)) : 1;
@@ -337,12 +543,16 @@ export async function handleSuggestInsertionPoints(
 
         const role = classifyRole(callerNode.fanIn, callerNode.fanOut, false, false);
         const strategy = deriveStrategy(role);
-        // Graph-expanded candidates score slightly lower than the semantic seed
-        const score = compositeScore(seedResult.score + 0.15, role) * 0.85;
+        // Graph-expanded candidates score slightly lower than the semantic seed.
+        // Use the NORMALISED seed score so this is on the same scale as the seed
+        // candidates above (raw RRF scores top out ~0.03, which would otherwise
+        // rank every expanded node below — and report a misleading semanticScore).
+        const expandedSemantic = normalise(seedResult.score) + 0.15;
+        const score = compositeScore(expandedSemantic, role) * 0.85;
         candidates.push({
           rank: 0,
           score,
-          semanticScore: seedResult.score + 0.15,
+          semanticScore: expandedSemantic,
           name: callerNode.name,
           filePath: callerNode.filePath,
           className: callerNode.className,
@@ -362,35 +572,79 @@ export async function handleSuggestInsertionPoints(
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  const top = candidates.slice(0, limit).map((c, i) => ({ ...c, rank: i + 1 }));
+  const ranked = candidates.slice(0, limit).map((c, i) => ({ ...c, rank: i + 1 }));
+
+  // On weak evidence the LOCATIONS are still worth inspecting, but the advice built on
+  // them is not: naming a place is information, telling an agent how to edit it is a
+  // recommendation, and a recommendation resting on incidental matches is what put a new
+  // step inside an unrelated function on 2026-09-20 (spec `mcp-handlers`
+  // InsertionPointsWithholdRecommendationWithoutStrongEvidence).
+  const advisory = retrievalVerdict === 'covered';
+  const top = advisory
+    ? ranked
+    : ranked.map(({ insertionStrategy: _withheld, ...rest }) => rest);
 
   return {
     description,
+    coverage: advisory
+      ? { verdict: retrievalVerdict, questionKind: 'where-is' as const }
+      : coverageDisclosure(retrievalVerdict, 'where-is'),
     count: top.length,
     candidates: top,
-    nextSteps:
-      top.length > 0
-        ? [
-            `Run get_function_skeleton on "${top[0].filePath}" to see the internal structure of ${top[0].name}`,
-            `Run get_subgraph on "${top[0].name}" to understand its call neighborhood`,
-            `After implementing, run check_spec_drift to verify the code matches the spec`,
-          ]
-        : [
-            'No candidates found. Try a broader description or run "spec-gen analyze --embed" to build the index.',
-          ],
+    ...(indexDegraded ? { indexDegraded } : {}),
+    ...(advisory
+      ? {
+          nextSteps:
+            top.length > 0
+              ? [
+                  `Run get_function_skeleton on "${ranked[0].filePath}" to see the internal structure of ${ranked[0].name}`,
+                  `Run get_subgraph on "${ranked[0].name}" to understand its call neighborhood`,
+                  `After implementing, run check_spec_drift to verify the code matches the spec`,
+                ]
+              : [
+                  'No candidates found. Try a broader description or run "openlore analyze --embed" to build the index.',
+                ],
+        }
+      : {}),
   };
 }
 
 /**
  * Return the full content of a spec domain's spec.md plus its mapping entries.
  */
+/**
+ * The spec root this project actually uses, normalized.
+ *
+ * A repo that moved `openspec/` would otherwise have every spec resolved to a
+ * path that does not exist — `get_spec` reporting not-found for files plainly on
+ * disk, and `list_spec_domains` answering with an empty list.
+ */
+async function configuredSpecRoot(absDir: string): Promise<{ absolute: string; relative: string }> {
+  const configured = (await readOpenLoreConfig(absDir).catch(() => null))?.openspecPath ?? OPENSPEC_DIR;
+  const absolute = resolveOpenspecDir(absDir, configured);
+  const relativePath = relative(absDir, absolute).replaceAll('\\', '/');
+  return { absolute, relative: relativePath || '.' };
+}
+
 export async function handleGetSpec(directory: string, domain: string): Promise<unknown> {
   const { existsSync } = await import('node:fs');
   const { readFile } = await import('node:fs/promises');
   const { join: pjoin } = await import('node:path');
   const absDir = await validateDirectory(directory);
 
-  const specFile = pjoin(absDir, 'openspec', 'specs', domain, 'spec.md');
+  const openspecRoot = await configuredSpecRoot(absDir);
+  const specsRoot = pjoin(openspecRoot.absolute, OPENSPEC_SPECS_SUBDIR);
+
+  // `domain` is an untrusted tool arg; confine it to the repo so e.g.
+  // domain="../../../../etc" can't escape to read arbitrary spec.md files.
+  let specFile: string;
+  try {
+    specFile = safeJoin(specsRoot, pjoin(domain, 'spec.md'));
+  } catch {
+    return {
+      error: `No spec found for domain "${domain}". Run list_spec_domains to see available domains.`,
+    };
+  }
   if (!existsSync(specFile)) {
     return {
       error: `No spec found for domain "${domain}". Run list_spec_domains to see available domains.`,
@@ -403,28 +657,47 @@ export async function handleGetSpec(directory: string, domain: string): Promise<
   ]);
   const linkedFunctions = mappingIdx ? functionsForDomain(mappingIdx, domain) : undefined;
 
+  // Both the reported path and the provenance must name the file actually read.
+  // Querying git about `openspec/...` while serving a relocated spec would report
+  // a clean, unrelated path — a modified spec could then be served as reviewed.
+  const relativeSpecFile = [
+    ...(openspecRoot.relative === '.' ? [] : [openspecRoot.relative]),
+    OPENSPEC_SPECS_SUBDIR,
+    domain,
+    'spec.md',
+  ].join('/');
   return {
     domain,
-    specFile: `openspec/specs/${domain}/spec.md`,
+    specFile: relativeSpecFile,
     content,
+    provenance: await reviewedFileContentProvenance(absDir, relativeSpecFile),
     linkedFunctions,
   };
 }
 
 /**
- * List all spec domains available in the project (reads openspec/specs/ directory).
+ * List all spec domains available in the project (reads the configured specs directory).
  * Useful for the agent to discover what domains exist before doing a targeted search.
+ *
+ * Honors the configured spec root for the same reason `handleGetSpec` does, and
+ * because that handler's not-found error sends the agent here: a relocated corpus
+ * would otherwise answer with an empty list of domains `get_spec` opens happily.
  */
 export async function handleListSpecDomains(directory: string): Promise<unknown> {
   const { readdir } = await import('node:fs/promises');
   const { join: pjoin } = await import('node:path');
   const absDir = await validateDirectory(directory);
 
-  const specsDir = pjoin(absDir, OPENSPEC_DIR, OPENSPEC_SPECS_SUBDIR);
+  const openspecRoot = await configuredSpecRoot(absDir);
+  const specsDir = pjoin(openspecRoot.absolute, OPENSPEC_SPECS_SUBDIR);
+  const relativeSpecsDir = [
+    ...(openspecRoot.relative === '.' ? [] : [openspecRoot.relative]),
+    OPENSPEC_SPECS_SUBDIR,
+  ].join('/');
   if (!(await fileExists(specsDir))) {
     return {
       domains: [],
-      note: 'No openspec/specs/ directory found. Run "spec-gen generate" first.',
+      note: `No ${relativeSpecsDir}/ directory found. Run "openlore generate" first.`,
     };
   }
 
@@ -439,12 +712,16 @@ export async function handleListSpecDomains(directory: string): Promise<unknown>
     entries.map((e) => fileExists(pjoin(specsDir, e, 'spec.md')))
   );
   const domains = entries.filter((_, i) => domainChecks[i]);
-  return { domains, count: domains.length };
+  return {
+    domains,
+    count: domains.length,
+    provenance: await reviewedFileContentProvenance(absDir, relativeSpecsDir),
+  };
 }
 
 /**
- * Semantic search over the spec index built by "spec-gen analyze --embed"
- * or "spec-gen analyze --reindex-specs".
+ * Semantic search over the spec index built by "openlore analyze --embed"
+ * or "openlore analyze --reindex-specs".
  */
 export async function handleSearchSpecs(
   directory: string,
@@ -453,60 +730,102 @@ export async function handleSearchSpecs(
   domain?: string,
   section?: string
 ): Promise<unknown> {
+  const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
 
   const { SpecVectorIndex } = await import('../../analyzer/spec-vector-index.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
+  const { resolveEmbedder, embedderMode, isKeywordRetrievalMode } = await import('../../analyzer/embedder.js');
 
   if (!SpecVectorIndex.exists(outputDir)) {
     return {
-      error:
-        'No spec index found. Run "spec-gen analyze --embed" or "spec-gen analyze --reindex-specs" first, ' +
-        'then configure EMBED_BASE_URL and EMBED_MODEL.',
+      error: 'No spec index found. Run "openlore analyze" first.',
+      hint: 'Plain "openlore analyze" builds a keyword (BM25) spec index; configure EMBED_* for semantic spec search.',
     };
   }
 
-  let embedSvc: InstanceType<typeof EmbeddingService>;
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readSpecGenConfig(absDir);
-    if (!cfg) {
-      return {
-        error:
-          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, or add an "embedding" section to .spec-gen/config.json.',
-      };
-    }
-    const svcFromConfig = EmbeddingService.fromConfig(cfg);
-    if (!svcFromConfig) {
-      return {
-        error:
-          'No embedding configuration found. Set EMBED_BASE_URL and EMBED_MODEL env vars, or add an "embedding" section to .spec-gen/config.json.',
-      };
-    }
-    embedSvc = svcFromConfig;
-  }
+  // Resolve the active embedder (env → local provider → remote config); null is
+  // the first-class keyword default for spec search.
+  const cfg = await readOpenLoreConfig(absDir);
+  const embedSvc = await resolveEmbedder(cfg);
+  const vocabularyExpansion = cfg?.retrieval?.vocabularyExpansion !== false;
+  const semanticRetrievalMode = embedderMode(embedSvc);
 
   limit = Math.max(1, Math.min(limit, 50));
-  const [results, mappingIdx] = await Promise.all([
-    SpecVectorIndex.search(outputDir, query, embedSvc, { limit, domain, section }),
+  const [searchSnapshot, mappingIdx] = await Promise.all([
+    typeof SpecVectorIndex.searchWithFreshness === 'function'
+      ? SpecVectorIndex.searchWithFreshness(outputDir, query, embedSvc, { limit, domain, section, vocabularyExpansion })
+      : SpecVectorIndex.search(outputDir, query, embedSvc, { limit, domain, section, vocabularyExpansion }).then(async results => ({
+        results,
+        retrievalMode: results.length > 0 && results.every(result => result.scoreKind === 'bm25')
+          ? 'keyword' as const
+          : 'semantic' as const,
+        // Optional guard keeps legacy injected test doubles compatible.
+        indexFreshness: typeof SpecVectorIndex.freshness === 'function'
+          ? await SpecVectorIndex.freshness(outputDir)
+          : null,
+      })),
     loadMappingIndex(absDir),
   ]);
+  const { results, indexFreshness, retrievalMode: snapshotRetrievalMode } = searchSnapshot;
+  const retrievalMode = isKeywordRetrievalMode(snapshotRetrievalMode)
+    ? snapshotRetrievalMode
+    : semanticRetrievalMode;
+  const searchMode = isKeywordRetrievalMode(retrievalMode) ? 'bm25_fallback' : 'hybrid';
+  const servedResults = await Promise.all(results.map(async (r) => ({
+    score: r.score,
+    scoreKind: r.scoreKind ?? (isKeywordRetrievalMode(retrievalMode) ? 'bm25' : 'cosine_distance'),
+    matchEvidence: requireMatchEvidence(r.matchEvidence),
+    ...(r.expansionTerms?.length ? { expansionTerms: r.expansionTerms } : {}),
+    id: r.record.id,
+    domain: r.record.domain,
+    section: r.record.section,
+    title: r.record.title,
+    text: r.record.text,
+    provenance: await indexedSpecContentProvenance(
+      absDir,
+      `openspec/specs/${r.record.domain}/spec.md`,
+      [r.record.title, r.record.text, ...r.record.linkedFiles],
+    ),
+    linkedFiles: r.record.linkedFiles,
+    linkedFunctions: mappingIdx ? functionsForDomain(mappingIdx, r.record.domain) : undefined,
+  })));
+
+  const verdict = coverageVerdict(servedResults.map(r => r.matchEvidence));
+  if (verdict === 'uncovered') {
+    return {
+      query,
+      searchMode,
+      retrievalMode,
+      coverage: coverageDisclosure(verdict, 'why-decided'),
+      // The keyword-mode note is an independent disclosure, and an uncovered result is
+      // exactly when it matters: semantic ranking may be the reason nothing matched.
+      ...(isKeywordRetrievalMode(retrievalMode)
+        ? {
+            note: 'Keyword (BM25) spec search — the zero-config default. For semantic ranking, run "openlore embed --local" (on-device, no API key) or set EMBED_* for a remote endpoint.',
+          }
+        : {}),
+      count: 0,
+      results: [],
+      ...(indexFreshness ? { indexFreshness } : {}),
+    };
+  }
 
   return {
     query,
-    count: results.length,
-    results: results.map((r) => ({
-      score: r.score,
-      id: r.record.id,
-      domain: r.record.domain,
-      section: r.record.section,
-      title: r.record.title,
-      text: r.record.text,
-      linkedFiles: r.record.linkedFiles,
-      linkedFunctions: mappingIdx ? functionsForDomain(mappingIdx, r.record.domain) : undefined,
-    })),
+    searchMode,
+    retrievalMode,
+    coverage: verdict === 'covered'
+      ? { verdict, questionKind: 'why-decided' as const }
+      : coverageDisclosure(verdict, 'why-decided'),
+    ...(isKeywordRetrievalMode(retrievalMode)
+      ? {
+          note: 'Keyword (BM25) spec search — the zero-config default. For semantic ranking, run "openlore embed --local" (on-device, no API key) or set EMBED_* for a remote endpoint.',
+        }
+      : {}),
+    count: servedResults.length,
+    results: servedResults,
+    ...(indexFreshness ? { indexFreshness } : {}),
   };
 }
 
@@ -521,32 +840,25 @@ export async function handleUnifiedSearch(
   domain?: string,
   section?: string
 ): Promise<unknown> {
+  const tooLong = queryTooLongError(query); if (tooLong) return tooLong;
   const absDir = await validateDirectory(directory);
-  const outputDir = join(absDir, SPEC_GEN_DIR, SPEC_GEN_ANALYSIS_SUBDIR);
+  const outputDir = join(absDir, OPENLORE_DIR, OPENLORE_ANALYSIS_SUBDIR);
 
   const { UnifiedSearch, unifiedSearchAvailable } =
     await import('../../analyzer/unified-search.js');
-  const { EmbeddingService } = await import('../../analyzer/embedding-service.js');
+  const { resolveEmbedder } = await import('../../analyzer/embedder.js');
 
   if (!(await unifiedSearchAvailable(outputDir))) {
     return {
       error:
-        'No unified search available. Run "spec-gen analyze --embed" first, ' +
+        'No unified search available. Run "openlore analyze --embed" first, ' +
         'then configure EMBED_BASE_URL and EMBED_MODEL.',
     };
   }
 
-  // Resolve embedding service
-  let embedSvc: InstanceType<typeof EmbeddingService> | null = null;
-  try {
-    embedSvc = EmbeddingService.fromEnv();
-  } catch {
-    const cfg = await readSpecGenConfig(absDir);
-    const svcFromConfig = cfg ? EmbeddingService.fromConfig(cfg) : null;
-    if (svcFromConfig) {
-      embedSvc = svcFromConfig;
-    }
-  }
+  // Resolve the active embedder (env → local provider → remote config).
+  const cfg = await readOpenLoreConfig(absDir);
+  const embedSvc = await resolveEmbedder(cfg);
 
   limit = Math.max(1, Math.min(limit, 50));
   const results = await UnifiedSearch.unifiedSearch(outputDir, query, embedSvc, {
@@ -554,12 +866,23 @@ export async function handleUnifiedSearch(
     language,
     domain,
     section,
+    vocabularyExpansion: cfg?.retrieval?.vocabularyExpansion !== false,
   });
+  const analysisProvenance = await readAnalysisContentProvenance(absDir);
+  const servedResults = await Promise.all(results.map(async result => ({
+    ...result,
+    provenance: result.source.domain
+      ? await indexedSpecContentProvenance(
+          absDir,
+          `openspec/specs/${result.source.domain}/spec.md`,
+          [result.source.section, result.source.title].filter((value): value is string => Boolean(value)),
+        )
+      : analysisProvenance,
+  })));
 
   return {
     query,
-    count: results.length,
-    results,
+    count: servedResults.length,
+    results: servedResults,
   };
 }
-

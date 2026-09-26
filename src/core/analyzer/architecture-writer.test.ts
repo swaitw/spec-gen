@@ -8,6 +8,9 @@
  *   - writeArchitectureMd (async file writer)
  */
 
+import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   inferClusterRole,
@@ -24,9 +27,9 @@ import type { SerializedCallGraph, FunctionNode, LayerViolation } from './call-g
 // MOCKS
 // ============================================================================
 
-vi.mock('node:fs/promises', () => ({
-  writeFile: vi.fn().mockResolvedValue(undefined),
-}));
+// `node:fs/promises` is deliberately NOT mocked: the writer publishes through the confined atomic
+// writer (O_NOFOLLOW temp + rename), and a stubbed `writeFile` would assert a mechanism the code
+// no longer uses — including the symlink refusal below, which only a real filesystem can show.
 
 // ============================================================================
 // FIXTURES
@@ -467,27 +470,35 @@ describe('writeArchitectureMd', () => {
     vi.clearAllMocks();
   });
 
-  it('writes ARCHITECTURE.md to rootPath and returns the path', async () => {
-    const { writeFile } = await import('node:fs/promises');
-    const overview = makeOverview();
-    const result = await writeArchitectureMd('/my/project', overview);
+  it('writes ARCHITECTURE.md into the given output dir and returns the path', async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), 'arch-writer-'));
+    const result = await writeArchitectureMd(outputDir, makeOverview());
 
-    expect(result).toBe('/my/project/ARCHITECTURE.md');
-    expect(writeFile).toHaveBeenCalledWith(
-      '/my/project/ARCHITECTURE.md',
-      expect.stringContaining('# Architecture Overview'),
-      'utf-8',
-    );
+    // A real filesystem path, so the NATIVE separator is the correct output — the
+    // expectation is built the same way rather than hard-coding the POSIX form.
+    expect(result).toBe(join(outputDir, 'ARCHITECTURE.md'));
+    expect(await readFile(result, 'utf-8')).toContain('# Architecture Overview');
   });
 
   it('writes rendered markdown content', async () => {
-    const { writeFile } = await import('node:fs/promises');
+    const outputDir = await mkdtemp(join(tmpdir(), 'arch-writer-'));
     const overview = makeOverview({
       summary: { totalFiles: 7, totalClusters: 1, totalEdges: 2, cycles: 0, layerViolations: 0 },
     });
-    await writeArchitectureMd('/root', overview);
+    const result = await writeArchitectureMd(outputDir, overview);
 
-    const [, content] = (writeFile as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(content).toContain('| Files | 7 |');
+    expect(await readFile(result, 'utf-8')).toContain('| Files | 7 |');
+  });
+
+  it('refuses to write through a symlink at ARCHITECTURE.md', async () => {
+    // A hostile repository can commit `.openlore/analysis/ARCHITECTURE.md -> ~/.claude/CLAUDE.md`.
+    // The plain `writeFile` this used to do followed it.
+    const outputDir = await mkdtemp(join(tmpdir(), 'arch-writer-'));
+    const victim = join(outputDir, 'victim.md');
+    await writeFile(victim, 'ORIGINAL\n', 'utf-8');
+    await symlink(victim, join(outputDir, 'ARCHITECTURE.md'));
+
+    await expect(writeArchitectureMd(outputDir, makeOverview())).rejects.toThrow(/not a regular file/);
+    expect(await readFile(victim, 'utf-8')).toBe('ORIGINAL\n');
   });
 });

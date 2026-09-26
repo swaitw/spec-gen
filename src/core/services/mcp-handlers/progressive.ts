@@ -1,0 +1,149 @@
+/**
+ * Progressive-disclosure helpers (Spec 25 Phase C / P2–P5).
+ *
+ * OpenLore's answer to headroom's reversible compression: return the smallest
+ * sufficient structural fact plus an *exact* expansion handle, and let a caller
+ * fit the result to a token budget deterministically. Because our IDs are
+ * deterministic, expansion is exact (call `get_function_body(directory,
+ * filePath, name)`), never a fuzzy re-search.
+ */
+
+import { estimateTokens } from '../llm-service.js';
+
+/**
+ * Uniform expansion handle attached to every disclosable item: `name::filePath`.
+ * An agent expands exactly one body with `get_function_body` only if it needs
+ * the implementation — turning a would-be follow-up read into a cheap, optional,
+ * one-shot call instead of a blind re-search (the P2 contract).
+ */
+export function expandHandle(name: string, filePath: string): string {
+  return `${name}::${filePath}`;
+}
+
+export interface BudgetOutcome<T> {
+  kept: T[];
+  /** How many items were dropped to fit the budget (0 when none / no budget). */
+  omitted: number;
+}
+
+/**
+ * Greedily keep score-ordered items until `budget` tokens are exhausted (P4).
+ * Items are assumed already importance-ranked by the caller; at least one item
+ * is always kept so a tiny budget still yields a usable answer. Deterministic:
+ * same items + budget → same output (uses the char-based `estimateTokens`).
+ */
+export function applyTokenBudget<T>(items: T[], budget: number | undefined): BudgetOutcome<T> {
+  if (!budget || budget <= 0 || items.length === 0) return { kept: items, omitted: 0 };
+  const kept: T[] = [];
+  let used = 0;
+  for (const item of items) {
+    const cost = estimateTokens(JSON.stringify(item));
+    if (kept.length > 0 && used + cost > budget) break; // always keep ≥1
+    kept.push(item);
+    used += cost;
+  }
+  return { kept, omitted: items.length - kept.length };
+}
+
+/**
+ * Collapse *exact* duplicates — same name AND signature AND docstring — to one
+ * exemplar that lists the other locations in `duplicateOf` (P3, conservative).
+ * Requiring an exact triple match means two genuinely different functions that
+ * merely share a name are never merged; only true copies (generated code,
+ * vendored duplicates, re-exports) collapse. Order is preserved.
+ */
+export function collapseExactDuplicates<
+  T extends { name: string; filePath: string; signature?: string; docstring?: string },
+>(items: T[]): Array<T & { duplicateOf?: string[] }> {
+  const seen = new Map<string, T & { duplicateOf?: string[] }>();
+  const out: Array<T & { duplicateOf?: string[] }> = [];
+  for (const it of items) {
+    const key = `${it.name}\0${it.signature ?? ''}\0${it.docstring ?? ''}`;
+    const prev = seen.get(key);
+    if (prev) {
+      (prev.duplicateOf ??= []).push(it.filePath);
+    } else {
+      const copy = { ...it } as T & { duplicateOf?: string[] };
+      seen.set(key, copy);
+      out.push(copy);
+    }
+  }
+  return out;
+}
+
+/** The omission note appended when a token budget drops items (P4). */
+export function omissionNote(omitted: number, expandHint: string): string {
+  return `${omitted} more result(s) omitted to fit tokenBudget — ${expandHint}`;
+}
+
+// ===========================================================================
+// Response verbosity (change: refine-happy-path-and-defaults /
+// ConciseByDefaultDetailedOnRequest)
+// ===========================================================================
+//
+// A tool whose detailed output can exceed a concise summary accepts a
+// `responseFormat` parameter defaulting to `concise`, so the common call stays
+// cheap and an agent opts into the full payload only when it needs it. When a
+// concise (or otherwise bounded) result drops items, it carries a truncation
+// receipt — the omitted count and the exact narrower call to get the rest — so a
+// bound is never a silent cut.
+
+/** Output verbosity for a tool that supports a concise summary vs. the full payload. */
+export type ResponseFormat = 'concise' | 'detailed';
+
+/**
+ * Normalize an untrusted `responseFormat` argument to the concise-by-default
+ * contract. Anything other than the exact string `'detailed'` resolves to
+ * `'concise'` (the safe, cheap default), so a typo or a missing value never
+ * silently returns the large payload.
+ */
+export function normalizeResponseFormat(value: unknown): ResponseFormat {
+  return value === 'detailed' ? 'detailed' : 'concise';
+}
+
+/** A truncation receipt: how many items were withheld and how to get them. */
+export interface TruncationReceipt {
+  omitted: number;
+  detail: string;
+}
+
+/**
+ * Build a truncation receipt when a bounded result withholds items, or `null`
+ * when nothing was dropped (so callers can spread it conditionally). The `detail`
+ * names the exact narrower/fuller call to retrieve the rest.
+ */
+export function truncationReceipt(omitted: number, detail: string): TruncationReceipt | null {
+  return omitted > 0 ? { omitted, detail } : null;
+}
+
+/** How many items a concise list-inventory summary keeps before truncating. */
+export const CONCISE_INVENTORY_SAMPLE = 20;
+
+/**
+ * Summarize a uniform `{ cached, total, <listKey>: [...] }` inventory result for the
+ * concise/detailed contract. `detailed` returns the result unchanged; `concise`
+ * keeps `total` + the first `sampleSize` items + a truncation receipt naming the
+ * `detail` call for the rest. Fail-soft: a result whose `listKey` is not an array
+ * is returned unchanged (never drops an unexpected shape).
+ */
+export function summarizeListInventory(
+  result: Record<string, unknown>,
+  listKey: string,
+  format: ResponseFormat,
+  detail: string,
+  sampleSize: number = CONCISE_INVENTORY_SAMPLE,
+): Record<string, unknown> {
+  if (format === 'detailed') return result;
+  const list = result[listKey];
+  if (!Array.isArray(list)) return result;
+  const sample = list.slice(0, sampleSize);
+  const out: Record<string, unknown> = {
+    responseFormat: 'concise',
+    cached: result.cached,
+    total: typeof result.total === 'number' ? result.total : list.length,
+    [listKey]: sample,
+  };
+  const receipt = truncationReceipt(list.length - sample.length, detail);
+  if (receipt) out.truncation = receipt;
+  return out;
+}

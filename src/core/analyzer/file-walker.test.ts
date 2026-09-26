@@ -12,7 +12,7 @@ describe('FileWalker', () => {
   let testDir: string;
 
   beforeEach(async () => {
-    testDir = join(tmpdir(), `spec-gen-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    testDir = join(tmpdir(), `openlore-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     await mkdir(testDir, { recursive: true });
   });
 
@@ -41,6 +41,16 @@ describe('FileWalker', () => {
       expect(result.files).toHaveLength(2);
       expect(result.files.map((f) => f.path)).toContain('src/main.ts');
       expect(result.files.map((f) => f.path)).toContain('README.md');
+    });
+
+    it.skipIf(process.platform === 'win32')('preserves a literal POSIX backslash without colliding with a directory separator', async () => {
+      await mkdir(join(testDir, 'src', 'a'), { recursive: true });
+      await writeFile(join(testDir, 'src', 'a\\b.ts'), 'export const literal = 1;');
+      await writeFile(join(testDir, 'src', 'a', 'b.ts'), 'export const nested = 2;');
+
+      const result = await walkDirectory(testDir);
+
+      expect(result.files.map(file => file.path).sort()).toEqual(['src/a/b.ts', 'src/a\\b.ts']);
     });
 
     it('should collect correct file metadata', async () => {
@@ -118,10 +128,10 @@ describe('FileWalker', () => {
       expect(result.files[0].name).toBe('src.ts');
     });
 
-    it('should skip .spec-gen and openspec directories', async () => {
-      await mkdir(join(testDir, '.spec-gen'));
+    it('should skip .openlore and openspec directories', async () => {
+      await mkdir(join(testDir, '.openlore'));
       await mkdir(join(testDir, 'openspec', 'specs'), { recursive: true });
-      await writeFile(join(testDir, '.spec-gen', 'config.json'), '{}');
+      await writeFile(join(testDir, '.openlore', 'config.json'), '{}');
       await writeFile(join(testDir, 'openspec', 'specs', 'auth.md'), '');
       await writeFile(join(testDir, 'app.ts'), '');
 
@@ -179,6 +189,29 @@ describe('FileWalker', () => {
 
       expect(result.files).toHaveLength(1);
       expect(result.files[0].name).toBe('main.py');
+    });
+
+    // Issue #504: vector stores and datasets filled the fingerprint byte budget.
+    it('should skip binary data stores and model weights', async () => {
+      for (const name of ['t.parquet', 'a.arrow', 'x.npy', 'm.pkl', 'w.safetensors', 'db.sqlite', 'model.onnx']) {
+        await writeFile(join(testDir, name), '');
+      }
+      await mkdir(join(testDir, 'vectors.lance', '_versions'), { recursive: true });
+      await writeFile(join(testDir, 'vectors.lance', '_versions', '1.manifest'), '');
+      await writeFile(join(testDir, 'app.py'), '');
+
+      const result = await walkDirectory(testDir);
+
+      expect(result.files.map(f => f.name)).toEqual(['app.py']);
+    });
+
+    it('lets includePatterns force a skipped data file back in', async () => {
+      await writeFile(join(testDir, 'fixture.parquet'), '');
+      await writeFile(join(testDir, 'app.py'), '');
+
+      const result = await walkDirectory(testDir, { includePatterns: ['*.parquet'] });
+
+      expect(result.files.map(f => f.name).sort()).toEqual(['app.py', 'fixture.parquet']);
     });
 
     it('should skip minified files', async () => {
@@ -415,6 +448,22 @@ describe('FileWalker', () => {
       expect(result.summary.byDirectory['(root)']).toBe(1);
     });
 
+    it('counts a directory named __proto__ as an ordinary key without polluting Object.prototype', async () => {
+      // The directory/extension counters are keyed by repository-derived names. A directory
+      // literally named `__proto__` (or `constructor`) must be counted as a plain key and must
+      // never reach `Object.prototype` — the counters are Maps materialized to plain objects.
+      await mkdir(join(testDir, '__proto__'));
+      await writeFile(join(testDir, '__proto__', 'a.ts'), '');
+      await writeFile(join(testDir, '__proto__', 'b.ts'), '');
+
+      const result = await walkDirectory(testDir);
+
+      expect(result.summary.byDirectory['__proto__']).toBe(2);
+      // No global prototype pollution occurred.
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      expect(Object.prototype).not.toHaveProperty('a.ts');
+    });
+
     it('should track skipped files', async () => {
       await mkdir(join(testDir, 'node_modules'));
       await writeFile(join(testDir, 'node_modules', 'pkg.js'), '');
@@ -448,6 +497,19 @@ describe('FileWalker', () => {
       const meta = result.files.find(f => f.path === 'small.ts');
       expect(meta).toBeDefined();
       expect(meta!.lines).toBeGreaterThan(0);
+    });
+  });
+
+  describe('traversal resource bounds', () => {
+    it('fails closed before retaining more than the entry budget', async () => {
+      await Promise.all(Array.from({ length: 5 }, (_, index) => writeFile(join(testDir, `file-${index}.ts`), '')));
+      await expect(walkDirectory(testDir, { maxEntries: 4 })).rejects.toThrow(/entry budget exceeded/i);
+    });
+
+    it('fails closed when the directory depth budget is exceeded', async () => {
+      await mkdir(join(testDir, 'one', 'two'), { recursive: true });
+      await writeFile(join(testDir, 'one', 'two', 'deep.ts'), '');
+      await expect(walkDirectory(testDir, { maxDepth: 1 })).rejects.toThrow(/depth budget exceeded/i);
     });
   });
 });

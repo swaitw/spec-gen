@@ -1,0 +1,67 @@
+# OpenLore structural PR review — copy this file to `.github/workflows/openlore-review.yml`.
+#
+# Posts ONE sticky comment on each pull request with the deterministic structural
+# briefing (structural delta + blast radius). Advisory by default: it informs, it
+# never fails the check. To opt into gating, set `gate: 'true'` below and configure
+# `enforcement.policy` in `.openlore/config.json` (legacy `blastRadius.block` lowers
+# to the same policy). Gate mode covers blocking findings, new debt under `frozen`,
+# uninitialized or unverifiable frozen baselines, and invalid candidate config.
+#
+# Requirements: a full-history checkout (`fetch-depth: 0`) so the base..head range is
+# reachable, and write permission on pull-request comments.
+#
+# This example is deliberately non-runnable until the placeholder below is replaced
+# with a reviewed immutable Action commit containing this hardening. The composite builds
+# that revision with its committed lockfile instead of resolving OpenLore by a mutable npm selector.
+#
+# Fork PRs: GitHub hands a READ-ONLY `GITHUB_TOKEN` to `pull_request` runs triggered from a
+# fork, so this job cannot post the sticky comment for external contributors. Do NOT switch
+# this job to `pull_request_target` while checking out the PR head: OpenLore parses
+# attacker-controlled repository content, and that combination exposes a write token to an
+# attacker-influenced analysis path.
+#
+# To comment on fork PRs, use two workflows: (1) a `pull_request` workflow with read-only
+# permissions checks out and analyzes the head, then uploads only the rendered briefing as
+# an artifact; (2) a `workflow_run` workflow with `pull-requests: write` does
+# not check out or execute the head, validates/downloads that artifact, and posts its inert
+# text. The trusted job must select the artifact by `workflow_run.id`, verify the source
+# repository/event/conclusion from trusted run metadata, derive the PR number from that metadata
+# (never the artifact), clamp the body, and normalize exactly one leading sticky marker before
+# posting with its own `github-script`; this composite's post step is pull_request-only. Treat the
+# artifact as untrusted data. Pin the Action to a reviewed immutable commit whenever a
+# write-capable token is in scope.
+
+name: OpenLore review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per PR: a newer push cancels the in-flight review so only the latest posts
+# (avoids a race that could create a duplicate sticky comment).
+concurrency:
+  group: openlore-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  openlore-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history so the PR base is reachable
+          ref: ${{ github.event.pull_request.head.sha }} # analyze the same head passed to review
+          persist-credentials: false # never leave the write-capable token in the head checkout
+
+      # Replace the placeholder with the first reviewed commit that contains this hardening.
+      # The Action builds that exact revision with its committed dependency lockfile.
+      - uses: clay-good/OpenLore/.github/actions/openlore-review@REPLACE_WITH_REVIEWED_COMMIT_SHA
+        with:
+          # github-token: ${{ secrets.GITHUB_TOKEN }}   # default; uncomment to override
+          # base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          analyze: 'true'            # build the index for the full blast radius
+          gate: 'false'              # 'true' = gate orphan enforcement and invalid candidate config
